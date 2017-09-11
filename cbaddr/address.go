@@ -19,18 +19,17 @@ type Hash20 []byte
 
 //
 // Decode 解码区块链地址。
-// 还原用户地址为公钥Hash。
-// 解码失败返回nil
+// 还原用户地址为公钥Hash，用户地址为Base58编码格式。
 //
-func Decode(s58 string) Hash20 {
+func Decode(s string) (Hash20, error) {
 
 }
 
 //
 // Encode 编码区块链地址。
-// 由公钥Hash到用户地址的编码。
+// 将公钥Hash编码为用户地址（Base58）。
 //
-func Encode(b20 []byte) string {
+func Encode(b Hash20) string {
 
 }
 
