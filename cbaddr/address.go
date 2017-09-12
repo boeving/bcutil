@@ -18,6 +18,23 @@ const (
 type Hash20 []byte
 
 //
+// UnmarshalText 序列解码接口实现（如JSON:Unmarshal），
+// 采用Decode的解码结果。
+//
+func (h *Hash20) UnmarshalText(text []byte) error {
+	if len(text) == 0 {
+		*h = nil
+		return nil
+	}
+	v, err := Decode(string(text))
+	if err != nil {
+		return err
+	}
+	*h = v
+	return nil
+}
+
+//
 // Decode 解码区块链地址。
 // 还原用户地址为公钥Hash，用户地址为Base58编码格式。
 //
