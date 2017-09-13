@@ -35,14 +35,14 @@ type PKHash [20]byte
 
 //
 // SetBytes 转换字节序列为数组值。
-// 切片长度必须和数组长度相等。
+// 切片长度必须和数组长度相等，否则返回nil。
 //
-func (p *PKHash) SetBytes(bs []byte) bool {
+func (p *PKHash) SetBytes(bs []byte) *PKHash {
 	if len(bs) != len(*p) {
-		return false
+		return nil
 	}
 	copy((*p)[:], bs)
-	return true
+	return p
 }
 
 //
@@ -50,17 +50,17 @@ func (p *PKHash) SetBytes(bs []byte) bool {
 // 按字符串从左到右的顺序对应赋值（big-endian）。
 // 16进制字符串不含前导0x或0X标识。
 //
-func (p *PKHash) SetString(s string, base int) bool {
+func (p *PKHash) SetString(s string, base int) *PKHash {
 	i := new(big.Int)
-	i, ok := i.SetString(s, base)
-	if ok {
-		copy((*p)[:], i.Bytes())
+	if _, ok := i.SetString(s, base); !ok {
+		return nil
 	}
-	return ok
+	copy((*p)[:], i.Bytes())
+	return p
 }
 
 //
-// String 显示为十六进制串，附前缀。
+// String 显示为十六进制串，附 0x 前缀。
 //
 func (p *PKHash) String() string {
 	fmt.Printf("%#x", *p)
@@ -72,6 +72,21 @@ type Address struct {
 	// 前缀标识
 	// 仅限：SignFlag|MultiSignFlag
 	Flag string
+}
+
+//
+// NewAddress 创建一个公钥地址实例。
+// @sf 是否为普通地址前缀标识（非多签名地址）。
+//
+func NewAddress(h *PKHash, sf bool) *Address {
+	f := SignFlag
+
+	if !sf {
+		f = MultiSignFlag
+	}
+	addr := Address{Hash: *h, Flag: f}
+
+	return &addr
 }
 
 //
@@ -159,6 +174,7 @@ func (a *Address) UnmarshalText(text []byte) error {
 	return nil
 }
 
+// 计算校验和。
 // checksum: first some bytes of sha256^2
 func checksum(input []byte) (cksum [LenChecksum]byte) {
 	h := sha256.Sum256(input)
