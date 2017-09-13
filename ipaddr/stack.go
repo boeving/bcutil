@@ -6,9 +6,12 @@ import (
 	"sync"
 )
 
-// Stack IP序列
-// 兼容IPv4和IPv6两种格式。
-// 内部用切片实现，可添加重复的地址。
+//
+// Stack IP序列。
+// 兼容IPv4和IPv6两种格式。内部用切片实现，可添加重复的地址。
+//
+// 并发安全，可以在多个Go程中操作同一实例。
+//
 type Stack struct {
 	pool []net.Addr
 	mu   sync.Mutex
@@ -93,6 +96,8 @@ func (s *Stack) Pop(n int) []net.Addr {
 //
 // IPAddrs 获取IP序列的管道。
 // 允许地址集在服务期变化（更大的灵活性）。
+//
+// 并发安全，可以多次调用创建多个管道获取数据。
 //
 func (s *Stack) IPAddrs(cancel func() bool) <-chan net.Addr {
 	ch := make(chan net.Addr)

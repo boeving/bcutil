@@ -1,3 +1,7 @@
+//
+// Package ipaddr IP地址集封装。
+// 包含一个范围类型和一个序列集合类型。
+//
 package ipaddr
 
 import (
@@ -6,8 +10,12 @@ import (
 	"sync"
 )
 
-// Range IP范围
+//
+// Range IP范围。
 // 仅支持IPv4地址类型。
+//
+// 并发安全，可以在多个Go程中操作同一实例。
+//
 type Range struct {
 	netip   net.IP // 网络地址
 	begin   int    // 起始主机号
@@ -35,6 +43,8 @@ func NewRange(cidr string, begin, end int) (*Range, error) {
 //
 // IPAddrs 获取IP序列的管道。
 // 正常退出后会重置内部游标。
+//
+// 并发安全，可以多次调用创建多个管道获取数据。
 //
 func (r *Range) IPAddrs(cancel func() bool) <-chan net.Addr {
 	ch := make(chan net.Addr)
