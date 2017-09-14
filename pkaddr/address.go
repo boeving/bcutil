@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"hash"
 	"math/big"
-	"strings"
 
 	"github.com/qchen-zh/pputil/base58"
 	"golang.org/x/crypto/ripemd160"
@@ -18,12 +17,8 @@ import (
 // ErrChecksum 地址校验和验证不合格。
 var ErrChecksum = errors.New("checksum error")
 
-// 基本常量定义。
-const (
-	SignFlag      = "CX" // 普通地址前缀标识
-	MultiSignFlag = "cx" // 多重签名地址前缀标识
-	LenChecksum   = 4    // 校验码长度
-)
+// LenChecksum 校验码长度。
+const LenChecksum = 4
 
 // PKHash 160位/20字节Hash序列。
 // 公钥地址Base58编码前未附带前缀和校验码的公钥哈希。
@@ -33,9 +28,9 @@ type PKHash [20]byte
 // SetBytes 转换字节序列为数组值。
 // 切片长度必须和数组长度相等，否则返回nil。
 //
-func (p *PKHash) SetBytes(bs []byte) *PKHash {
+func (p *PKHash) SetBytes(bs []byte) error {
 	if len(bs) != len(*p) {
-		return nil
+		return errors.New("bs's length must " + len(*p))
 	}
 	copy((*p)[:], bs)
 	return p
@@ -44,12 +39,15 @@ func (p *PKHash) SetBytes(bs []byte) *PKHash {
 //
 // SetString 从字符串表示设置序列值。
 // 按字符串从左到右的顺序对应赋值（big-endian）。
-// 16进制字符串不含前导0x或0X标识。
+// 16进制字符串可含前导0x或0X标识（或不含）。
 //
-func (p *PKHash) SetString(s string, base int) *PKHash {
+func (p *PKHash) SetString(s string, base int) error {
+	if base == 16 && len(s) > 2 && (s[1] == 'x' || s[1] == 'X') {
+		s = s[2:]
+	}
 	i := new(big.Int)
 	if _, ok := i.SetString(s, base); !ok {
-		return nil
+		return errors.New(s + " is invalid number characters")
 	}
 	copy((*p)[:], i.Bytes())
 	return p
@@ -59,16 +57,14 @@ func (p *PKHash) SetString(s string, base int) *PKHash {
 // String 显示为十六进制串，附 0x 前缀。
 //
 func (p *PKHash) String() string {
-	fmt.Printf("%#x", *p)
+	fmt.Sprintf("%#x", *p)
 }
 
 // Address 公钥地址。
 // 原则上Flag可任意指定，但本类型的UnmarshalText方法除外。
 type Address struct {
-	Hash PKHash
-	// 前缀标识
-	// 如：SignFlag，MultiSignFlag
-	Flag string
+	Hash PKHash // 公钥哈希
+	Flag string // 前缀标识
 }
 
 //
@@ -111,45 +107,10 @@ func (a *Address) Decode(s, flag string) error {
 }
 
 //
-// Flag 提取地址前缀标识。
-// 仅限于已定义的 SignFlag 和 MultiSignFlag。
-//
-// （注：Base58编码的长度并不与数据源的长度一一对应，因此无法提取未知前缀标识）。
-//
-func Flag(addr string) string {
-	if strings.HasPrefix(addr, SignFlag) {
-		return SignFlag
-	}
-	if strings.HasPrefix(addr, MultiSignFlag) {
-		return MultiSignFlag
-	}
-	return ""
-}
-
-//
 // String 输出字符串表示，即Encode的结果。
 //
 func (a *Address) String() string {
 	return a.Encode()
-}
-
-//
-// UnmarshalText 编码解组接口实现。
-//
-// 用于JSON格式数据解码（json.Unmarshal）。
-// 仅限于已定义的前缀标识（Flag()的返回值）的地址。
-//
-func (a *Address) UnmarshalText(text []byte) error {
-	if len(text) == 0 {
-		return nil
-	}
-	s := string(text)
-
-	err := a.Decode(s, a.Flag(s))
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 // 计算校验和。
