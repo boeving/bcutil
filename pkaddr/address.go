@@ -15,14 +15,10 @@ import (
 	"golang.org/x/crypto/ripemd160"
 )
 
-// ErrChecksum indicates that the checksum of a check-encoded string
-// does not verify against the checksum.
+// ErrChecksum 地址校验和验证不合格。
 var ErrChecksum = errors.New("checksum error")
 
-// ErrInvalidFormat 无效的地址格式。
-var ErrInvalidFormat = errors.New("invalid format: flag prefix missing")
-
-// 基本常量。
+// 基本常量定义。
 const (
 	SignFlag      = "CX" // 普通地址前缀标识
 	MultiSignFlag = "cx" // 多重签名地址前缀标识
@@ -67,33 +63,12 @@ func (p *PKHash) String() string {
 }
 
 // Address 公钥地址。
+// 原则上Flag可任意指定，但本类型的UnmarshalText方法除外。
 type Address struct {
 	Hash PKHash
 	// 前缀标识
-	// 仅限：SignFlag|MultiSignFlag
+	// 如：SignFlag，MultiSignFlag
 	Flag string
-}
-
-//
-// NewAddress 创建一个公钥地址实例。
-// @sf 是否为普通地址前缀标识（非多签名地址）。
-//
-func NewAddress(h *PKHash, sf bool) *Address {
-	f := SignFlag
-
-	if !sf {
-		f = MultiSignFlag
-	}
-	addr := Address{Hash: *h, Flag: f}
-
-	return &addr
-}
-
-//
-// IsMultiSign 是否为多签名地址。
-//
-func (a *Address) IsMultiSign() bool {
-	return a.Flag == MultiSignFlag
 }
 
 //
@@ -117,39 +92,38 @@ func (a *Address) Encode() string {
 
 //
 // Decode 解码公钥地址。
+// @flag 必须与编码时的值一致，
 //
-func (a *Address) Decode(addr string) error {
-	f, h := addrPair(addr)
-	if f == "" {
-		return ErrInvalidFormat
-	}
-	dec := base58.Decode(h)
+func (a *Address) Decode(s, flag string) error {
+	dec := base58.Decode(s[len(flag):])
+	n := len(dec) - LenChecksum
 
 	var cksum [LenChecksum]byte
-	n := len(dec) - LenChecksum
 	copy(cksum[:], dec[n:])
 
 	if checksum(append([]byte(f), dec[:n])) != cksum {
 		return ErrChecksum
 	}
-	a.Flag = f
+	a.Flag = flag
 	copy(a.Hash[:], dec[:n])
 
 	return nil
 }
 
 //
-// 切分地址字符串为两片：标识，正文。
-// 正文部分由Base58编码而来。
+// Flag 提取地址前缀标识。
+// 仅限于已定义的 SignFlag 和 MultiSignFlag。
 //
-func addrPair(addr string) (string, string) {
+// （注：Base58编码的长度并不与数据源的长度一一对应，因此无法提取未知前缀标识）。
+//
+func Flag(addr string) string {
 	if strings.HasPrefix(addr, SignFlag) {
-		return SignFlag, addr[len(SignFlag):]
+		return SignFlag
 	}
 	if strings.HasPrefix(addr, MultiSignFlag) {
-		return MultiSignFlag, addr[len(MultiSignFlag):]
+		return MultiSignFlag
 	}
-	return "", addr
+	return ""
 }
 
 //
@@ -160,14 +134,18 @@ func (a *Address) String() string {
 }
 
 //
-// UnmarshalText 反序列化接口实现。
-// 主要用于JSON格式数据解码（json.Unmarshal）。
+// UnmarshalText 编码解组接口实现。
+//
+// 用于JSON格式数据解码（json.Unmarshal）。
+// 仅限于已定义的前缀标识（Flag()的返回值）的地址。
 //
 func (a *Address) UnmarshalText(text []byte) error {
 	if len(text) == 0 {
 		return nil
 	}
-	err := a.Decode(string(text))
+	s := string(text)
+
+	err := a.Decode(s, a.Flag(s))
 	if err != nil {
 		return err
 	}
