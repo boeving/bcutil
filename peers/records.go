@@ -1,5 +1,6 @@
 //
 // Package peers 网络节点评估。
+// （目标为众多节点，故包名后附s便于区别）
 //
 package peers
 
