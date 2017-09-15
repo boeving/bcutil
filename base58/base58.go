@@ -50,7 +50,7 @@ func Encode(b []byte) string {
 	x := new(big.Int)
 	x.SetBytes(b)
 
-	answer := make([]byte, 0, len(b)*136/100)
+	answer := make([]byte, 0, len(b)*137/100)
 	for x.Cmp(bigZero) > 0 {
 		mod := new(big.Int)
 		x.DivMod(x, bigRadix, mod)
