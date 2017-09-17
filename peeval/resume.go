@@ -1,6 +1,5 @@
 //
-// Package peeval 网络节点评估。
-// （目标为众多节点，故包名后附s便于区别）
+// Package peeval 网络端点价值评估。
 //
 package peeval
 
@@ -12,32 +11,31 @@ import (
 
 // 基本常量。
 const (
-	RecordSize = 1000 // 每网络节点记录条目数。
-	HitsMax    = 255  // 效益满分
-	BadsMax    = 255  // 破坏性满分
+	HitsMax = 0xff // 效益满分
+	BadsMax = 0xff // 破坏性满分
 )
 
-// Peer 节点基本信息。
+// Peer 端点基本信息。
 type Peer struct {
 	IP   net.IP // 监听IP
 	Port uint16 // 监听端口
 }
 
 //
-// String 节点显示形式如 190.160.10.200:3356。
+// String 端点显示形式如 190.160.10.200:3356。
 //
 func (p *Peer) String() string {
 	return fmt.Sprintf("%s:%d", p.IP, p.Port)
 }
 
 //
-// Resume 节点概要。
-// 记录节点的行为评估因子。
-//  - 效益得分（Value）；
+// Resume 端点概要。
+// 记录端点的行为评估因子。
+//  - 效益得分（Score）；
 //  - 破坏性点数（Tough）；
 //  - 连接效率（往返时间）；
 // 注：
-// RTT与节点查询筛选策略相关：假定RTT相似者相近。
+// RTT与端点查询筛选策略相关：假定RTT相似者相近。
 //
 type Resume struct {
 	Peer
@@ -97,24 +95,88 @@ func (rs *Resume) BadAgain(n uint8) uint8 {
 	return rs.bads
 }
 
-// Value 得分评估器。
-//  1. 节点活跃度；
-//  2. 节点提供数据有效性；
-//  3. 节点提供数据量；
-type Value struct {
+// Score 得分评估器。
+//  1. 端点活跃度；
+//  2. 端点提供数据有效性；
+//  3. 端点提供数据量；
+type Score struct {
 	counts int   // 连接次数（活跃度）
 	amount int64 // 有效数据量（字节数）
 	total  int64 // 总数据量（字节数）
 }
 
+// Count 连接计数加一。
+func (s *Score) Count() {
+	if s.counts < 0 {
+		return
+	}
+	s.counts++
+}
+
+// Amount 有效数据量累计。
+func (s *Score) Amount(sz int64) {
+	if s.amount < 0 {
+		return
+	}
+	s.amount += sz
+}
+
+// Total 总数据量累计。
+func (s *Score) Total(sz int64) {
+	if s.total < 0 {
+		return
+	}
+	s.total += sz
+}
+
+//
+// Value 返回评估分值。
+// 当各字段值为负时表明已经最大化了。
+//
+func (s *Score) Value() uint8 {
+	//
+}
+
 //
 // Tough 破坏计算器。
-//  1. 无效交易；
-//  3. 无效交易区块头；
-//  2. 攻击性交易数据；
+//  1. 传递无效交易计数；
+//  3. 传递无效交易区块头计数；
+//  2. 传递攻击性交易数据计数；
 //
 type Tough struct {
 	badTx   int
 	badHead int
 	attack  int
+}
+
+// BadTx 无效交易次数累计。
+func (t *Tough) BadTx() {
+	if t.badTx < 0 {
+		return
+	}
+	t.badTx++
+}
+
+// BadHead 无效区块头计次。
+func (t *Tough) BadHead() {
+	if t.badHead < 0 {
+		return
+	}
+	t.badHead++
+}
+
+// Attack 攻击数据计次。
+func (t *Tough) Attack() {
+	if t.attack < 0 {
+		return
+	}
+	t.attack++
+}
+
+//
+// Value 返回攻击值。
+// 当各字段值为负时表明已经最大化了。
+//
+func (t *Tough) Value() uint8 {
+	//
 }
