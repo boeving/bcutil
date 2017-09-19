@@ -1,17 +1,15 @@
 //
 // Package pkaddr 公钥地址相关的特性操作。
+// 包含对公钥哈希的签名验证（Auth）。
 //
 package pkaddr
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"hash"
 	"math/big"
 
 	"github.com/qchen-zh/pputil/base58"
-	"golang.org/x/crypto/ripemd160"
 )
 
 // ErrChecksum 地址校验和验证不合格。
@@ -33,7 +31,7 @@ func (p *PKHash) SetBytes(bs []byte) error {
 		return errors.New("bs's length must " + len(*p))
 	}
 	copy((*p)[:], bs)
-	return p
+	return nil
 }
 
 //
@@ -50,7 +48,7 @@ func (p *PKHash) SetString(s string, base int) error {
 		return errors.New(s + " is invalid number characters")
 	}
 	copy((*p)[:], i.Bytes())
-	return p
+	return nil
 }
 
 //
@@ -111,25 +109,4 @@ func (a *Address) Decode(s, flag string) error {
 //
 func (a *Address) String() string {
 	return a.Encode()
-}
-
-// 计算校验和。
-// checksum: first some bytes of sha256^2
-func checksum(input []byte) (cksum [LenChecksum]byte) {
-	h := sha256.Sum256(input)
-	h2 := sha256.Sum256(h[:])
-	copy(cksum[:], h2[:LenChecksum])
-	return
-}
-
-// Calculate the hash of hasher over buf.
-func calcHash(buf []byte, hasher hash.Hash) []byte {
-	hasher.Write(buf)
-	return hasher.Sum(nil)
-}
-
-// Hash160 calculates the hash ripemd160(sha256(b)).
-// 主要用于对公钥的Hash计算。
-func Hash160(buf []byte) []byte {
-	return calcHash(calcHash(buf, sha256.New()), ripemd160.New())
 }
