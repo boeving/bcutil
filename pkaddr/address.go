@@ -18,13 +18,13 @@ var ErrChecksum = errors.New("checksum error")
 // LenChecksum 校验码长度。
 const LenChecksum = 4
 
-// PKHash 160位/20字节Hash序列。
+// PKHash 160位/20字节公钥哈希。
 // 公钥地址Base58编码前未附带前缀和校验码的公钥哈希。
 type PKHash [20]byte
 
 //
-// SetBytes 转换字节序列为数组值。
-// 切片长度必须和数组长度相等，否则返回nil。
+// SetBytes 从字节切片设置公钥哈希。
+// 切片长度必须公钥哈希长度相等，否则返回nil。
 //
 func (p *PKHash) SetBytes(bs []byte) error {
 	if len(bs) != len(*p) {
@@ -35,7 +35,7 @@ func (p *PKHash) SetBytes(bs []byte) error {
 }
 
 //
-// SetString 从字符串表示设置序列值。
+// SetString 从字符串设置公钥哈希。
 // 按字符串从左到右的顺序对应赋值（big-endian）。
 // 16进制字符串可含前导0x或0X标识（或不含）。
 //
