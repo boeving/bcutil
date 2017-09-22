@@ -2,7 +2,9 @@ package pkaddr
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"hash"
+	"time"
 
 	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ripemd160"
@@ -11,46 +13,76 @@ import (
 //
 // Auth 签名授权。
 // 用法：
-// 外部传递公钥、对公钥哈希的签名以及地址前缀。
+// 外部传递必要的验证数据：
+//  - 公钥
+//  - 最新时间戳（JSON）
+//  - 对 sha256(时间戳+公钥) 的签名，时间戳取Uinx毫秒数大端字节序
+//  - 地址前缀
 // 验证：
-//  1. 从公钥和地址前缀构造公钥地址；
-//  2. 检查公钥地址与目标地址是否匹配；
-//  3. 验证对公钥哈希的签名数据。
+//  1. 检查时间戳是否符合要求；
+//  2. 从公钥和地址前缀构造公钥地址，检查是否与目标地址匹配；
+//  3. 验证 sha256(时间戳+公钥) 的签名数据。
+//     时间戳取Unix时间毫秒数（1970.1.1～至今）
 // 注：
 // 验证数据不包含地址前缀标识。
 //
 type Auth struct {
-	Address
-	PubKey ed25519.PublicKey
+	addr      Address
+	timestamp time.Time
+	pubkey    ed25519.PublicKey
 }
 
 //
-// NewAuth 创建一个签名授权实例。
+// Address 设置地址。
 //
-func NewAuth(pk ed25519.PublicKey, flag string) *Auth {
-	hash := Hash160(pk)
-
-	return &Auth{
-		Hash:   hash,
-		Flag:   flag,
-		PubKey: pk,
+func (au *Auth) Address(pk ed25519.PublicKey, flag string) {
+	au.addr = Address{
+		Hash: Hash160(pk),
+		Flag: flag,
 	}
+	au.pubkey = pk
 }
 
 //
-// Address 获取公钥地址。
-// 即Base58编码的区块链地址。
+// Timestamp 设置时间戳。
+// @js 时间戳的JSON表示（含外围双引号）。
 //
-func (au *Auth) Address() string {
-	return au.Encode()
+func (au *Auth) Timestamp(js string) error {
+	return au.timestamp.UnmarshalJSON(js)
 }
 
 //
-// Verify 签名验证。
-// 实际上为对内部公钥哈希数据进行签名验证。
+// CheckTime 检查时间符合误差。
+// @t 与当前时间的容许误差。
 //
-func (au *Auth) Verify(sig []byte) bool {
-	return ed25519.Verify(au.PubKey, au.Hash[:], sig)
+func (au *Auth) CheckTime(d time.Duration) bool {
+	d0 := time.Since(au.timestamp)
+	if d0 < 0 {
+		d0 = -d0
+	}
+	return d0 <= d
+}
+
+//
+// CheckAddr 检查地址是否符合。
+//
+func (au *Auth) CheckAddr(addr Address) bool {
+	return au.addr == addr
+}
+
+//
+// CheckSig 验证签名。
+// 目标数据为对 sha256(时间戳Uinx毫秒数+公钥) 的签名。
+// 毫秒数值采用8字节大端字节序。
+//
+func (au *Auth) CheckSig(sig []byte) bool {
+	ms := au.timestamp.UnixNano() / 1000000
+	b := make([]byte, 8)
+
+	binary.BigEndian.PutUint64(b, ms)
+	b = append(b, au.pubkey)
+
+	return ed25519.Verify(au.pubkey, sha256.Sum256(b), sig)
 }
 
 //
