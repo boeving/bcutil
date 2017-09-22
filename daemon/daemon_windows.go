@@ -14,6 +14,7 @@ import (
 	"unsafe"
 )
 
+// ErrWindowsUnsupported 依赖于nssm.exe工具。
 var ErrWindowsUnsupported = errors.New("Adding as a service failed. Download and place nssm.exe in the path to install this service as an service. NSSM url: https://nssm.cc/")
 
 // windowsRecord - standard record (struct) for windows version of daemon package
@@ -24,7 +25,6 @@ type windowsRecord struct {
 }
 
 func newDaemon(name, description string, dependencies []string) (Daemon, error) {
-
 	return &windowsRecord{name, description, dependencies}, nil
 }
 

@@ -21,7 +21,6 @@ type darwinRecord struct {
 }
 
 func newDaemon(name, description string, dependencies []string) (Daemon, error) {
-
 	return &darwinRecord{name, description, dependencies}, nil
 }
 

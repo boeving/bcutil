@@ -36,8 +36,8 @@ Example:
 		port = ":9977"
 	)
 
-  // dependencies that are NOT required by the service, but might be used
-  var dependencies = []string{"dummy.service"}
+  	// dependencies that are NOT required by the service, but might be used
+  	var dependencies = []string{"dummy.service"}
 
 	var stdlog, errlog *log.Logger
 
