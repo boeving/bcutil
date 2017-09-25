@@ -1,7 +1,6 @@
 package httpd
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -9,26 +8,8 @@ import (
 	"time"
 )
 
-var (
-	// MaxThread 最大线程数量
-	MaxThread = 5
-	// CacheSize 缓冲区大小
-	CacheSize = 1024
-
-	errBlock = errors.New("BlockList == nil, can not get block info")
-)
-
-// Block 分段区块。
-type Block struct {
-	Begin int64
-	End   int64
-}
-
-// Status 下载状态。
-type Status struct {
-	Downloaded int64
-	Speeds     int64
-}
+// MaxThread 最大线程数量
+var MaxThread = 5
 
 // FileDl 文件下载管理器。
 type FileDl struct {

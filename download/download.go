@@ -7,8 +7,12 @@ package download
 
 import (
 	"crypto/sha1"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+
+	"github.com/qchen-zh/pputil"
 )
 
 // 基本常量
@@ -17,10 +21,15 @@ const (
 	BlockSize = 1024 * 4 // 文件分块大小（4k）
 )
 
+const (
+	// 分块索引单元长度
+	lenBlockIdx = 8 + 8 + 20
+)
+
 var (
-	errSize   = errors.New("the file size or blocksize is zero")
-	errUndone = errors.New("the download task undone")
-	errChksum = errors.New("the file checksum is not match")
+	errSize    = errors.New("file size invalid")
+	errWriteAt = errors.New("the Writer not support WriteAt")
+	errIndex   = errors.New("the indexs not in blocks")
 )
 
 // HashSum sha1校验和。
@@ -37,6 +46,39 @@ type Block struct {
 	Begin int64
 	End   int64
 	Sum   *HashSum
+}
+
+//
+// Read 读取设置分块定义。
+// 数据结构：
+//  Begin[8]End[8]Sum[20] = 36 bytes
+//  大端字节序
+//
+func (b *Block) Read(buf [lenBlockIdx]byte) {
+	b.Begin = int64(binary.BigEndian.Uint64(buf[:8]))
+	b.End = int64(binary.BigEndian.Uint64(buf[8:16]))
+
+	b.Sum = new(HashSum)
+	copy((*b.Sum)[:], buf[16:])
+}
+
+//
+// Bytes 编码分块定义为序列。
+//
+func (b *Block) Bytes() []byte {
+	var buf [lenBlockIdx]byte
+
+	binary.BigEndian.PutUint64(buf[:8], Uint64(b.Begin))
+	binary.BigEndian.PutUint64(buf[8:16], Uint64(b.End))
+
+	copy(buf[16:], (*b.Sum)[:])
+	return buf[:]
+}
+
+// 分块数据（存储）。
+type blockData struct {
+	offset int64
+	data   []byte
 }
 
 //
@@ -73,64 +115,81 @@ type Monitor interface {
 // 负责单个目标数据的分块，组合校验，缓存等。
 //
 type Manager struct {
-	Size    int64           // 文件大小（bytes）
-	FileSum HashSum         // 文件校验和
-	Blocks  map[int64]Block // 分块集，键：Begin
-	Cache   io.ReadWriter   // 分块数据缓存（临时空间）
-	Indexes io.ReadWriter   // 未完成分块索引缓存
+	Size    int64            // 文件大小（bytes）
+	Blocks  map[int64]*Block // 分块集，键：Begin
+	Cacher  io.Writer        // 分块数据缓存
+	Indexer io.ReadWriter    // 未完成分块索引存储
 
-	filedata   []byte
-	restIndexs map[int64]struct{}
+	restIndexes map[int64]struct{}
 }
 
 //
-// Resume 管理器重启。
-// 主要为检测缓存状况，重构待下载分块集。
+// IndexesRest 构建剩余分块索引。
+// 依Blocks成员构建，在Blocks赋值之后调用。
 //
-func (m *Manager) Resume() error {
+func (m *Manager) IndexesRest() {
+	if m.Blocks == nil {
+		return
+	}
+	buf := make(map[int64]struct{}, len(m.Blocks))
 
+	for off := range m.Blocks {
+		buf[off] = struct{}{}
+	}
+	m.restIndexes = buf
 }
 
 //
-// Divide 分块配置。
-// 对数据大小进行分块定义，没有分块校验和信息。
-// 一般仅在http简单下载场合使用。
+// LoadIndexes 载入待下载分块索引。
 //
-// @bsz 分块大小
+// 后续续传时需要，Blocks成员无需初始赋值。
+// 需要读取Indexer成员，应当已经赋值。
 //
-func (m *Manager) Divide(bsz int64) error {
-	if m.Size == 0 || bsz == 0 {
-		return errSize
+// 之后应当调用IndexRest构建剩余分块索引信息。
+//
+func (m *Manager) LoadIndexes() error {
+	if m.Blocks == nil {
+		m.Blocks = make(map[int64]*Block)
 	}
-	buf := make(map[int64]Block)
-	cnt, mod := m.Size/bsz, m.Size%bsz
-
-	i := 0
-	for i < cnt {
-		off := i * bsz
-		buf[off] = Block{off, off + bsz, nil}
-		m.restIndexs[off] = struct{}{}
-		i++
+	var buf [lenBlockIdx]byte
+	for {
+		if _, err := io.ReadFull(m.Indexer, buf[:]); err != nil {
+			return fmt.Errorf("cache index invalid: %v", err)
+		}
+		var b Block
+		b.Read(buf)
+		m.Blocks[b.Begin] = &b
 	}
-	if mod > 0 {
-		off := cnt * bsz
-		buf[off] = Block{off, off + mod, nil}
-		m.restIndexs[off] = struct{}{}
-	}
-	m.Blocks = buf
-
 	return nil
 }
 
 //
-// BlockGetter 获取一个分块范围值。
+// Divide 分块配置。
+//
+// 对数据大小进行分块定义，没有分块校验和信息。
+// 一般仅在http简单下载场合使用。
+// 之后应当调用IndexRest构建剩余分块索引信息。
+//
+//  @bsz 分块大小，应大于零。零值引发panic
+//
+func (m *Manager) Divide(bsz int64) error {
+	buf, err := Divide(m.Size, bsz)
+	if err != nil {
+		return err
+	}
+	m.Blocks = buf
+	return nil
+}
+
+//
+// BlockGetter 获取分块定义取值渠道。
 //
 func (m *Manager) BlockGetter() <-chan Block {
 	ch := make(chan Block, 1)
 
 	go func() {
 		for _, v := range m.Blocks {
-			ch <- v
+			ch <- *v
 		}
 		close(ch)
 	}()
@@ -139,33 +198,150 @@ func (m *Manager) BlockGetter() <-chan Block {
 }
 
 //
-// CacheBlock 缓存分块数据。
-// 缓存成功后更新剩余索引区（restIndexs）。
+// SaveCache 缓存分块数据。
+// 数据缓存成功后更新索引区（restIndexes）。
 //
-func (m *Manager) CacheBlock(data []byte, b Block) (int64, error) {
+func (m *Manager) SaveCache(bs []blockData) (num int, err error) {
+	if len(bs) == 0 {
+		return
+	}
+	w, ok := m.Cacher.(io.WriterAt)
+	if !ok {
+		err = errWriteAt
+		return
+	}
+	n := 0
+	for _, b := range bs {
+		if n, err = w.WriteAt(b.data, b.offset); err != nil {
+			break
+		}
+		num += n
 
+		// 安全存储后移除索引
+		delete(m.restIndexes[b.offset])
+	}
+	return
 }
 
 //
-// CacheIndexs 缓存剩余分块索引。
+// SaveIndexs 缓存剩余分块索引。
 //
-func (m *Manager) CacheIndexs() (int64, error) {
+func (m *Manager) SaveIndexs() (int, error) {
+	if len(m.restIndexes) == 0 {
+		return 0, nil
+	}
+	n := 0
+	buf := make([]byte, 0, len(m.restIndexes)*lenBlockIdx)
 
+	for off := range m.restIndexes {
+		b := m.Blocks[off]
+		if b == nil {
+			return 0, errIndex
+		}
+		buf = append(buf, b.Bytes())
+	}
+
+	return m.Indexer.Write(buf)
 }
 
 //
-// Finish 下载完成。
-// 返回读取接口。
-// 如果文件校验和不匹配或未下载完，返回error
+// Divide 分块配置。
 //
-func (m *Manager) Finish() (io.Reader, error) {
-	if len(m.restIndexs) != 0 {
-		return nil, errUndone
+// 对数据大小进行分块定义，没有分块校验和信息。
+// 一般仅在http简单下载场合使用。
+// 之后应当调用IndexRest构建剩余分块索引信息。
+//
+// 	@size 文件大小，应大于零。
+// 	@bsz  分块大小，应大于零。零值引发panic
+//
+func Divide(size, bsz int64) (map[int64]*Block, error) {
+	if size <= 0 {
+		return nil, errSize
 	}
-	if sha1.Sum(m.filedata) != m.FileSum {
-		return nil, errChksum
+	if bsz <= 0 {
+		return panic("block size invalid")
 	}
-	return m.Cache, nil
+	buf := make(map[int64]*Block)
+	cnt, mod := size/bsz, size%bsz
+
+	var i int64
+	for i < cnt {
+		off := i * bsz
+		buf[off] = &Block{off, off + bsz, nil}
+		i++
+	}
+	if mod > 0 {
+		off := cnt * bsz
+		buf[off] = &Block{off, off + mod, nil}
+	}
+	return buf, nil
+}
+
+//
+// BlockSum 设置文件分块校验和。
+// bs集合为针对r的源文件大小分割而来。
+//
+func BlockSum(r io.ReaderAt, bs map[int64]*Block) {
+	stop := make(chan struct{})
+	cancel := pputil.Canceller(stop)
+	exit := make(chan error)
+	limit := make(chan struct{}, 12)
+	var err error
+END:
+	for _, b := range bs {
+		select {
+		case err := <-exit:
+			break END
+		default:
+			limit <- struct{}{}
+			go func() {
+				blockSum(r, b.Begin, b.End, exit, cancel)
+				<-limit
+			}()
+		}
+	}
+	close(stop)
+	return err
+}
+
+func blockRead(r io.ReaderAt, begin, end int64, buf chan<- []byte) {
+	//
+}
+
+func blockSum(buf <-chan []byte, out chan<- HashSum) {
+	//
+}
+
+//
+// 读取分块并执行Hash计算。
+// 如果出错会通知调用上层。
+//
+func blockSumX(r io.ReaderAt, begin, end int64, hash chan HashSum, exit chan error, cancel func() bool) {
+	if cancel() {
+		return
+	}
+	buf := make([]byte, begin-end)
+	n, err := r.ReadAt(buf, begin)
+
+	if n < len(buf) || cancel() {
+		pputil.Closec(exit, err)
+		return
+	}
+	hash <- sha1.Sum(buf)
+}
+
+//
+// Finish 下载完成校验。
+//
+func Finish(r io.Reader, cksum HashSum) bool {
+	h := sha1.New()
+	if _, err := io.Copy(h, r); err != nil {
+		return false
+	}
+	if h.Sum(nil) != cksum {
+		return false
+	}
+	return true
 }
 
 //
