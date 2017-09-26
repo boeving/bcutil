@@ -17,11 +17,11 @@ import (
 // 并发安全，可以在多个Go程中操作同一实例。
 //
 type Range struct {
-	netip   net.IP // 网络地址
-	begin   int    // 起始主机号
-	end     int    // 终点主机号
-	current int    // 当前取值
-	mu      sync.Mutex
+	netip  net.IP // 网络地址
+	begin  int    // 起始主机号
+	end    int    // 终点主机号
+	cursor int    // 当前取值
+	mu     sync.Mutex
 }
 
 // NewRange 新建一个范围实例。
@@ -42,23 +42,19 @@ func NewRange(cidr string, begin, end int) (*Range, error) {
 
 //
 // IPAddrs 获取IP序列的管道。
-// 正常退出后会重置内部游标。
-//
-// 并发安全，可以多次调用创建多个管道获取数据。
 //
 func (r *Range) IPAddrs(cancel func() bool) <-chan net.Addr {
 	ch := make(chan net.Addr)
 
 	go func() {
 		for {
-			addr := r.next()
+			addr := r.Next()
 			if cancel() || addr == nil {
 				break
 			}
 			ch <- addr
 		}
 		close(ch)
-		r.Reset()
 	}()
 
 	return ch
@@ -70,23 +66,23 @@ func (r *Range) IPAddrs(cancel func() bool) <-chan net.Addr {
 func (r *Range) Reset() *Range {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.current = 0
+	r.cursor = 0
 	return r
 }
 
 //
-// 获取下一个IP地址。
+// Next 获取下一个IP地址。
 // 到终点后返回nil。
 //
-func (r *Range) next() net.Addr {
+func (r *Range) Next() net.Addr {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.current >= r.end {
+	if r.cursor >= r.end {
 		return nil
 	}
-	r.current++
-	return makeIPv4(r.netip, iToBytes(uint32(r.current-1)))
+	r.cursor++
+	return makeIPv4(r.netip, iToBytes(uint32(r.cursor-1)))
 }
 
 /////////////

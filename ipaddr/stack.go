@@ -10,11 +10,10 @@ import (
 // Stack IP序列。
 // 兼容IPv4和IPv6两种格式。内部用切片实现，可添加重复的地址。
 //
-// 并发安全，可以在多个Go程中操作同一实例。
-//
 type Stack struct {
-	pool []net.Addr
-	mu   sync.Mutex
+	pool   []net.Addr
+	cursor int
+	mu     sync.Mutex
 }
 
 //
@@ -97,24 +96,16 @@ func (s *Stack) Pop(n int) []net.Addr {
 // IPAddrs 获取IP序列的管道。
 // 允许地址集在服务期变化（更大的灵活性）。
 //
-// 并发安全，可以多次调用创建多个管道获取数据。
-//
 func (s *Stack) IPAddrs(cancel func() bool) <-chan net.Addr {
 	ch := make(chan net.Addr)
 
 	go func() {
-		i := 0
-		// 循环内互斥保护
 		for {
-			s.mu.Lock()
-			v := index(s, i)
-			s.mu.Unlock()
-
-			if cancel() || v == nil {
+			v, ok := s.Next()
+			if cancel() || !ok {
 				break
 			}
 			ch <- v
-			i++
 		}
 		close(ch)
 	}()
@@ -123,11 +114,24 @@ func (s *Stack) IPAddrs(cancel func() bool) <-chan net.Addr {
 }
 
 //
-// 提取集合成员，适应集合动态变化。
+// Reset 重置游标。
 //
-func index(s []net.Addr, i int) net.Addr {
-	if len(s) == 0 || len(s) >= i {
-		return nil
+func (s *Stack) Reset() {
+	s.mu.Lock()
+	s.cursor = 0
+	s.mu.Unlock()
+}
+
+//
+// Next 提取下一个地址。
+//
+func (s *Stack) Next() (v net.Addr, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if 0 < len(s.pool) && s.cursor < len(s.pool) {
+		v, ok = s.pool[s.cursor], true
+		s.cursor++
 	}
-	return s[i]
+	return
 }

@@ -24,6 +24,10 @@ const (
 const (
 	// 分块索引单元长度
 	lenBlockIdx = 8 + 8 + 20
+
+	// 构造分块校验和并发量
+	// 行为：读取分块，Hash计算
+	maxChecksum = 12
 )
 
 var (
@@ -278,15 +282,15 @@ func Divide(size, bsz int64) (map[int64]*Block, error) {
 }
 
 //
-// BlockSum 设置文件分块校验和。
+// BlocksSum 设置文件分块校验和。
 // bs集合为针对r的源文件大小分割而来。
 //
-func BlockSum(r io.ReaderAt, bs map[int64]*Block) {
+func BlocksSum(r io.ReaderAt, bs map[int64]*Block) {
 	stop := make(chan struct{})
 	cancel := pputil.Canceller(stop)
-	exit := make(chan error)
-	limit := make(chan struct{}, 12)
+
 	var err error
+	exit = pputil.LimitWorks(maxChecksum, func() {}, cancel)
 END:
 	for _, b := range bs {
 		select {
@@ -295,7 +299,7 @@ END:
 		default:
 			limit <- struct{}{}
 			go func() {
-				blockSum(r, b.Begin, b.End, exit, cancel)
+				blockSum(r, b)
 				<-limit
 			}()
 		}
@@ -304,12 +308,33 @@ END:
 	return err
 }
 
-func blockRead(r io.ReaderAt, begin, end int64, buf chan<- []byte) {
-	//
+//
+// 读取特定片区的数据。
+// 读取出错后返回错误（通知外部）。
+//
+func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
+	buf := make([]byte, begin-end)
+	n, err := r.ReadAt(buf, begin)
+
+	if n < len(buf) {
+		return nil, err
+	}
+	return buf, nil
 }
 
-func blockSum(buf <-chan []byte, out chan<- HashSum) {
-	//
+//
+// 单个区块设置校验和。
+//
+func blockSum(r io.ReaderAt, b *Block) error {
+	buf, err := blockRead(r, b.Begin, b.End)
+
+	if err != nil {
+		return err
+	}
+	b.Sum = new(HashSum)
+	copy((*b.Sum)[:], sha1.Sum(buf))
+
+	return nil
 }
 
 //

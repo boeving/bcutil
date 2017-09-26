@@ -1,3 +1,5 @@
+// Package pputil P2P 通用工具集。
+//
 package pputil
 
 //
@@ -5,7 +7,7 @@ package pputil
 // 与传入的stop管道绑定，判断该管道是否关闭。
 //
 // 常用于服务性Go程根据外部的要求（外部关闭stop），终止自己的服务。
-// 通常简单结束即可。避免Go程泄漏。
+// 通常简单结束即可。
 //
 func Canceller(stop <-chan struct{}) func() bool {
 	return func() bool {
@@ -19,14 +21,18 @@ func Canceller(stop <-chan struct{}) func() bool {
 }
 
 //
-// Closec 安全关闭信号通道。
+// Closec 容错关闭信号通道。
 // 回避重复关闭导致的panic，主要应用于多对一的通知。
-// 如多个协程中一个出错，其它协程应当放弃工作。
+// 例如多个协程中一个出错，其它协程应当放弃工作时。
+//
+// 容许ch值为nil。直接返回（无任何效果）。
 //
 func Closec(ch chan error, msg error) {
-	defer func() {
-		recover()
-	}()
+	if ch == nil {
+		return
+	}
+	defer func() { recover() }()
+
 	ch <- msg
 	close(ch)
 }
