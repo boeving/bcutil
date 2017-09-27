@@ -356,7 +356,7 @@ func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.
 	if limit <= 0 {
 		limit = SumThread
 	}
-	return goes.LoopWorks(goes.LimitLooper(bs, limit), bad, cancel)
+	return goes.Works(goes.LimitWorker(bs, limit), bad, cancel)
 }
 
 //
@@ -366,7 +366,7 @@ func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.
 // 注：通常仅在分块较大数量较少时采用。
 //
 func (bs *BlockSumor) FullDo(bad chan<- error, cancel func() bool) *sync.WaitGroup {
-	return goes.LoopWorks(bs, bad, cancel)
+	return goes.Works(bs, bad, cancel)
 }
 
 //

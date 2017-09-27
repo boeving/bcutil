@@ -7,55 +7,55 @@ import (
 )
 
 //
-// Looper 并发循环器。
-// 用于从循环构造并发工作服务器。
-//  - Next返回nil时退出循环；
-//  - Work返回error表示出错，外部可能终止循环；
+// Worker 并发工作器。
+// 用于构造并发工作服务集。
+//  - Next返回nil时结束并发创建；
+//  - Work返回error表示出错，外部可能终止服务；
 //
-type Looper interface {
+type Worker interface {
 	Next() interface{}
 	Work(k interface{}) error
 }
 
 //
-// limitLoop 有效并发循环器。
+// limitWork 有限并发工作器。
 //
-type limitLoop struct {
-	lp   Looper
+type limitWork struct {
+	wk   Worker
 	sema chan struct{}
 }
 
 //
-// Next 有限性递进。
+// Next 有限性迭代取值。
 //
-func (l *limitLoop) Next() interface{} {
+func (l *limitWork) Next() interface{} {
 	l.sema <- struct{}{}
-	return l.lp.Next()
+	return l.wk.Next()
 }
 
 //
 // Work 工作执行覆盖。
 //
-func (l *limitLoop) Work(k interface{}) error {
-	err := l.lp.Work(k)
+func (l *limitWork) Work(k interface{}) error {
+	err := l.wk.Work(k)
 	<-l.sema
 	return err
 }
 
 //
-// LimitLooper 创建有限并发循环器。
+// LimitWorker 创建有限并发工作器。
 //
-func LimitLooper(lp Looper, limit int) Looper {
-	ll := limitLoop{
-		lp,
+func LimitWorker(w Worker, limit int) Worker {
+	lw := limitWork{
+		w,
 		make(chan struct{}, limit),
 	}
-	return &ll
+	return &lw
 }
 
 //
-// LoopWorks 并发工作服务。
-// 针对每一次循环（lp.Next），对lp.Work开启一个单独的Go程执行。
+// Works 创建并发工作集。
+// 针对每一次迭代（w.Next），对lp.Work开启一个单独的Go程执行。
 //
 // 外部通过bad获得lp.Work的执行状态（出错信息），
 // 通过cancel可以主动控制内部服务退出。
@@ -63,7 +63,7 @@ func LimitLooper(lp Looper, limit int) Looper {
 //
 // 正常结束和外部主动结束服务，bad管道传递nil后关闭。
 //
-func LoopWorks(lp Looper, bad chan<- error, cancel func() bool) *sync.WaitGroup {
+func Works(w Worker, bad chan<- error, cancel func() bool) *sync.WaitGroup {
 	wg := new(sync.WaitGroup)
 	wg.Add(1)
 
@@ -72,13 +72,13 @@ func LoopWorks(lp Looper, bad chan<- error, cancel func() bool) *sync.WaitGroup 
 			if cancel != nil && cancel() {
 				break
 			}
-			v := lp.Next()
+			v := w.Next()
 			if v == nil {
 				break
 			}
 			wg.Add(1)
 			go func(v) {
-				if err := lp.Work(v); err != nil {
+				if err := w.Work(v); err != nil {
 					pputil.Closec(bad, err)
 				}
 				wg.Done()
