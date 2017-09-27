@@ -301,6 +301,7 @@ type BlockSumor struct {
 // 分块校验和设置在list成员的Sum字段上。
 //
 // 返回值仅可单次使用，由 Do|FullDo 实施。
+// list是一个引用，外部不应该再修改它。
 //
 func NewBlockSumor(r io.ReaderAt, list map[int64]*Block) *BlockSumor {
 	bs := BlockSumor{
@@ -312,7 +313,7 @@ func NewBlockSumor(r io.ReaderAt, list map[int64]*Block) *BlockSumor {
 	// 启动一个服务
 	go func() {
 		for k := range bs.data {
-			ch <- k
+			bs.ch <- k
 		}
 		close(ch) // for nil
 	}()
@@ -384,9 +385,9 @@ func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
 }
 
 //
-// Finish 下载完成校验。
+// CheckSum 整体数据校验。
 //
-func Finish(r io.Reader, cksum HashSum) bool {
+func CheckSum(r io.Reader, cksum HashSum) bool {
 	h := sha1.New()
 	if _, err := io.Copy(h, r); err != nil {
 		return false
