@@ -25,6 +25,7 @@ func Canceller(stop <-chan struct{}) func() bool {
 // 回避重复关闭导致的panic，主要应用于多对一的通知。
 // 例如多个协程中一个出错，其它协程应当放弃工作时。
 //
+// 只有第一个通知会有效到达。
 // 容许ch值为nil。直接返回（无任何效果）。
 //
 func Closec(ch chan error, msg error) {

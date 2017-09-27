@@ -11,23 +11,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
-	"github.com/qchen-zh/pputil"
+	"github.com/qchen-zh/pputil/goes"
 )
 
 // 基本常量
 const (
 	SumSize   = 20       // 校验和哈希长度（sha1）
 	BlockSize = 1024 * 4 // 文件分块大小（4k）
+
+	// 构造分块校验和并发量
+	// 行为：读取分块，Hash计算
+	SumThread = 12
 )
 
 const (
 	// 分块索引单元长度
 	lenBlockIdx = 8 + 8 + 20
-
-	// 构造分块校验和并发量
-	// 行为：读取分块，Hash计算
-	maxChecksum = 12
 )
 
 var (
@@ -79,10 +80,13 @@ func (b *Block) Bytes() []byte {
 	return buf[:]
 }
 
-// 分块数据（存储）。
-type blockData struct {
-	offset int64
-	data   []byte
+//
+// BlockData 分块数据
+// 注：用于存储。
+//
+type BlockData struct {
+	Offset int64
+	Data   []byte
 }
 
 //
@@ -205,7 +209,7 @@ func (m *Manager) BlockGetter() <-chan Block {
 // SaveCache 缓存分块数据。
 // 数据缓存成功后更新索引区（restIndexes）。
 //
-func (m *Manager) SaveCache(bs []blockData) (num int, err error) {
+func (m *Manager) SaveCache(bs []BlockData) (num int, err error) {
 	if len(bs) == 0 {
 		return
 	}
@@ -216,13 +220,13 @@ func (m *Manager) SaveCache(bs []blockData) (num int, err error) {
 	}
 	n := 0
 	for _, b := range bs {
-		if n, err = w.WriteAt(b.data, b.offset); err != nil {
+		if n, err = w.WriteAt(b.Data, b.Offset); err != nil {
 			break
 		}
 		num += n
 
 		// 安全存储后移除索引
-		delete(m.restIndexes[b.offset])
+		delete(m.restIndexes[b.Offset])
 	}
 	return
 }
@@ -282,30 +286,87 @@ func Divide(size, bsz int64) (map[int64]*Block, error) {
 }
 
 //
-// BlocksSum 设置文件分块校验和。
-// bs集合为针对r的源文件大小分割而来。
+// BlockSumor 分块校验和生成器。
+// 按分块定义读取目标数据，计算校验和并设置。
 //
-func BlocksSum(r io.ReaderAt, bs map[int64]*Block) {
-	stop := make(chan struct{})
-	cancel := pputil.Canceller(stop)
+type BlockSumor struct {
+	r    io.ReaderAt
+	data map[int64]*Block
+	ch   chan interface{}
+}
 
-	var err error
-	exit = pputil.LimitWorks(maxChecksum, func() {}, cancel)
-END:
-	for _, b := range bs {
-		select {
-		case err := <-exit:
-			break END
-		default:
-			limit <- struct{}{}
-			go func() {
-				blockSum(r, b)
-				<-limit
-			}()
-		}
+//
+// NewBlockSumor 新建一个分块校验和生成器。
+// list清单为针对r的源文件大小分割而来。
+// 分块校验和设置在list成员的Sum字段上。
+//
+// 返回值仅可单次使用，由 Do|FullDo 实施。
+//
+func NewBlockSumor(r io.ReaderAt, list map[int64]*Block) *BlockSumor {
+	bs := BlockSumor{
+		r:    r,
+		data: list,
 	}
-	close(stop)
-	return err
+	bs.ch = make(chan interface{})
+
+	// 启动一个服务
+	go func() {
+		for k := range bs.data {
+			ch <- k
+		}
+		close(ch) // for nil
+	}()
+
+	return &bs
+}
+
+//
+// Next 获取下一个分块定义。
+//
+func (bs *BlockSumor) Next() interface{} {
+	return <-bs.ch
+}
+
+//
+// Work 计算一个分块数据的校验和。
+//
+func (bs *BlockSumor) Work(k interface{}) error {
+	b := bs.data[k.(int64)]
+	if b == nil {
+		return errIndex
+	}
+	data, err := blockRead(bs.r, b.Begin, b.End)
+
+	if err != nil {
+		return err
+	}
+	b.Sum = new(HashSum)
+	copy((*b.Sum)[:], sha1.Sum(buf))
+
+	return nil
+}
+
+//
+// Do 计算/设置分块校验和。
+// 启动 limit 个并发计算，传递0采用内置默认值（SumThread）。
+//
+// 返回的等待对象等待全部工作完成。
+//
+func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.WaitGroup {
+	if limit <= 0 {
+		limit = SumThread
+	}
+	return goes.LoopWorks(goes.LimitLooper(bs, limit), bad, cancel)
+}
+
+//
+// FullDo 计算/设置分块校验和。
+// 完全并发——有多少个分块启动多少个协程。
+//
+// 注：通常仅在分块较大数量较少时采用。
+//
+func (bs *BlockSumor) FullDo(bad chan<- error, cancel func() bool) *sync.WaitGroup {
+	return goes.LoopWorks(bs, bad, cancel)
 }
 
 //
@@ -320,39 +381,6 @@ func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
-}
-
-//
-// 单个区块设置校验和。
-//
-func blockSum(r io.ReaderAt, b *Block) error {
-	buf, err := blockRead(r, b.Begin, b.End)
-
-	if err != nil {
-		return err
-	}
-	b.Sum = new(HashSum)
-	copy((*b.Sum)[:], sha1.Sum(buf))
-
-	return nil
-}
-
-//
-// 读取分块并执行Hash计算。
-// 如果出错会通知调用上层。
-//
-func blockSumX(r io.ReaderAt, begin, end int64, hash chan HashSum, exit chan error, cancel func() bool) {
-	if cancel() {
-		return
-	}
-	buf := make([]byte, begin-end)
-	n, err := r.ReadAt(buf, begin)
-
-	if n < len(buf) || cancel() {
-		pputil.Closec(exit, err)
-		return
-	}
-	hash <- sha1.Sum(buf)
 }
 
 //
