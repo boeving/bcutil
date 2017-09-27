@@ -321,9 +321,9 @@ func NewBlockSumor(r io.ReaderAt, list map[int64]*Block) *BlockSumor {
 }
 
 //
-// Next 获取下一个分块定义。
+// Task 获取一个分块定义。
 //
-func (bs *BlockSumor) Next() interface{} {
+func (bs *BlockSumor) Task() interface{} {
 	return <-bs.ch
 }
 
@@ -356,7 +356,7 @@ func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.
 	if limit <= 0 {
 		limit = SumThread
 	}
-	return goes.Works(goes.LimitWorker(bs, limit), bad, cancel)
+	return goes.Works(goes.LimitTasker(bs, limit), bad, cancel)
 }
 
 //
