@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"sync"
+
+	"github.com/qchen-zh/pputil/goes"
 )
 
 //
@@ -41,23 +43,11 @@ func NewRange(cidr string, begin, end int) (*Range, error) {
 }
 
 //
-// IPAddrs 获取IP序列的管道。
+// IPAddrs 获取IP序列的微服务。
+// 返回管道内值：net.Addr。
 //
-func (r *Range) IPAddrs(cancel func() bool) <-chan net.Addr {
-	ch := make(chan net.Addr)
-
-	go func() {
-		for {
-			addr := r.Next()
-			if cancel() || addr == nil {
-				break
-			}
-			ch <- addr
-		}
-		close(ch)
-	}()
-
-	return ch
+func (r *Range) IPAddrs(cancel func() bool) <-chan interface{} {
+	return goes.Serve(r, cancel)
 }
 
 //
@@ -71,18 +61,18 @@ func (r *Range) Reset() *Range {
 }
 
 //
-// Next 获取下一个IP地址。
-// 到终点后返回nil。
+// Value 获取下一个IP地址。
+// v存储：net.Addr
 //
-func (r *Range) Next() net.Addr {
+func (r *Range) Value() (v interface{}, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.cursor >= r.end {
-		return nil
+		return
 	}
 	r.cursor++
-	return makeIPv4(r.netip, iToBytes(uint32(r.cursor-1)))
+	return makeIPv4(r.netip, iToBytes(uint32(r.cursor-1))), true
 }
 
 /////////////
@@ -116,7 +106,7 @@ func check(begin, end int, mask net.IPMask) error {
 //
 // 构造IPv4主机地址。
 //
-func makeIPv4(nip net.IP, host []byte) *net.IPAddr {
+func makeIPv4(nip net.IP, host []byte) net.Addr {
 	out := make([]byte, len(nip))
 
 	for i := 0; i < net.IPv4len; i++ {

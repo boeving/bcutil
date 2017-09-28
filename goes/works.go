@@ -8,9 +8,9 @@ import (
 
 //
 // Tasker 任务管理器。
-// 用于构造并发任务执行服务集。
-//  - Task返回nil时结束并发创建；
-//  - Work返回error表示出错，外部可能终止服务；
+// 用于构造并发任务执行服务。
+//  - Task 返回nil时结束并发创建；
+//  - Work 返回error表示出错，外部可以终止服务；
 //
 type Tasker interface {
 	Task() interface{}
@@ -43,7 +43,7 @@ func (l *limitTask) Work(k interface{}) error {
 }
 
 //
-// LimitTasker 创建有限并发任务。
+// LimitTasker 创建一个有限并发任务管理器。
 //
 func LimitTasker(t Tasker, limit int) Tasker {
 	lt := limitTask{
@@ -55,13 +55,16 @@ func LimitTasker(t Tasker, limit int) Tasker {
 
 //
 // Works 创建并发工作集。
+//
 // 针对每一次迭代（t.Task），对t.Work开启一个单独的Go程执行。
-//
 // 外部通过bad获得t.Work的执行状态（出错信息），
-// 通过cancel可以主动控制内部服务退出。
-// 注：cancel可由Canceller创建，外部关闭其stop即可传递结束信号。
+// 然后可以通过cancel主动控制内部服务退出。
 //
-// 正常结束和外部主动结束服务，bad管道传递nil后关闭。
+// 正常结束或外部主动结束服务后，bad管道关闭。
+// 外部应用始终需要清空bad，以防Go程泄漏，
+// 同时，返回的WaitGroup也才会正常归零。
+//
+// 注：cancel可由Canceller创建，外部关闭其stop即可传递结束信号。
 //
 func Works(t Tasker, bad chan<- error, cancel func() bool) *sync.WaitGroup {
 	wg := new(sync.WaitGroup)
@@ -77,14 +80,15 @@ func Works(t Tasker, bad chan<- error, cancel func() bool) *sync.WaitGroup {
 				break
 			}
 			wg.Add(1)
-			go func(v) {
+
+			go func(v interface{}) {
 				if err := t.Work(v); err != nil {
-					pputil.Closec(bad, err)
+					pputil.Sends(bad, err)
 				}
 				wg.Done()
 			}(v)
 		}
-		pputil.Closec(bad, nil)
+		close(bad)
 		wg.Done()
 	}()
 

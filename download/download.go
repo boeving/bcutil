@@ -348,10 +348,12 @@ func (bs *BlockSumor) Work(k interface{}) error {
 }
 
 //
-// Do 计算/设置分块校验和。
-// 启动 limit 个并发计算，传递0采用内置默认值（SumThread）。
+// Do 计算/设置分块校验和（有限并发）。
 //
-// 返回的等待对象等待全部工作完成。
+// 启动 limit 个并发计算，传递0采用内置默认值（SumThread）。
+// 返回的等待对象用于等待全部工作完成。
+//
+// 应用需要处理bad内的值，并且需要清空。
 //
 func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.WaitGroup {
 	if limit <= 0 {
@@ -361,9 +363,9 @@ func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.
 }
 
 //
-// FullDo 计算/设置分块校验和。
-// 完全并发——有多少个分块启动多少个协程。
+// FullDo 计算/设置分块校验和（完全并发）。
 //
+// 有多少个分块启动多少个协程。其它说明与Do相同。
 // 注：通常仅在分块较大数量较少时采用。
 //
 func (bs *BlockSumor) FullDo(bad chan<- error, cancel func() bool) *sync.WaitGroup {

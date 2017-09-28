@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"sync"
+
+	"github.com/qchen-zh/pputil/goes"
 )
 
 //
@@ -93,24 +95,13 @@ func (s *Stack) Pop(n int) []net.Addr {
 }
 
 //
-// IPAddrs 获取IP序列的管道。
+// IPAddrs 获取IP序列的微服务。
+// 返回管道内值：net.Addr。
+//
 // 允许地址集在服务期变化（更大的灵活性）。
 //
-func (s *Stack) IPAddrs(cancel func() bool) <-chan net.Addr {
-	ch := make(chan net.Addr)
-
-	go func() {
-		for {
-			v, ok := s.Next()
-			if cancel() || !ok {
-				break
-			}
-			ch <- v
-		}
-		close(ch)
-	}()
-
-	return ch
+func (s *Stack) IPAddrs(cancel func() bool) <-chan interface{} {
+	return goes.Serve(s, cancel)
 }
 
 //
@@ -123,9 +114,10 @@ func (s *Stack) Reset() {
 }
 
 //
-// Next 提取下一个地址。
+// Value 提取下一个地址。
+// v存储：net.Addr
 //
-func (s *Stack) Next() (v net.Addr, ok bool) {
+func (s *Stack) Value() (v interface{}, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
