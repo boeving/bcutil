@@ -1,4 +1,5 @@
-// Package goes 通用并发类服务工具集。
+// Package goes 并发服务工具集。
+// 主要应用在多个Go程对调用宿主（单一）的信号反馈。
 package goes
 
 //
