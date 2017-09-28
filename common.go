@@ -40,12 +40,12 @@ func Sendes(ch chan<- error, msg error) {
 }
 
 //
-// Closec 容错关闭信号通道。
+// Closes 容错关闭信号通道。
 //
 // 回避重复关闭导致的panic，应用场景与Sendc类似。
 // 兼容ch值为nil，静默返回。
 //
-func Closec(ch chan<- error) {
+func Closes(ch chan<- error) {
 	if ch == nil {
 		return
 	}
