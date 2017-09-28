@@ -1,55 +1,55 @@
+// Package httpd 直接网址下载方式的实现。
+//
 package httpd
 
 import (
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
+
+	dl "github.com/qchen-zh/pputil/download"
 )
 
-// MaxThread 最大线程数量
-var MaxThread = 5
-
-// FileDl 文件下载管理器。
+// FileDl 文件下载器。
 type FileDl struct {
-	URL       string   // 下载地址
-	Size      int64    // 文件大小
-	File      *os.File // 要写入的文件
-	BlockList []Block  // 用于记录未下载的文件块起始位置
-
-	onStart  func()
-	onPause  func()
-	onResume func()
-	onCancel func()
-	onFinish func()
-	onError  func(int, error)
-
-	paused bool
-	status Status
+	URL      string
+	checksum func([]byte) dl.HashSum
+	complete func([]byte)
+	fail     func(Block, error)
 }
 
-// NewFileDl 创建新的文件下载
-// 如果 size <= 0 则自动获取文件大小
-func NewFileDl(url string, file *os.File, size int64) (*FileDl, error) {
-	if size <= 0 {
-		// 获取文件信息
-		resp, err := http.Get(url)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-
-		size = resp.ContentLength
+//
+// FileSize 探测文件大小。
+//
+func FileSize(url string) (int64, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0, err
 	}
+	defer resp.Body.Close()
 
-	f := &FileDl{
-		URL:  url,
-		Size: size,
-		File: file,
-	}
+	return resp.ContentLength
+}
 
-	return f, nil
+// Get 下载目标分块。
+func (d *FileDl) Get(Block) ([]byte, error) {
+	//
+}
+
+// CheckSum 注册校验哈希函数
+func (d *FileDl) CheckSum(sum func([]byte) HashSum) {
+	d.checksum = sum
+}
+
+// Completed 注册完成回调。
+func (d *FileDl) Completed(done func([]byte)) {
+	d.complete = done
+}
+
+// Failed 注册失败回调。
+func (d *FileDl) Failed(fail func(Block, error)) {
+	d.fail = fail
 }
 
 // Start 开始下载

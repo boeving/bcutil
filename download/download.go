@@ -18,17 +18,18 @@ import (
 
 // 基本常量
 const (
-	SumSize   = 20       // 校验和哈希长度（sha1）
-	BlockSize = 1024 * 4 // 文件分块大小（4k）
+	SumLength = 20     // 校验和哈希长度（sha1）
+	PieceUnit = 1 < 14 // 分片单位值（16k）
+	PieceSize = 1 < 4  // 分片大小（16），总长16*16k = 256k
 
-	// 构造分块校验和并发量
-	// 行为：读取分块，Hash计算
+	// 构造分片校验和并发量
+	// 行为：读取分片，Hash计算
 	SumThread = 12
 )
 
 const (
-	// 分块索引单元长度
-	lenBlockIdx = 8 + 8 + 20
+	// 分片索引单元长度
+	lenPieceIdx = 8 + 8 + 20
 )
 
 var (
@@ -38,7 +39,7 @@ var (
 )
 
 // HashSum sha1校验和。
-type HashSum [SumSize]byte
+type HashSum [SumLength]byte
 
 // Status 下载状态。
 type Status struct {
@@ -46,20 +47,20 @@ type Status struct {
 	Completed int64
 }
 
-// Block 分段区块。
-type Block struct {
+// Piece 数据分片。
+type Piece struct {
 	Begin int64
 	End   int64
 	Sum   *HashSum
 }
 
 //
-// Read 读取设置分块定义。
+// Read 读取设置分片定义。
 // 数据结构：
 //  Begin[8]End[8]Sum[20] = 36 bytes
 //  大端字节序
 //
-func (b *Block) Read(buf [lenBlockIdx]byte) {
+func (b *Piece) Read(buf [lenPieceIdx]byte) {
 	b.Begin = int64(binary.BigEndian.Uint64(buf[:8]))
 	b.End = int64(binary.BigEndian.Uint64(buf[8:16]))
 
@@ -68,10 +69,10 @@ func (b *Block) Read(buf [lenBlockIdx]byte) {
 }
 
 //
-// Bytes 编码分块定义为序列。
+// Bytes 编码分片定义为序列。
 //
-func (b *Block) Bytes() []byte {
-	var buf [lenBlockIdx]byte
+func (b *Piece) Bytes() []byte {
+	var buf [lenPieceIdx]byte
 
 	binary.BigEndian.PutUint64(buf[:8], Uint64(b.Begin))
 	binary.BigEndian.PutUint64(buf[8:16], Uint64(b.End))
@@ -81,28 +82,30 @@ func (b *Block) Bytes() []byte {
 }
 
 //
-// BlockData 分块数据
+// PieceData 分片数据
 // 注：用于存储。
 //
-type BlockData struct {
+type PieceData struct {
 	Offset int64
 	Data   []byte
 }
 
 //
 // Hauler 数据搬运工。
-// 实施单个目标（分块）的具体下载行为，
+// 实施单个目标（分片）的具体下载行为，
 //
 type Hauler interface {
-	// 下载分块。
-	Get(Block) ([]byte, error)
+	// 下载分片。
+	Get(Piece) ([]byte, error)
 
 	// 注册校验哈希函数
-	// @tries 失败尝试次数（不宜过大）
-	CheckSum(sum func([]byte) HashSum, tries int)
+	CheckSum(cksum func([]byte) HashSum)
 
 	// 注册完成回调。
-	Completed(done func([]byte))
+	Completed(func([]byte))
+
+	// 注册失败回调。
+	Failed(func(Piece, error))
 }
 
 //
@@ -120,83 +123,83 @@ type Monitor interface {
 
 //
 // Manager 下载管理。
-// 负责单个目标数据的分块，组合校验，缓存等。
+// 负责单个目标数据的分片，组合校验，缓存等。
 //
 type Manager struct {
 	Size    int64            // 文件大小（bytes）
-	Blocks  map[int64]*Block // 分块集，键：Begin
-	Cacher  io.Writer        // 分块数据缓存
-	Indexer io.ReadWriter    // 未完成分块索引存储
+	Pieces  map[int64]*Piece // 分片集，键：Begin
+	Cacher  io.Writer        // 分片数据缓存
+	Indexer io.ReadWriter    // 未完成分片索引存储
 
 	restIndexes map[int64]struct{}
 }
 
 //
-// IndexesRest 构建剩余分块索引。
-// 依Blocks成员构建，在Blocks赋值之后调用。
+// IndexesRest 构建剩余分片索引。
+// 依Pieces成员构建，在Pieces赋值之后调用。
 //
 func (m *Manager) IndexesRest() {
-	if m.Blocks == nil {
+	if m.Pieces == nil {
 		return
 	}
-	buf := make(map[int64]struct{}, len(m.Blocks))
+	buf := make(map[int64]struct{}, len(m.Pieces))
 
-	for off := range m.Blocks {
+	for off := range m.Pieces {
 		buf[off] = struct{}{}
 	}
 	m.restIndexes = buf
 }
 
 //
-// LoadIndexes 载入待下载分块索引。
+// LoadIndexes 载入待下载分片索引。
 //
-// 后续续传时需要，Blocks成员无需初始赋值。
+// 后续续传时需要，Pieces成员无需初始赋值。
 // 需要读取Indexer成员，应当已经赋值。
 //
-// 之后应当调用IndexRest构建剩余分块索引信息。
+// 之后应当调用IndexRest构建剩余分片索引信息。
 //
 func (m *Manager) LoadIndexes() error {
-	if m.Blocks == nil {
-		m.Blocks = make(map[int64]*Block)
+	if m.Pieces == nil {
+		m.Pieces = make(map[int64]*Piece)
 	}
-	var buf [lenBlockIdx]byte
+	var buf [lenPieceIdx]byte
 	for {
 		if _, err := io.ReadFull(m.Indexer, buf[:]); err != nil {
 			return fmt.Errorf("cache index invalid: %v", err)
 		}
-		var b Block
+		var b Piece
 		b.Read(buf)
-		m.Blocks[b.Begin] = &b
+		m.Pieces[b.Begin] = &b
 	}
 	return nil
 }
 
 //
-// Divide 分块配置。
+// Divide 分片配置。
 //
-// 对数据大小进行分块定义，没有分块校验和信息。
+// 对数据大小进行分片定义，没有分片校验和信息。
 // 一般仅在http简单下载场合使用。
-// 之后应当调用IndexRest构建剩余分块索引信息。
+// 之后应当调用IndexRest构建剩余分片索引信息。
 //
-//  @bsz 分块大小，应大于零。零值引发panic
+//  @bsz 分片大小，应大于零。零值引发panic
 //
 func (m *Manager) Divide(bsz int64) error {
 	buf, err := Divide(m.Size, bsz)
 	if err != nil {
 		return err
 	}
-	m.Blocks = buf
+	m.Pieces = buf
 	return nil
 }
 
 //
-// BlockGetter 获取分块定义取值渠道。
+// PieceGetter 获取分片定义取值渠道。
 //
-func (m *Manager) BlockGetter() <-chan Block {
-	ch := make(chan Block, 1)
+func (m *Manager) PieceGetter() <-chan Piece {
+	ch := make(chan Piece, 1)
 
 	go func() {
-		for _, v := range m.Blocks {
+		for _, v := range m.Pieces {
 			ch <- *v
 		}
 		close(ch)
@@ -206,10 +209,10 @@ func (m *Manager) BlockGetter() <-chan Block {
 }
 
 //
-// SaveCache 缓存分块数据。
+// SaveCache 缓存分片数据。
 // 数据缓存成功后更新索引区（restIndexes）。
 //
-func (m *Manager) SaveCache(bs []BlockData) (num int, err error) {
+func (m *Manager) SaveCache(bs []PieceData) (num int, err error) {
 	if len(bs) == 0 {
 		return
 	}
@@ -232,17 +235,17 @@ func (m *Manager) SaveCache(bs []BlockData) (num int, err error) {
 }
 
 //
-// SaveIndexs 缓存剩余分块索引。
+// SaveIndexs 缓存剩余分片索引。
 //
 func (m *Manager) SaveIndexs() (int, error) {
 	if len(m.restIndexes) == 0 {
 		return 0, nil
 	}
 	n := 0
-	buf := make([]byte, 0, len(m.restIndexes)*lenBlockIdx)
+	buf := make([]byte, 0, len(m.restIndexes)*lenPieceIdx)
 
 	for off := range m.restIndexes {
-		b := m.Blocks[off]
+		b := m.Pieces[off]
 		if b == nil {
 			return 0, errIndex
 		}
@@ -253,58 +256,58 @@ func (m *Manager) SaveIndexs() (int, error) {
 }
 
 //
-// Divide 分块配置。
+// Divide 分片配置。
 //
-// 对数据大小进行分块定义，没有分块校验和信息。
+// 对数据大小进行分片定义，没有分片校验和信息。
 // 一般仅在http简单下载场合使用。
-// 之后应当调用IndexRest构建剩余分块索引信息。
+// 之后应当调用IndexRest构建剩余分片索引信息。
 //
 // 	@size 文件大小，应大于零。
-// 	@bsz  分块大小，应大于零。零值引发panic
+// 	@bsz  分片大小，应大于零。零值引发panic
 //
-func Divide(size, bsz int64) (map[int64]*Block, error) {
+func Divide(size, bsz int64) (map[int64]*Piece, error) {
 	if size <= 0 {
 		return nil, errSize
 	}
 	if bsz <= 0 {
 		return panic("block size invalid")
 	}
-	buf := make(map[int64]*Block)
+	buf := make(map[int64]*Piece)
 	cnt, mod := size/bsz, size%bsz
 
 	var i int64
 	for i < cnt {
 		off := i * bsz
-		buf[off] = &Block{off, off + bsz, nil}
+		buf[off] = &Piece{off, off + bsz, nil}
 		i++
 	}
 	if mod > 0 {
 		off := cnt * bsz
-		buf[off] = &Block{off, off + mod, nil}
+		buf[off] = &Piece{off, off + mod, nil}
 	}
 	return buf, nil
 }
 
 //
-// BlockSumor 分块校验和生成器。
-// 按分块定义读取目标数据，计算校验和并设置。
+// PieceSumor 分片校验和生成器。
+// 按分片定义读取目标数据，计算校验和并设置。
 //
-type BlockSumor struct {
+type PieceSumor struct {
 	r    io.ReaderAt
-	data map[int64]*Block
+	data map[int64]*Piece
 	ch   chan interface{}
 }
 
 //
-// NewBlockSumor 新建一个分块校验和生成器。
+// NewPieceSumor 新建一个分片校验和生成器。
 // list清单为针对r的源文件大小分割而来。
-// 分块校验和设置在list成员的Sum字段上。
+// 分片校验和设置在list成员的Sum字段上。
 //
 // 返回值仅可单次使用，由 Do|FullDo 实施。
 // list是一个引用，外部不应该再修改它。
 //
-func NewBlockSumor(r io.ReaderAt, list map[int64]*Block) *BlockSumor {
-	bs := BlockSumor{
+func NewPieceSumor(r io.ReaderAt, list map[int64]*Piece) *PieceSumor {
+	bs := PieceSumor{
 		r:    r,
 		data: list,
 	}
@@ -322,16 +325,16 @@ func NewBlockSumor(r io.ReaderAt, list map[int64]*Block) *BlockSumor {
 }
 
 //
-// Task 获取一个分块定义。
+// Task 获取一个分片定义。
 //
-func (bs *BlockSumor) Task() interface{} {
+func (bs *PieceSumor) Task() interface{} {
 	return <-bs.ch
 }
 
 //
-// Work 计算一个分块数据的校验和。
+// Work 计算一个分片数据的校验和。
 //
-func (bs *BlockSumor) Work(k interface{}) error {
+func (bs *PieceSumor) Work(k interface{}) error {
 	b := bs.data[k.(int64)]
 	if b == nil {
 		return errIndex
@@ -348,14 +351,14 @@ func (bs *BlockSumor) Work(k interface{}) error {
 }
 
 //
-// Do 计算/设置分块校验和（有限并发）。
+// Do 计算/设置分片校验和（有限并发）。
 //
 // 启动 limit 个并发计算，传递0采用内置默认值（SumThread）。
 // 返回的等待对象用于等待全部工作完成。
 //
 // 应用需要处理bad内的值，并且需要清空。
 //
-func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.WaitGroup {
+func (bs *PieceSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.WaitGroup {
 	if limit <= 0 {
 		limit = SumThread
 	}
@@ -363,12 +366,12 @@ func (bs *BlockSumor) Do(limit int, bad chan<- error, cancel func() bool) *sync.
 }
 
 //
-// FullDo 计算/设置分块校验和（完全并发）。
+// FullDo 计算/设置分片校验和（完全并发）。
 //
-// 有多少个分块启动多少个协程。其它说明与Do相同。
-// 注：通常仅在分块较大数量较少时采用。
+// 有多少个分片启动多少个协程。其它说明与Do相同。
+// 注：通常仅在分片较大数量较少时采用。
 //
-func (bs *BlockSumor) FullDo(bad chan<- error, cancel func() bool) *sync.WaitGroup {
+func (bs *PieceSumor) FullDo(bad chan<- error, cancel func() bool) *sync.WaitGroup {
 	return goes.Works(bs, bad, cancel)
 }
 
