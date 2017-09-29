@@ -26,6 +26,19 @@ type Status struct {
 }
 
 //
+// Monitor 下载管理。
+// 在下载过程的各个阶段/状态触发控制响应。
+//
+type Monitor interface {
+	OnStart(s Status)   // 下载开始之前的回调
+	OnPause(s Status)   // 下载暂停之后的回调
+	OnResume(s Status)  // 下载继续之前的回调
+	OnCancel(s Status)  // 下载取消之后的回调
+	OnFinish(s Status)  // 下载完成之后的回调
+	OnError(int, error) // 出错之后的回调
+}
+
+//
 // Manager 下载器。
 //
 // 下载目标可能是一个URL，此时一般巍为http方式获取（httpd）。
