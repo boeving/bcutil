@@ -52,73 +52,8 @@ func (d *FileDl) Failed(fail func(Block, error)) {
 	d.fail = fail
 }
 
-// Start 开始下载
-func (f *FileDl) Start() {
-	go func() {
-		if f.Size <= 0 {
-			f.BlockList = append(f.BlockList, Block{0, -1})
-		} else {
-			blockSize := f.Size / int64(MaxThread)
-			var begin int64
-			// 数据平均分配给各个线程
-			for i := 0; i < MaxThread; i++ {
-				var end = (int64(i) + 1) * blockSize
-				f.BlockList = append(f.BlockList, Block{begin, end})
-				begin = end + 1
-			}
-			// 将余出数据分配给最后一个线程
-			f.BlockList[MaxThread-1].End += f.Size - f.BlockList[MaxThread-1].End
-		}
-
-		f.touch(f.onStart)
-		// 开始下载
-		err := f.download()
-		if err != nil {
-			f.touchOnError(0, err)
-			return
-		}
-	}()
-}
-
-func (f *FileDl) download() error {
-	f.startGetSpeeds()
-
-	ok := make(chan bool, MaxThread)
-	for i := range f.BlockList {
-		go func(id int) {
-			defer func() {
-				ok <- true
-			}()
-
-			for {
-				err := f.downloadBlock(id)
-				if err != nil {
-					f.touchOnError(0, err)
-					// 重新下载
-					continue
-				}
-				break
-			}
-		}(i)
-	}
-
-	for i := 0; i < MaxThread; i++ {
-		<-ok
-	}
-	// 检查是否为暂停导致的“下载完成”
-	if f.paused {
-		f.touch(f.onPause)
-		return nil
-	}
-	f.paused = true
-	f.touch(f.onFinish)
-
-	return nil
-}
-
-// 文件块下载器
-// 根据线程ID获取下载块的起始位置
-func (f *FileDl) downloadBlock(id int) error {
+// 分片下载
+func download(p Piece) error {
 	request, err := http.NewRequest("GET", f.URL, nil)
 	if err != nil {
 		return err
