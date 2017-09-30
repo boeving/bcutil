@@ -9,20 +9,21 @@ import (
 func ExampleClose() {
 	ch := goes.NewCloser()
 
-	go func() {
-		i := 0
-		for i < 5 {
-			err := fmt.Errorf("error happened %d", i)
-			// non blocking
-			ch.Close(err)
-			i++
-		}
-	}()
-
 	i := 0
+	for i < 5 {
+		// no goroutines leak.
+		go func(n int) {
+			err := fmt.Errorf("error happened %d", n)
+			ch.Close(err)
+		}(i)
+		i++
+	}
+
+	i = 0
 	for i < 3 {
 		err := <-ch.C
-		// only the first error
+		// non-blocking,
+		// only first error, rest err is nil
 		fmt.Println(err)
 		i++
 	}

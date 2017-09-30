@@ -9,23 +9,26 @@ import "sync"
 // 容许ch值为nil，静默返回（无任何效果）。
 //
 // 主要应用于多对一的情形，
-// 例如多个协程中一个出错导致通道关闭，而其它协程仍未执行结束。
+// 例如多个Go程中一个出错导致通道关闭，而其它Go程仍未执行结束。
 //
-func Send(ch chan<- error, msg error) {
+func Send(ch chan<- error, err error) {
 	if ch == nil {
 		return
 	}
 	defer func() { recover() }()
-	ch <- msg
+	ch <- err
 }
 
 //
 // Close 容错式关闭信号通道。
 //
-// 回避重复关闭导致的panic，应用场景与Sendc类似。
+// 回避重复关闭导致的panic，应用场景与Send类似。
 // 兼容ch值为nil，静默返回。
 //
-func Close(ch chan<- error) {
+// 外部仍需将ch内的信号清空，以防关闭前有Go程阻塞。
+// 如果“一旦出错就应该关闭”，则使用Closer更便捷。
+//
+func Close(ch chan<- struct{}) {
 	if ch == nil {
 		return
 	}
@@ -55,17 +58,17 @@ func NewCloser() *Closer {
 
 //
 // Close 发送并关闭。
-// 仅发送一条消息即关闭通道，后续调用静默容错。
+// 仅发送一条消息即关闭通道，后续调用静默容错，无阻塞。
 //
 // 通常，应用仅在出错时才调用此方法。
 //
-func (c *Closer) Close(msg error) {
+func (c *Closer) Close(err error) {
 	defer func() {
 		recover()
 		c.mu.Unlock()
 	}()
 	c.mu.Lock()
 
-	c.C <- msg
+	c.C <- err
 	close(c.C)
 }

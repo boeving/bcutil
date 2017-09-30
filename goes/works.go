@@ -2,16 +2,18 @@ package goes
 
 import (
 	"sync"
+
+	"github.com/qchen-zh/pputil"
 )
 
 //
 // Tasker 任务管理器。
 // 用于构造并发任务执行服务。
-//  - Task 返回nil时结束并发创建；
-//  - Work 返回error表示出错，外部可以终止服务；
+//  - Task ok返回false时结束并发创建。
+//  - Work 返回error表示出错，外部可以终止服务。
 //
 type Tasker interface {
-	Task() interface{}
+	Task() (k interface{}, ok bool)
 	Work(k interface{}) error
 }
 
@@ -26,7 +28,7 @@ type limitTask struct {
 //
 // Task 延迟控制获取任务。
 //
-func (l *limitTask) Task() interface{} {
+func (l *limitTask) Task() (interface{}, bool) {
 	l.sema <- struct{}{}
 	return l.tk.Task()
 }
@@ -55,40 +57,83 @@ func LimitTasker(t Tasker, limit int) Tasker {
 // Works 创建并发工作集。
 //
 // 针对每一次迭代（t.Task），对t.Work开启一个单独的Go程执行。
-// 外部通过bad获得t.Work的执行状态（出错信息），
-// 然后可以通过cancel主动控制内部服务退出。
+// 返回的通道用于获得t.Work的执行状态。
+// 如果有Go程出错，传递首个出错信息后关闭通道，同时不再创建新Go程。
 //
-// 正常结束或外部主动结束服务后，bad管道关闭。
-// 外部应用始终需要清空bad，以防Go程泄漏，
-// 同时，返回的WaitGroup也才会正常归零。
+// 正常结束后，返回的通道传递nil后关闭。
+// 返回的通道保证仅传递一次消息，读取后即无阻塞。
+// （未结束的Go程会继续运行到完成，无阻塞）
 //
-// 注：cancel可由Canceller创建，外部关闭其stop即可传递结束信号。
-//
-func Works(t Tasker, bad chan<- error, cancel func() bool) *sync.WaitGroup {
-	wg := new(sync.WaitGroup)
-	wg.Add(1)
+func Works(t Tasker) <-chan error {
+	end := NewCloser()
+	stop := make(chan struct{})
+	cancel := pputil.Canceller(stop)
 
 	go func() {
+		wg := new(sync.WaitGroup)
 		for {
-			if cancel != nil && cancel() {
+			if cancel() {
 				break
 			}
-			v := t.Task()
-			if v == nil {
+			v, ok := t.Task()
+			if !ok {
 				break
 			}
 			wg.Add(1)
 
 			go func(v interface{}) {
 				if err := t.Work(v); err != nil {
-					Send(bad, err)
+					end.Close(err)
+					// 容错式关闭
+					Close(stop)
 				}
 				wg.Done()
 			}(v)
 		}
-		close(bad)
-		wg.Done()
+		wg.Wait()
+		// 正常关闭传递nil
+		// 容错关闭，无害
+		end.Close(nil)
 	}()
 
-	return wg
+	return end.C
+}
+
+//
+// WorksLong 创建并发工作集。
+// 用法与Works类似，但由外部控制服务是否终止。
+//
+// 正常结束或外部主动结束服务时，返回的管道被直接关闭。
+// 否则内部每个Go程的出错信息都会发送。
+//
+// 外部必须读取完管道内的值，否则内部Go程会阻塞泄漏。
+// cancel实参不能为nil，可由Canceller创建。
+//
+func WorksLong(t Tasker, cancel func() bool) <-chan error {
+	bad := make(chan error)
+
+	go func() {
+		wg := new(sync.WaitGroup)
+		for {
+			if cancel() {
+				break
+			}
+			v, ok := t.Task()
+			if !ok {
+				break
+			}
+			wg.Add(1)
+
+			go func(v interface{}) {
+				if err := t.Work(v); err != nil {
+					bad <- err
+				}
+				wg.Done()
+			}(v)
+		}
+		wg.Wait()
+		close(bad)
+	}()
+
+	return bad
 }

@@ -45,10 +45,35 @@ type Monitor interface {
 // 也可能是文件的全局标识（Hash），此时为P2P传输（peerd）。
 //
 type Manager struct {
-	Monitor           // 下载响应处理
-	Work    Hauler    // 数据搬运工
-	Out     io.Writer // 输出目标文件
-	status  Status    // 当前状态
+	Monitor                // 下载响应处理
+	Work    Hauler         // 数据搬运工
+	Cacher  io.WriteSeeker // 下载数据缓存/重命名输出
+	status  Status         // 当前状态
+}
+
+//
+// CachePut 分片数据缓存输出。
+//
+func (m *Manager) CachePut(bs []PieceData) (num int, err error) {
+	if len(bs) == 0 {
+		return
+	}
+	w, ok := m.cacher.(io.WriterAt)
+	if !ok {
+		err = errWriteAt
+		return
+	}
+	n := 0
+	for _, b := range bs {
+		if n, err = w.WriteAt(b.Data, b.Offset); err != nil {
+			break
+		}
+		num += n
+
+		// 安全存储后移除索引
+		delete(m.restIndexes[b.Offset])
+	}
+	return
 }
 
 //

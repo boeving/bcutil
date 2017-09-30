@@ -23,7 +23,7 @@ func (t *Team) Value() (v interface{}, ok bool) {
 	return
 }
 
-func ExampleServe() {
+func ExampleValues() {
 	ts := Team{
 		members: []string{
 			"Jon snow",
@@ -35,7 +35,7 @@ func ExampleServe() {
 			"Samwell Tarly",
 		},
 	}
-	ch := goes.Serve(&ts, nil)
+	ch := goes.Values(&ts, nil)
 	for {
 		v, ok := <-ch
 		if !ok {
