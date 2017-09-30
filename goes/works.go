@@ -101,13 +101,14 @@ func Works(t Tasker) <-chan error {
 
 //
 // WorksLong 创建并发工作集。
-// 用法与Works类似，但由外部控制服务是否终止。
+// 用法与Works类似，但由外部控制服务何时终止。
 //
-// 正常结束或外部主动结束服务时，返回的管道被直接关闭。
-// 否则内部每个Go程的出错信息都会发送。
+// 服务结束之前工作会一直执行（无论是否出错）。
+// 每个Go程的出错信息也会持续发送。
+// 正常结束或外部主动结束服务后，通道会被直接关闭。
 //
-// 外部必须读取完管道内的值，否则内部Go程会阻塞泄漏。
-// cancel实参不能为nil，可由Canceller创建。
+// 外部需要清空通道内的值，否则内部Go程会阻塞泄漏。
+// cancel可由Canceller创建。
 //
 func WorksLong(t Tasker, cancel func() bool) <-chan error {
 	bad := make(chan error)
@@ -115,7 +116,7 @@ func WorksLong(t Tasker, cancel func() bool) <-chan error {
 	go func() {
 		wg := new(sync.WaitGroup)
 		for {
-			if cancel() {
+			if cancel != nil && cancel() {
 				break
 			}
 			v, ok := t.Task()
