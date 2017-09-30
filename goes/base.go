@@ -41,20 +41,16 @@ func Close(ch chan<- error) {
 // 保证通道即时关闭，
 // 外部应用仅需读取一次通道即可，无并发协程阻塞泄漏。
 //
-//
 type Closer struct {
-	ch chan<- error
-	mu sysc.Mutex
+	C  chan error
+	mu sync.Mutex
 }
 
 //
 // NewCloser 创建一个关闭信号器。
 //
-func NewCloser(ch chan<- error) *Closer {
-	return &Closer{
-		ch: ch,
-		mu: sync.Mutex,
-	}
+func NewCloser() *Closer {
+	return &Closer{C: make(chan error)}
 }
 
 //
@@ -70,6 +66,6 @@ func (c *Closer) Close(msg error) {
 	}()
 	c.mu.Lock()
 
-	c.ch <- msg
-	close(c.ch)
+	c.C <- msg
+	close(c.C)
 }

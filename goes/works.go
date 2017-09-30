@@ -2,8 +2,6 @@ package goes
 
 import (
 	"sync"
-
-	"github.com/qchen-zh/pputil/goes"
 )
 
 //
@@ -83,7 +81,7 @@ func Works(t Tasker, bad chan<- error, cancel func() bool) *sync.WaitGroup {
 
 			go func(v interface{}) {
 				if err := t.Work(v); err != nil {
-					goes.Send(bad, err)
+					Send(bad, err)
 				}
 				wg.Done()
 			}(v)
