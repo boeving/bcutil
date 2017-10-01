@@ -42,7 +42,7 @@ type HashSum [SumLength]byte
 // 小于16k的文本文档无需分片，简化逻辑。
 //
 type Pieces struct {
-	Span  int64             // 分片大小（bytes）
+	Span  int               // 分片大小（bytes）
 	Index map[int64]HashSum // 校验集（key: offset）
 }
 
@@ -50,7 +50,7 @@ type Pieces struct {
 // NewPieces 创建一个分片集对象。
 // @size 为分片大小（bytes）。
 //
-func NewPieces(size int64) Pieces {
+func NewPieces(size int) Pieces {
 	return Pieces{
 		Span:  size,
 		Index: make(map[int64]HashSum),
@@ -66,25 +66,25 @@ func (p *Pieces) Head(r io.Reader) error {
 	if _, err := r.Read(b[:]); err != nil {
 		return err
 	}
-	p.Span = int64(b[0]) * PieceUnit
+	p.Span = int(b[0]) * PieceUnit
 	return nil
 }
 
 //
-// Read 读取分片定义。
+// Load 读取分片定义。
 // 分片定义为32字节哈希连续存储。
 //  结构：1+[32][32]...
 //
 // 0值表示无分片，应仅包含一个哈希序列。
 //
-func (p *Pieces) Read(r io.Reader) error {
+func (p *Pieces) Load(r io.Reader) error {
 	i := 0
 	for {
 		var sum [SumLength]byte
 		if _, err := io.ReadFull(r, sum[:]); err != nil {
 			return err
 		}
-		p.Index[i*p.Span] = sum
+		p.Index[i*int64(p.Span)] = sum
 
 		if p.Span == 0 {
 			break
@@ -96,7 +96,7 @@ func (p *Pieces) Read(r io.Reader) error {
 
 //
 // Bytes 编码分片集。
-// 结构：1+[32][32]...
+// 不含位置偏移，结构：1+[32][32]...
 //
 func (p *Pieces) Bytes() []byte {
 	buf := make([]byte, 1, 1+len(p.Index)*SumLength)
@@ -109,9 +109,22 @@ func (p *Pieces) Bytes() []byte {
 }
 
 //
+// Clone 深层克隆。
+// 主要用于即时清除已下载数据索引。
+//
+func (p *Pieces) Clone() Pieces {
+	list := make(map[int64]HashSum)
+
+	for k, v := range p.Index {
+		list[k] = v
+	}
+	return Pieces{p.Span, list}
+}
+
+//
 // RestPieces 剩余分片。
-// 存储结构与Pieces稍有差别（包含下标偏移值）
-//  结构：1+[8+32][8+32]...
+// 存储结构与Pieces有区别（含下标偏移）
+// 注：因分片已不连续。
 //
 type RestPieces struct {
 	Pieces
@@ -120,10 +133,10 @@ type RestPieces struct {
 const lenOffSum = 8 + SumLength
 
 //
-// Read 读取未下载索引数据。
+// Load 读取未下载索引数据。
 // 结构：1+[8+32][8+32]...
 //
-func (p *RestPieces) Read(r io.Reader) error {
+func (p *RestPieces) Load(r io.Reader) error {
 	for {
 		var buf [lenOffSum]byte
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
@@ -144,7 +157,7 @@ func offsetAndSum(buf *[lenOffSum]byte) (uint64, *HashSum) {
 
 //
 // Bytes 编码剩余分片索引集。
-// 结构：1+[8+32][8+32]...
+// 包含位置下标偏移值，结构：1+[8+32][8+32]...
 //
 func (p *RestPieces) Bytes() []byte {
 	buf := make([]byte, 1, 1+len(p.Index)*lenOffSum)
@@ -237,8 +250,8 @@ func (s *Sumor) List() map[int64]HashSum {
 //
 // Task 获取一个分片定义。
 //
-func (s *Sumor) Task() (v interface{}, ok bool) {
-	v, ok = <-s.ch
+func (s *Sumor) Task() (k interface{}, ok bool) {
+	k, ok = <-s.ch
 	return
 }
 
@@ -300,10 +313,11 @@ func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
 //
 // SumChecker 校验和检查器。
 // 用于完整文件依据校验清单整体核实。
+// （内部并发检查）
 //
 type SumChecker struct {
 	RA   io.ReaderAt
-	Span int64
+	Span int
 	List map[int64]HashSum
 	ch   <-chan int64
 }
@@ -312,7 +326,7 @@ type SumChecker struct {
 // NewSumChecker 创建一个校验和检查器。
 // 注：只能使用一次。
 //
-func NewSumChecker(ra io.ReaderAt, span int64, list map[int64]HashSum) *SumChecker {
+func NewSumChecker(ra io.ReaderAt, span int, list map[int64]HashSum) *SumChecker {
 	ch := make(chan int64)
 	sc := SumChecker{
 		RA:   ra,
@@ -332,8 +346,8 @@ func NewSumChecker(ra io.ReaderAt, span int64, list map[int64]HashSum) *SumCheck
 //
 // Task 返回偏移下标。
 //
-func (sc *SumChecker) Task() (v interface{}, ok bool) {
-	v, ok = sc.ch
+func (sc *SumChecker) Task() (k interface{}, ok bool) {
+	k, ok = sc.ch
 	return
 }
 
@@ -343,7 +357,7 @@ func (sc *SumChecker) Task() (v interface{}, ok bool) {
 //
 func (sc *SumChecker) Work(k interface{}) error {
 	off := k.(int64)
-	data, err := blockRead(sc.RA, off, off+sc.Span)
+	data, err := blockRead(sc.RA, off, off+int64(sc.Span))
 
 	if err != nil {
 		return err
@@ -379,13 +393,18 @@ func CheckSum(ra io.ReaderAt, span int64, list map[int64]HashSum) bool {
 // Ordered 返回按偏移排序后的哈希序列。
 // 已知分片大小的优化版。
 //
+// list需为完整的清单，如果下标偏移超出范围，返回nil。
 // 主要用于默克尔树及树根的计算。
 //
 func Ordered(span int64, list map[int64]HashSum) []HashSum {
 	buf := make([]HashSum, len(list))
 
 	for off, sum := range list {
-		buf[off/span] = sum
+		i := off / span
+		if i >= len(buf) {
+			return nil
+		}
+		buf[i] = sum
 	}
 	return buf
 }

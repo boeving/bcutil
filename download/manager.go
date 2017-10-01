@@ -10,10 +10,17 @@ import (
 	"io"
 )
 
-// 基本常量
-const ()
+const (
+	// RefreshSize 写入缓存
+	// 磁盘刷新数据下限，及时写入并更新未下载索引。
+	// 注记：与Convey上传分享数据缓存不同。
+	RefreshSize = 1 << 23 // 8MB
+)
 
 var (
+	errPieces  = errors.New("the pieces hasn't data")
+	errIndexer = errors.New("the index Writer is invalid")
+	errExpired = errors.New("the download task already end")
 	errSize    = errors.New("file size invalid")
 	errWriteAt = errors.New("the Writer not support WriteAt")
 	errIndex   = errors.New("the indexs not in blocks")
@@ -21,8 +28,15 @@ var (
 
 // Status 下载状态。
 type Status struct {
-	Total     int64
-	Completed int64
+	Total     int // 总分片数
+	Completed int // 已完成下载分片数
+}
+
+//
+// Rest 剩余量设置。
+//
+func (s *Status) Rest(v int) {
+	s.Completed = s.Total - v
 }
 
 //
@@ -39,16 +53,18 @@ type Monitor interface {
 }
 
 //
-// Manager 下载器。
+// Manager 下载管理器。
 //
 // 下载目标可能是一个URL，此时一般巍为http方式获取（httpd）。
 // 也可能是文件的全局标识（Hash），此时为P2P传输（peerd）。
 //
 type Manager struct {
-	Monitor                // 下载响应处理
-	Work    Hauler         // 数据搬运工
-	Cacher  io.WriteSeeker // 下载数据缓存/重命名输出
-	status  Status         // 当前状态
+	Monitor                 // 下载响应处理
+	Dler     Downloader     // 下载器
+	Cacher   io.WriteSeeker // 下载数据缓存/重命名输出
+	Speed    Status         // 完成进度
+	BaseSize int            // 缓存输出基础大小
+	dtch     chan PieceData // 数据传递渠道
 }
 
 //

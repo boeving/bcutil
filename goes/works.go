@@ -9,8 +9,8 @@ import (
 //
 // Tasker 任务管理器。
 // 用于构造并发任务执行服务。
-//  - Task ok返回false时结束并发创建。
-//  - Work 返回error表示出错，外部可以终止服务。
+//  - Task ok返回false表示结束任务分发。
+//  - Work 返回非nil表示出错，外部可能回应。
 //
 type Tasker interface {
 	Task() (k interface{}, ok bool)
@@ -64,6 +64,8 @@ func LimitTasker(t Tasker, limit int) Tasker {
 // 返回的通道保证仅传递一次消息，读取后即无阻塞。
 // （未结束的Go程会继续运行到完成，无阻塞）
 //
+// Task 与 Work 总是成对执行，外部取消不影响这一规则。
+//
 func Works(t Tasker) <-chan error {
 	end := NewCloser()
 	stop := make(chan struct{})
@@ -81,8 +83,8 @@ func Works(t Tasker) <-chan error {
 			}
 			wg.Add(1)
 
-			go func(v interface{}) {
-				if err := t.Work(v); err != nil {
+			go func(k interface{}) {
+				if err := t.Work(k); err != nil {
 					end.Close(err)
 					// 容错式关闭
 					Close(stop)
