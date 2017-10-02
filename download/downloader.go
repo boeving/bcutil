@@ -1,8 +1,3 @@
-// Package download 下载器。
-// 支持并发、断点续传。
-// 外部实现特定的下载方式，如http直接下载或P2P传输。
-// 由用户定义下载响应集。
-//
 package download
 
 import (
@@ -98,8 +93,7 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 
 //
 // Work 下载单块数据。
-// 即时返回，下载失败时无数据传递。
-// 数据异步传递，不影响新的工作进程。
+// 下载失败时无数据传递。
 //
 func (d *Downloader) Work(k interface{}) error {
 	p := k.(Piece)
@@ -108,10 +102,7 @@ func (d *Downloader) Work(k interface{}) error {
 	if err != nil {
 		return err
 	}
-	// 异步传递解耦。
-	go func() {
-		d.dtch <- PieceData{p.Begin, bs}
-	}()
+	d.dtch <- PieceData{p.Begin, bs}
 	return nil
 }
 

@@ -7,14 +7,20 @@ package download
 
 import (
 	"errors"
-	"io"
+	"sync"
 )
 
+// 写入缓存常量。
 const (
-	// RefreshSize 写入缓存
-	// 磁盘刷新数据下限，及时写入并更新未下载索引。
-	// 注记：与Convey上传分享数据缓存不同。
-	RefreshSize = 1 << 23 // 8MB
+	// 磁盘刷新（Refresh）数据下限，写入后更新未下载索引。
+	// 根据硬件环境选配不同的值。
+	CacheSize   = 1 << (20 + iota) // 1MB
+	CacheSize2                     // 2MB
+	CacheSize4                     // 4MB
+	CacheSize8                     // 8MB
+	CacheSize16                    // 16MB
+	CacheSize32                    // 32MB
+	CacheSize64                    // 64MB
 )
 
 var (
@@ -26,113 +32,137 @@ var (
 	errIndex   = errors.New("the indexs not in blocks")
 )
 
-// Status 下载状态。
-type Status struct {
-	Total     int // 总分片数
-	Completed int // 已完成下载分片数
-}
-
 //
-// Rest 剩余量设置。
-//
-func (s *Status) Rest(v int) {
-	s.Completed = s.Total - v
-}
-
-//
-// Monitor 下载管理。
-// 在下载过程的各个阶段/状态触发控制响应。
+// Monitor 下载监控器。
+// 在下载过程的各个阶段/状态触发的响应回调。
 //
 type Monitor interface {
-	OnStart(s Status)   // 下载开始之前的回调
-	OnPause(s Status)   // 下载暂停之后的回调
-	OnResume(s Status)  // 下载继续之前的回调
-	OnCancel(s Status)  // 下载取消之后的回调
-	OnFinish(s Status)  // 下载完成之后的回调
-	OnError(int, error) // 出错之后的回调
+	ChPause() <-chan struct{} // 获取暂停信号
+	ChExit() <-chan struct{}  // 获取退出信号
+	Status() *Status          // 获取状态对象
+
+	// 下载控制
+	// 返回false表示拒绝该操作。
+	Start() bool  // 开始下载
+	Pause() bool  // 暂停下载
+	Resume() bool // 继续暂停后的下载
+	Exit() bool   // 结束下载
+
+	Errors(off int64, err error) // 错误信息递送
+	Finish() error               // 完成回调
 }
+
+// UICaller 用户行为前置约束。
+// 返回false否决目标行为（如：Start、Pause等）
+type UICaller func(Status) bool
 
 //
 // Manager 下载管理器。
-//
-// 下载目标可能是一个URL，此时一般巍为http方式获取（httpd）。
-// 也可能是文件的全局标识（Hash），此时为P2P传输（peerd）。
+// 实现 Monitor 接口。
+//  - 普通URL下载采用http方式（httpd）
+//  - 文件哈希标识采用P2P传输（peerd）
 //
 type Manager struct {
-	Monitor                 // 下载响应处理
-	Dler     Downloader     // 下载器
-	Cacher   io.WriteSeeker // 下载数据缓存/重命名输出
-	Speed    Status         // 完成进度
-	BaseSize int            // 缓存输出基础大小
-	dtch     chan PieceData // 数据传递渠道
+	OnStart  UICaller // 下载开始之前
+	OnPause  UICaller // 暂停之前
+	OnResume UICaller // 继续之前（暂停后）
+	OnExit   UICaller // 结束之前
+
+	OnFinish func(Status)       // 下载完成之后
+	OnError  func(int64, error) // 出错之后
+
+	status  Status        // 状态暂存
+	chExit  chan struct{} // 取消信号量
+	chPause chan struct{} // 暂停信号量
+	semu    sync.Mutex
 }
 
 //
-// CachePut 分片数据缓存输出。
+// ChExit 取消信号。
 //
-func (m *Manager) CachePut(bs []PieceData) (num int, err error) {
-	if len(bs) == 0 {
-		return
-	}
-	w, ok := m.cacher.(io.WriterAt)
-	if !ok {
-		err = errWriteAt
-		return
-	}
-	n := 0
-	for _, b := range bs {
-		if n, err = w.WriteAt(b.Data, b.Offset); err != nil {
-			break
-		}
-		num += n
-
-		// 安全存储后移除索引
-		delete(m.restIndexes[b.Offset])
-	}
-	return
+func (m *Manager) ChExit() <-chan struct{} {
+	m.semu.Lock()
+	defer m.semu.Unlock()
+	return m.chExit
 }
 
 //
-// Start 开始或重新下载。
+// ChPause 暂停信号。
 //
-func (dl *Manager) Start() {
-	//
+func (m *Manager) ChPause() <-chan struct{} {
+	m.semu.Lock()
+	defer m.semu.Unlock()
+	return m.chPause
+}
+
+//
+// Status 接口：被设置下载状态。
+//
+func (m *Manager) Status() *Status {
+	return &m.status
+}
+
+//
+// Errors 发送出错信息。
+// @off 为下载失败的分片在文件中的下标位置。
+//
+func (m *Manager) Errors(off int64, err error) {
+	if m.OnError != nil {
+		m.OnError(off, err)
+	}
+}
+
+//
+// Start 开始下载。
+// 可能从未完成的临时文件开始（程序中途退出）。
+//
+func (m *Manager) Start() bool {
+	if m.OnStart != nil && !m.OnStart(m.status) {
+		return false
+	}
+	m.chExit = make(chan struct{})
+	m.chPause = make(chan struct{})
+	close(m.chPause)
+
+	return true
 }
 
 //
 // Pause 暂停。
-// 会缓存下载的文件，待后续断点续传。
 //
-func (dl *Manager) Pause() {
-	//
+func (m *Manager) Pause() bool {
+	if m.OnPause != nil && !m.OnPause(m.status) {
+		return false
+	}
+	m.chPause = make(chan struct{})
+	return true
 }
 
 //
 // Resume 继续下载。
-// 从未完成的临时文件开始，程序中途可能退出。
 //
-func (dl *Manager) Resume() {
-	//
+func (m *Manager) Resume() bool {
+	if m.OnResume != nil && !m.OnResume(m.status) {
+		return false
+	}
+	close(m.chPause)
+	return true
 }
 
 //
-// Cancel 取消下载。
-// 包含Clean逻辑，会清除下载的临时文件。
+// Exit 结束下载。
 //
-func (dl *Manager) Cancel() {
-	//
-}
-
-//
-// Status 获取下载状态。
-//
-func (dl *Manager) Status() {
+func (m *Manager) Exit() bool {
+	if m.OnExit != nil && !m.OnExit(m.status) {
+		return false
+	}
+	close(m.chExit)
 	//
 }
 
 //
 // Clean 清理临时文件。
 //
-func (dl *Manager) Clean() bool {
+func (m *Manager) Clean() error {
 
 }
