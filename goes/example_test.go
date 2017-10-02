@@ -15,6 +15,8 @@ func ExampleClose() {
 		go func(n int) {
 			err := fmt.Errorf("error happened %d", n)
 			ch.Close(err)
+			// non-blocking,
+			fmt.Println(err)
 		}(i)
 		i++
 	}
@@ -24,11 +26,7 @@ func ExampleClose() {
 		err := <-ch.C
 		// non-blocking,
 		// only first error, rest err is nil
-		fmt.Println(err)
+		fmt.Println("Outside: ", err)
 		i++
 	}
-	// Output:
-	// error happened 0
-	// <nil>
-	// <nil>
 }

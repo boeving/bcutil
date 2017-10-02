@@ -13,9 +13,8 @@ import (
 // 兼容IPv4和IPv6两种格式。内部用切片实现，可添加重复的地址。
 //
 type Stack struct {
-	pool   []net.Addr
-	cursor int
-	mu     sync.Mutex
+	pool []net.Addr
+	mu   sync.Mutex
 }
 
 //
@@ -101,29 +100,19 @@ func (s *Stack) Pop(n int) []net.Addr {
 // 允许地址集在服务期变化（更大的灵活性）。
 //
 func (s *Stack) IPAddrs(cancel func() bool) <-chan interface{} {
-	return goes.Serve(s, cancel)
-}
-
-//
-// Reset 重置游标。
-//
-func (s *Stack) Reset() {
-	s.mu.Lock()
-	s.cursor = 0
-	s.mu.Unlock()
+	return goes.Values(s, 0, 1, cancel)
 }
 
 //
 // Value 提取下一个地址。
 // v存储：net.Addr
 //
-func (s *Stack) Value() (v interface{}, ok bool) {
+func (s *Stack) Value(i int) (v interface{}, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if 0 < len(s.pool) && s.cursor < len(s.pool) {
-		v, ok = s.pool[s.cursor], true
-		s.cursor++
+	if 0 < len(s.pool) && i < len(s.pool) {
+		v, ok = s.pool[i], true
 	}
 	return
 }

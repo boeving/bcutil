@@ -92,7 +92,7 @@ func (d *Downloader) Run(rest Pieces) <-chan PieceData {
 // Task 获取一个分片定义。
 //
 func (d *Downloader) Task() (k interface{}, ok bool) {
-	k, ok = d.pich
+	k, ok = <-d.pich
 	return
 }
 

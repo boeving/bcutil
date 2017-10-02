@@ -233,8 +233,9 @@ func NewSumor(ra io.ReaderAt, fsize, psz int64) *Sumor {
 	}
 	sm := Sumor{
 		ra:   ra,
-		ch:   Divide(fsize, psz), // 分片服务
 		list: make(map[int64]HashSum),
+		// 启动分片服务
+		ch: Divide(fsize, psz),
 	}
 	return &sm
 }
@@ -347,7 +348,7 @@ func NewSumChecker(ra io.ReaderAt, span int, list map[int64]HashSum) *SumChecker
 // Task 返回偏移下标。
 //
 func (sc *SumChecker) Task() (k interface{}, ok bool) {
-	k, ok = sc.ch
+	k, ok = <-sc.ch
 	return
 }
 

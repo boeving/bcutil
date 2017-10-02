@@ -8,7 +8,8 @@ package goes
 //
 type Valuer interface {
 	// ok返回false表示结束取值。
-	Value() (v interface{}, ok bool)
+	// 允许传递一个通用索引号。
+	Value(i int) (v interface{}, ok bool)
 }
 
 //
@@ -20,7 +21,10 @@ type Valuer interface {
 // 外部可通过cancel主动退出微服务。
 // 注：cancel可由Canceller创建，外部关闭其stop即可。
 //
-func Values(v Valuer, cancel func() bool) <-chan interface{} {
+//  @i 通用索引号起始值。
+//  @setp 通用索引步进值。
+//
+func Values(v Valuer, i, step int, cancel func() bool) <-chan interface{} {
 	ch := make(chan interface{})
 
 	go func() {
@@ -28,12 +32,13 @@ func Values(v Valuer, cancel func() bool) <-chan interface{} {
 			if cancel != nil && cancel() {
 				break
 			}
-			val, ok := v.Value()
+			val, ok := v.Value(i)
 
 			if !ok {
 				break
 			}
 			ch <- val
+			i += step
 		}
 		close(ch)
 	}()

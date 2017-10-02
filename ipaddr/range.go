@@ -5,6 +5,7 @@
 package ipaddr
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -19,11 +20,10 @@ import (
 // 并发安全，可以在多个Go程中操作同一实例。
 //
 type Range struct {
-	netip  net.IP // 网络地址
-	begin  int    // 起始主机号
-	end    int    // 终点主机号
-	cursor int    // 当前取值
-	mu     sync.Mutex
+	netip net.IP // 网络地址
+	begin int    // 起始主机号
+	end   int    // 终点主机号
+	mu    sync.Mutex
 }
 
 // NewRange 新建一个范围实例。
@@ -47,32 +47,24 @@ func NewRange(cidr string, begin, end int) (*Range, error) {
 // 返回管道内值：net.Addr。
 //
 func (r *Range) IPAddrs(cancel func() bool) <-chan interface{} {
-	return goes.Serve(r, cancel)
-}
-
-//
-// Reset 迭代重置。内部游标归零。
-//
-func (r *Range) Reset() *Range {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.cursor = 0
-	return r
+	return goes.Values(r, 0, 1, cancel)
 }
 
 //
 // Value 获取下一个IP地址。
 // v存储：net.Addr
 //
-func (r *Range) Value() (v interface{}, ok bool) {
+func (r *Range) Value(i int) (interface{}, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.cursor >= r.end {
-		return
+	if i >= r.end {
+		return nil, false
 	}
-	r.cursor++
-	return makeIPv4(r.netip, iToBytes(uint32(r.cursor-1))), true
+	var host [4]byte
+	binary.BigEndian.PutUint32(host[:], uint32(i))
+
+	return makeIPv4(r.netip, host), true
 }
 
 /////////////
@@ -106,13 +98,13 @@ func check(begin, end int, mask net.IPMask) error {
 //
 // 构造IPv4主机地址。
 //
-func makeIPv4(nip net.IP, host []byte) net.Addr {
-	out := make([]byte, len(nip))
+func makeIPv4(nip net.IP, host [4]byte) net.Addr {
+	var out [4]byte
 
-	for i := 0; i < net.IPv4len; i++ {
+	for i := 0; i < 4; i++ {
 		out[i] = nip[i] | host[i]
 	}
-	return &net.IPAddr{IP: net.IP(out)}
+	return &net.IPAddr{IP: net.IP(out[:])}
 }
 
 //
@@ -125,17 +117,4 @@ func validHost(mask net.IPMask, host int) bool {
 		return false
 	}
 	return true
-}
-
-//
-// 整数转为字节序列。
-//
-func iToBytes(n uint32) []byte {
-	out := make([]byte, 4)
-
-	for i := 3; i >= 0; i-- {
-		out[i] = byte(n & 0xff)
-		n >>= 8
-	}
-	return out
 }
