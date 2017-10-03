@@ -34,26 +34,32 @@ type HashSum [SumLength]byte
 
 //
 // Pieces 分片集。
-// 头部1字节存储分片大小（16k单位）。
-//  - 0分片大小表示不分片；
+// 头部4字节存储分片数量和分片大小（16k单位）。
+// 其中前20位定义分片数量，后12位定义分片大小。
 //  - 最小分片16k（16k*1）；
-//  - 最大分片约4MB大小（16k*255）。
+//  - 最大分片约64MB（16k*4096）。
+//  - 0分片大小表示不分片；
 // 友好：
 // 小于16k的文本文档无需分片，简化逻辑。
 //
 type Pieces struct {
+	Total int               // 分片数量
 	Span  int               // 分片大小（bytes）
-	Index map[int64]HashSum // 校验集（key: offset）
+	Sums  map[int64]HashSum // 校验集（key: offset）
 }
 
 //
-// NewPieces 创建一个分片集对象。
-// @size 为分片大小（bytes）。
+// NewPieces 新建一个分片集。
+// 设置为单一分片的默认值（也即未分片）。
+// 常用于对种子文件的直接下载。
 //
-func NewPieces(size int) Pieces {
-	return Pieces{
-		Span:  size,
-		Index: make(map[int64]HashSum),
+// 通常情况下，外部是直接声明一个实例，
+// 然后调用Head和Load从种子文件中载入配置。
+//
+func NewPieces(sum HashSum) *Pieces {
+	return &Pieces{
+		1, 0,
+		map[int64]HashSum{0: sum},
 	}
 }
 
@@ -62,63 +68,98 @@ func NewPieces(size int) Pieces {
 // 外部需要保证读取流游标处于头部位置。
 //
 func (p *Pieces) Head(r io.Reader) error {
-	var b [1]byte
+	var b [4]byte
 	if _, err := r.Read(b[:]); err != nil {
 		return err
 	}
-	p.Span = int(b[0]) * PieceUnit
+	n2 := binary.BigEndian.Uint32(b[:])
+
+	// 前20bit为分片总数
+	p.Total = int(n2 >> 12)
+
+	// 后12bit为分片大小（16k单位）
+	p.Span = int((n2<<20)>>20) * PieceUnit
+
 	return nil
 }
 
 //
 // Load 读取分片定义。
 // 分片定义为32字节哈希连续存储。
-//  结构：1+[32][32]...
+// 结构：4+[32][32]...
 //
-// 0值表示无分片，应仅包含一个哈希序列。
+// 0值表示无分片，应仅读取一个哈希序列。
+// 正常返回的error值为io.EOF。
+//
+// 外部应保证读取流处于正确的位置（Head调用之后）。
 //
 func (p *Pieces) Load(r io.Reader) error {
-	i := 0
-	for {
+	if p.Sums == nil {
+		p.Sums = make(map[int64]HashSum)
+	}
+	span := int64(p.Span)
+
+	for i := 0; i < p.Total; i++ {
 		var sum [SumLength]byte
 		if _, err := io.ReadFull(r, sum[:]); err != nil {
 			return err
 		}
-		p.Index[i*int64(p.Span)] = sum
+		p.Sums[i*span] = sum
 
 		if p.Span == 0 {
 			break
 		}
-		i++
 	}
 	return nil
 }
 
 //
-// Bytes 编码分片集。
-// 不含位置偏移，结构：1+[32][32]...
+// Bytes 编码分片集整体字节序列。
+// 结构：4+[32][32]...
 //
 func (p *Pieces) Bytes() []byte {
-	buf := make([]byte, 1, 1+len(p.Index)*SumLength)
-	buf[1] = byte(p.Span / PieceUnit)
+	buf := make([]byte, 0, 4+len(p.Sums)*SumLength)
 
-	for _, sum := range p.Index {
+	// Head[4]...
+	buf = append(buf, p.HeadBytes()...)
+
+	for _, sum := range p.Sums {
 		buf = append(buf, sum[:]...)
 	}
 	return buf
 }
 
 //
-// Clone 深层克隆。
-// 主要用于即时清除已下载数据索引。
+// HeadBytes 构造头部4字节序列。
 //
-func (p *Pieces) Clone() Pieces {
-	list := make(map[int64]HashSum)
+func (p *Pieces) HeadBytes() []byte {
+	var buf [4]byte
 
-	for k, v := range p.Index {
-		list[k] = v
+	n2 := uint32(p.Total << 12)
+	n2 = n2 | (p.Span/PieceUnit)&0xfff
+
+	binary.BigEndian.PutUint32(buf[:], n2)
+
+	return buf[:]
+}
+
+//
+// Indexes 下标索引集。
+//
+func (p *Pieces) Indexes() []int64 {
+	buf := make([]int64, 0, len(p.Sums))
+
+	for k := range p.Sums {
+		buf = append(buf, k)
 	}
-	return Pieces{p.Span, list}
+	return buf
+}
+
+//
+// Empty 分片集是否为空
+//
+func (p *Pieces) Empty() bool {
+	return len(p.Sums) == 0
 }
 
 //
@@ -134,16 +175,20 @@ const lenOffSum = 8 + SumLength
 
 //
 // Load 读取未下载索引数据。
-// 结构：1+[8+32][8+32]...
+// 结构：4+[8+32][8+32]...
 //
 func (p *RestPieces) Load(r io.Reader) error {
-	for {
+	if p.Sums == nil {
+		p.Sums = make(map[int64]HashSum)
+	}
+	// 按头部定义次数循环
+	for i := 0; i < p.Total; i++ {
 		var buf [lenOffSum]byte
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
 			return err
 		}
 		off, sum := offsetAndSum(buf)
-		p.Index[int64(off)] = *sum
+		p.Sums[int64(off)] = *sum
 	}
 	return nil
 }
@@ -156,15 +201,15 @@ func offsetAndSum(buf *[lenOffSum]byte) (uint64, *HashSum) {
 }
 
 //
-// Bytes 编码剩余分片索引集。
-// 包含位置下标偏移值，结构：1+[8+32][8+32]...
+// Bytes 编码剩余分片索引集（整体）。
+// 包含位置下标偏移值，结构：4+[8+32][8+32]...
 //
 func (p *RestPieces) Bytes() []byte {
-	buf := make([]byte, 1, 1+len(p.Index)*lenOffSum)
-	buf[1] = byte(p.Span / PieceUnit)
-	off := make([]byte, 8)
+	buf := make([]byte, 0, 4+len(p.Sums)*lenOffSum)
+	buf = append(buf, p.HeadBytes()...)
 
-	for k, sum := range p.Index {
+	off := make([]byte, 8)
+	for k, sum := range p.Sums {
 		binary.BigEndian.PutUint64(off, uint64(k))
 		buf = append(buf, off...)
 		buf = append(buf, sum[:]...)

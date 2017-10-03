@@ -1,12 +1,14 @@
-// Package download 下载器。
+// Package download 分片下载模块。
 // 支持并发、断点续传。
 // 外部实现特定的下载方式，如http直接下载或P2P传输。
 // 由用户定义下载响应集。
 //
+// 对于http方式的资源，也应当构建一个分片索引集，包含验证哈希。
+// 这样便于P2P传输。http源被视为一个种子。
+//
 package download
 
 import (
-	"errors"
 	"sync"
 )
 
@@ -21,15 +23,6 @@ const (
 	CacheSize16                    // 16MB
 	CacheSize32                    // 32MB
 	CacheSize64                    // 64MB
-)
-
-var (
-	errPieces  = errors.New("the pieces hasn't data")
-	errIndexer = errors.New("the index Writer is invalid")
-	errExpired = errors.New("the download task already end")
-	errSize    = errors.New("file size invalid")
-	errWriteAt = errors.New("the Writer not support WriteAt")
-	errIndex   = errors.New("the indexs not in blocks")
 )
 
 //
@@ -52,6 +45,45 @@ type Monitor interface {
 	Finish() error               // 完成回调
 }
 
+// Status 下载状态。
+type Status struct {
+	Total     int // 总分片数
+	Completed int // 已完成下载分片数
+	mu        sync.Mutex
+}
+
+//
+// NewStatus 新建一个状态实例。
+//
+func NewStatus(rest, total int) *Status {
+	return &Status{
+		Total:     total,
+		Completed: total - rest,
+	}
+}
+
+//
+// Add 分片计数累加。
+//
+func (s *Status) Add(n int) {
+	s.mu.Lock()
+	s.Completed += n
+	s.mu.Unlock()
+}
+
+//
+// Progress 完成进度[0-1]。
+//
+func (s *Status) Progress() float32 {
+	s.mu.Look()
+	defer s.mu.Unlock()
+
+	if s.Completed == s.Total {
+		return 1.0
+	}
+	return float32(s.Completed) / float32(s.Total)
+}
+
 // UICaller 用户行为前置约束。
 // 返回false否决目标行为（如：Start、Pause等）
 type UICaller func(Status) bool
@@ -68,7 +100,7 @@ type Manager struct {
 	OnResume UICaller // 继续之前（暂停后）
 	OnExit   UICaller // 结束之前
 
-	OnFinish func(Status)       // 下载完成之后
+	OnFinish func(Status) error // 下载完成之后
 	OnError  func(int64, error) // 出错之后
 
 	status  Status        // 状态暂存
@@ -81,8 +113,6 @@ type Manager struct {
 // ChExit 取消信号。
 //
 func (m *Manager) ChExit() <-chan struct{} {
-	m.semu.Lock()
-	defer m.semu.Unlock()
 	return m.chExit
 }
 
@@ -96,25 +126,16 @@ func (m *Manager) ChPause() <-chan struct{} {
 }
 
 //
-// Status 接口：被设置下载状态。
+// Status 返回下载状态实例。
+// 可能被用于设置状态或获取信息。
 //
 func (m *Manager) Status() *Status {
 	return &m.status
 }
 
 //
-// Errors 发送出错信息。
-// @off 为下载失败的分片在文件中的下标位置。
-//
-func (m *Manager) Errors(off int64, err error) {
-	if m.OnError != nil {
-		m.OnError(off, err)
-	}
-}
-
-//
 // Start 开始下载。
-// 可能从未完成的临时文件开始（程序中途退出）。
+// 注册回调返回false，表示不同意开始。
 //
 func (m *Manager) Start() bool {
 	if m.OnStart != nil && !m.OnStart(m.status) {
@@ -122,7 +143,8 @@ func (m *Manager) Start() bool {
 	}
 	m.chExit = make(chan struct{})
 	m.chPause = make(chan struct{})
-	close(m.chPause)
+
+	close(m.chPause) // non-blocking
 
 	return true
 }
@@ -157,12 +179,26 @@ func (m *Manager) Exit() bool {
 		return false
 	}
 	close(m.chExit)
-	//
+	return true
 }
 
 //
-// Clean 清理临时文件。
+// Finish 完成后回调。
+// 可能用于外部状态显示（用户）。
 //
-func (m *Manager) Clean() error {
+func (m *Manager) Finish() error {
+	if m.OnFinish != nil {
+		return m.OnFinish(m.status)
+	}
+	return nil
+}
 
+//
+// Errors 发送出错信息。
+// @off 为下载失败的分片在文件中的下标位置。
+//
+func (m *Manager) Errors(off int64, err error) {
+	if m.OnError != nil {
+		m.OnError(off, err)
+	}
 }

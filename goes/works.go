@@ -46,6 +46,9 @@ func (l *limitTask) Work(k interface{}) error {
 // LimitTasker 创建一个有限并发任务管理器。
 //
 func LimitTasker(t Tasker, limit int) Tasker {
+	if limit <= 0 {
+		return nil
+	}
 	lt := limitTask{
 		t,
 		make(chan struct{}, limit),

@@ -51,22 +51,25 @@ func NewDownloader(fx func() Hauler) *Downloader {
 
 //
 // Run 执行下载。
-// rest 为外部传递的一个待下载分片定义集。
+// rest 为外部传递的一个待下载分片下标集。
 // 返回一个分片数据读取通道。
 // 当下载进程完毕后，通道关闭（可能有下载失败）。
 //
-func (d *Downloader) Run(rest Pieces) <-chan PieceData {
+func (d *Downloader) Run(span int, rest []int64) <-chan PieceData {
+	if len(rest) == 0 {
+		return nil
+	}
 	// 搬运工数量
 	max := MaxThread
-	if len(rest.Index) < max {
-		max = len(rest.Index)
+	if len(rest) < max {
+		max = len(rest)
 	}
 	// max作为通道缓存仅是一种主观处理。
 	// 通道的效率与外部存储IO相关。
 	d.dtch = make(chan PieceData, max)
 
 	// 分片索引服务
-	d.pich = pieceGetter(rest)
+	d.pich = pieceGetter(rest, int64(span))
 
 	err := goes.WorksLong(goes.LimitTasker(d, max), nil)
 	go func() {
@@ -110,12 +113,12 @@ func (d *Downloader) Work(k interface{}) error {
 // 分片定义取值渠道。
 // 对外传递未下载分片定义{Begin, End}。
 //
-func pieceGetter(p Pieces) <-chan Piece {
+func pieceGetter(list []int64, span int64) <-chan Piece {
 	ch := make(chan Piece)
 
 	go func() {
-		for off := range p.Index {
-			ch <- Piece{off, off + int64(p.Span)}
+		for _, off := range list {
+			ch <- Piece{off, off + span}
 		}
 		close(ch)
 	}()
