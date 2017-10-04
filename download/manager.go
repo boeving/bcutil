@@ -138,13 +138,16 @@ func (m *Manager) Status() *Status {
 // 注册回调返回false，表示不同意开始。
 //
 func (m *Manager) Start() bool {
+	m.semu.Lock()
+	defer m.semu.Unlock()
+
 	if m.OnStart != nil && !m.OnStart(m.status) {
 		return false
 	}
 	m.chExit = make(chan struct{})
 	m.chPause = make(chan struct{})
-
-	close(m.chPause) // non-blocking
+	// non-blocking
+	close(m.chPause)
 
 	return true
 }
@@ -153,6 +156,9 @@ func (m *Manager) Start() bool {
 // Pause 暂停。
 //
 func (m *Manager) Pause() bool {
+	m.semu.Lock()
+	defer m.semu.Unlock()
+
 	if m.OnPause != nil && !m.OnPause(m.status) {
 		return false
 	}
@@ -164,6 +170,9 @@ func (m *Manager) Pause() bool {
 // Resume 继续下载。
 //
 func (m *Manager) Resume() bool {
+	m.semu.Lock()
+	defer m.semu.Unlock()
+
 	if m.OnResume != nil && !m.OnResume(m.status) {
 		return false
 	}

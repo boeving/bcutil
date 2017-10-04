@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"sync"
 
 	"github.com/qchen-zh/pputil/goes"
 )
@@ -17,13 +16,10 @@ import (
 // Range IP范围。
 // 仅支持IPv4地址类型。
 //
-// 并发安全，可以在多个Go程中操作同一实例。
-//
 type Range struct {
 	netip net.IP // 网络地址
 	begin int    // 起始主机号
 	end   int    // 终点主机号
-	mu    sync.Mutex
 }
 
 // NewRange 新建一个范围实例。
@@ -55,9 +51,6 @@ func (r *Range) IPAddrs(cancel func() bool) <-chan interface{} {
 // v存储：net.Addr
 //
 func (r *Range) Value(i int) (interface{}, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if i >= r.end {
 		return nil, false
 	}

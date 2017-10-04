@@ -75,7 +75,7 @@ func Works(t Tasker) <-chan error {
 	cancel := pputil.Canceller(stop)
 
 	go func() {
-		wg := new(sync.WaitGroup)
+		var wg sync.WaitGroup
 		for {
 			if cancel() {
 				break
@@ -119,7 +119,7 @@ func WorksLong(t Tasker, cancel func() bool) <-chan error {
 	bad := make(chan error)
 
 	go func() {
-		wg := new(sync.WaitGroup)
+		var wg sync.WaitGroup
 		for {
 			if cancel != nil && cancel() {
 				break

@@ -89,7 +89,7 @@ type Server struct {
 
 	dtch  <-chan PieceData // 数据传递通道
 	speed *Status          // 完成进度
-	rtmu  sync.Mutex       // 分片索引管理锁
+	rtsem chan struct{}    // 分片索引管理锁
 }
 
 //
@@ -126,12 +126,11 @@ func (s *Server) Run(rest RestPieces) {
 		close(rtch)
 
 		// 等待分片索引管理服务退出。
-		s.rtmu.Lock()
-
-		if done = rest.Empty(); !done {
-			s.dtch = s.Dler.Run(rest.Span, rest.Indexes())
+		<-s.rtsem
+		if rest.Empty() {
+			break
 		}
-		s.rtmu.Unlock()
+		s.dtch = s.Dler.Run(rest.Span, rest.Indexes())
 	}
 }
 
@@ -221,11 +220,11 @@ func (s *Server) restManage(rest RestPieces, ch <-chan int64) {
 	if tm == 0 {
 		tm = IndexInterval
 	}
-	s.rtmu.Lock()
+	tick := time.NewTicker(tm)
 
 	for k := range ch {
 		select {
-		case <-time.After(tm):
+		case <-tick:
 			rest.Total = len(rest.Sums)
 			if _, err := s.Indexer.WriteAt(rest.Bytes(), 0); err != nil {
 				log.Println(err)
@@ -235,6 +234,8 @@ func (s *Server) restManage(rest RestPieces, ch <-chan int64) {
 		delete(rest.Sums, k)
 		s.speed.Add(1)
 	}
+	tick.Stop()
 
-	s.rtmu.Unlock()
+	// 服务完毕
+	s.rtsem <- struct{}{}
 }

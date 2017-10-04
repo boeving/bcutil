@@ -29,7 +29,7 @@ var (
 	errChecksum = errors.New("checksum was failed")
 )
 
-// HashSum sha1校验和。
+// HashSum 哈希校验和。
 type HashSum [SumLength]byte
 
 //
@@ -258,13 +258,24 @@ func Divide(fsize, psz int64) <-chan Piece {
 }
 
 //
+// OffSum 偏移&校验和值对。
+// 用于 map[int64]HashSum 并发数据的传递。
+//
+type OffSum struct {
+	Off int64
+	Sum HashSum
+}
+
+//
 // Sumor 校验和生成器。
 // 由 Do|FullDo 实施，仅可单次使用。
 //
 type Sumor struct {
 	ra   io.ReaderAt
-	ch   <-chan Piece
 	list map[int64]HashSum
+	ch   <-chan Piece
+	vch  chan OffSum
+	sem  chan struct{} // 取值锁
 }
 
 //
@@ -279,9 +290,20 @@ func NewSumor(ra io.ReaderAt, fsize, psz int64) *Sumor {
 	sm := Sumor{
 		ra:   ra,
 		list: make(map[int64]HashSum),
-		// 启动分片服务
-		ch: Divide(fsize, psz),
+		sem:  make(chan struct{}),
+		// 一个分片服务
+		ch:  Divide(fsize, psz),
+		vch: make(chan OffSum),
 	}
+
+	// 单独的赋值服务（list非并发安全）
+	go func() {
+		for v := range vch {
+			sm.list[v.Off] = v.Sum
+		}
+		close(sm.sem)
+	}()
+
 	return &sm
 }
 
@@ -290,6 +312,7 @@ func NewSumor(ra io.ReaderAt, fsize, psz int64) *Sumor {
 // 需要在 Do|FullDo 成功构建之后调用。
 //
 func (s *Sumor) List() map[int64]HashSum {
+	<-s.sem
 	return s.list
 }
 
@@ -311,7 +334,8 @@ func (s *Sumor) Work(k interface{}) error {
 	if err != nil {
 		return err
 	}
-	s.list[p.Begin] = sha256.Sum256(data)
+	s.vch <- OffSum{
+		p.Begin, sha256.Sum256(data)}
 
 	return nil
 }
@@ -365,7 +389,7 @@ type SumChecker struct {
 	RA   io.ReaderAt
 	Span int
 	List map[int64]HashSum
-	ch   <-chan int64
+	ch   <-chan OffSum
 }
 
 //
@@ -373,7 +397,7 @@ type SumChecker struct {
 // 注：只能使用一次。
 //
 func NewSumChecker(ra io.ReaderAt, span int, list map[int64]HashSum) *SumChecker {
-	ch := make(chan int64)
+	ch := make(chan OffSum)
 	sc := SumChecker{
 		RA:   ra,
 		Span: span,
@@ -381,8 +405,9 @@ func NewSumChecker(ra io.ReaderAt, span int, list map[int64]HashSum) *SumChecker
 		ch:   ch,
 	}
 	go func() {
-		for k := range sc.List {
-			ch <- k // no sc.ch
+		for k, sum := range sc.List {
+			// no sc.ch (only read)
+			ch <- OffSum{k, sum}
 		}
 		close(ch)
 	}()
@@ -402,13 +427,13 @@ func (sc *SumChecker) Task() (k interface{}, ok bool) {
 // 不符合则返回一个错误。
 //
 func (sc *SumChecker) Work(k interface{}) error {
-	off := k.(int64)
-	data, err := blockRead(sc.RA, off, off+int64(sc.Span))
+	os := k.(OffSum)
+	data, err := blockRead(sc.RA, os.Off, os.Off+int64(sc.Span))
 
 	if err != nil {
 		return err
 	}
-	if sha256.Sum256(data) != sc.List[off] {
+	if sha256.Sum256(data) != os.Sum {
 		return errChecksum
 	}
 	return nil
