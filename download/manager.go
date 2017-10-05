@@ -26,67 +26,41 @@ const (
 )
 
 //
+// Controller 下载控制。
+//
+type Controller interface {
+	// 退出控制
+	// 返回的通道关闭表示退出。
+	ChExit() <-chan struct{}
+
+	// 暂停控制
+	// 返回的通道阻塞表示暂停。
+	ChPause() <-chan struct{}
+}
+
+//
 // Monitor 下载监控器。
 // 在下载过程的各个阶段/状态触发的响应回调。
 //
 type Monitor interface {
-	ChPause() <-chan struct{} // 获取暂停信号
-	ChExit() <-chan struct{}  // 获取退出信号
-	Status() *Status          // 获取状态对象
+	Controller
 
 	// 下载控制
 	// 返回false表示拒绝该操作。
-	Start() bool  // 开始下载
-	Pause() bool  // 暂停下载
-	Resume() bool // 继续暂停后的下载
-	Exit() bool   // 结束下载
+	Start() bool   // 开始下载
+	Pause() bool   // 暂停下载
+	Resume() bool  // 继续暂停后的下载
+	Exit() bool    // 结束下载
+	Finish() error // 完成下载
 
-	Errors(off int64, err error) // 错误信息递送
-	Finish() error               // 完成回调
-}
-
-// Status 下载状态。
-type Status struct {
-	Total     int // 总分片数
-	Completed int // 已完成下载分片数
-	mu        sync.Mutex
-}
-
-//
-// NewStatus 新建一个状态实例。
-//
-func NewStatus(rest, total int) *Status {
-	return &Status{
-		Total:     total,
-		Completed: total - rest,
-	}
-}
-
-//
-// Add 分片计数累加。
-//
-func (s *Status) Add(n int) {
-	s.mu.Lock()
-	s.Completed += n
-	s.mu.Unlock()
-}
-
-//
-// Progress 完成进度[0-1]。
-//
-func (s *Status) Progress() float32 {
-	s.mu.Look()
-	defer s.mu.Unlock()
-
-	if s.Completed == s.Total {
-		return 1.0
-	}
-	return float32(s.Completed) / float32(s.Total)
+	// 错误信息递送
+	// err 可能是piece.PieError类型。
+	Errors(err error)
 }
 
 // UICaller 用户行为前置约束。
 // 返回false否决目标行为（如：Start、Pause等）
-type UICaller func(Status) bool
+type UICaller = func() bool
 
 //
 // Manager 下载管理器。
@@ -95,15 +69,13 @@ type UICaller func(Status) bool
 //  - 文件哈希标识采用P2P传输（peerd）
 //
 type Manager struct {
-	OnStart  UICaller // 下载开始之前
-	OnPause  UICaller // 暂停之前
-	OnResume UICaller // 继续之前（暂停后）
-	OnExit   UICaller // 结束之前
+	OnStart  UICaller    // 下载开始之前
+	OnPause  UICaller    // 暂停之前
+	OnResume UICaller    // 继续之前（暂停后）
+	OnExit   UICaller    // 结束之前
+	OnFinish UICaller    // 下载完成之后
+	OnError  func(error) // 出错之后
 
-	OnFinish func(Status) error // 下载完成之后
-	OnError  func(int64, error) // 出错之后
-
-	status  Status        // 状态暂存
 	chExit  chan struct{} // 取消信号量
 	chPause chan struct{} // 暂停信号量
 	semu    sync.Mutex
@@ -123,14 +95,6 @@ func (m *Manager) ChPause() <-chan struct{} {
 	m.semu.Lock()
 	defer m.semu.Unlock()
 	return m.chPause
-}
-
-//
-// Status 返回下载状态实例。
-// 可能被用于设置状态或获取信息。
-//
-func (m *Manager) Status() *Status {
-	return &m.status
 }
 
 //
@@ -206,8 +170,8 @@ func (m *Manager) Finish() error {
 // Errors 发送出错信息。
 // @off 为下载失败的分片在文件中的下标位置。
 //
-func (m *Manager) Errors(off int64, err error) {
+func (m *Manager) Errors(err error) {
 	if m.OnError != nil {
-		m.OnError(off, err)
+		m.OnError(err)
 	}
 }

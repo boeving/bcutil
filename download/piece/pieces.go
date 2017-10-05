@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/qchen-zh/pputil/goes"
@@ -23,11 +24,20 @@ const (
 	DefaultPieceSize = PieceUnit * 16
 )
 
-var (
-	// 读取末端为起始0下标。
-	errZero     = errors.New("read end offset is zero")
-	errChecksum = errors.New("checksum was failed")
-)
+// 读取末端为起始0下标。
+var errZero = errors.New("read end offset is zero")
+
+//
+// PieError 分片错误。
+//
+type PieError struct {
+	Off int64
+	Msg string
+}
+
+func (p PieError) Error() string {
+	return fmt.Sprintf("[%d] %s", p.Off, p.Msg)
+}
 
 // HashSum 哈希校验和。
 type HashSum [SumLength]byte
@@ -43,9 +53,9 @@ type HashSum [SumLength]byte
 // 小于16k的文本文档无需分片，简化逻辑。
 //
 type Pieces struct {
-	Total int               // 分片数量
-	Span  int               // 分片大小（bytes）
-	Sums  map[int64]HashSum // 校验集（key: offset）
+	Amount int               // 分片数量
+	Span   int               // 分片大小（bytes）
+	Sums   map[int64]HashSum // 校验集（key: offset）
 }
 
 //
@@ -75,7 +85,7 @@ func (p *Pieces) Head(r io.Reader) error {
 	n2 := binary.BigEndian.Uint32(b[:])
 
 	// 前20bit为分片总数
-	p.Total = int(n2 >> 12)
+	p.Amount = int(n2 >> 12)
 
 	// 后12bit为分片大小（16k单位）
 	p.Span = int((n2<<20)>>20) * PieceUnit
@@ -99,7 +109,7 @@ func (p *Pieces) Load(r io.Reader) error {
 	}
 	span := int64(p.Span)
 
-	for i := 0; i < p.Total; i++ {
+	for i := 0; i < p.Amount; i++ {
 		var sum [SumLength]byte
 		if _, err := io.ReadFull(r, sum[:]); err != nil {
 			return err
@@ -135,7 +145,7 @@ func (p *Pieces) Bytes() []byte {
 func (p *Pieces) HeadBytes() []byte {
 	var buf [4]byte
 
-	n2 := uint32(p.Total << 12)
+	n2 := uint32(p.Amount << 12)
 	n2 = n2 | (p.Span/PieceUnit)&0xfff
 
 	binary.BigEndian.PutUint32(buf[:], n2)
@@ -182,7 +192,7 @@ func (p *RestPieces) Load(r io.Reader) error {
 		p.Sums = make(map[int64]HashSum)
 	}
 	// 按头部定义次数循环
-	for i := 0; i < p.Total; i++ {
+	for i := 0; i < p.Amount; i++ {
 		var buf [lenOffSum]byte
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
 			return err
@@ -225,31 +235,36 @@ type Piece struct {
 	End   int64
 }
 
+// Size 分片大小。
+func (p Piece) Size() int {
+	return int(p.End - p.Begin)
+}
+
 //
 // Divide 分片配置服务。
 // 对确定的数据大小进行分片定义。
-// 	fsize 文件大小，负值与零相同。
-// 	psz   分片大小，负值或零或大于fsize，取等于fsize。
+// 	fsize 文件大小，负值或零无效。
+// 	span  分片大小，负值或零或大于fsize，取等于fsize。
 //
-func Divide(fsize, psz int64) <-chan Piece {
+func Divide(fsize, span int64) <-chan Piece {
 	if fsize < 0 {
-		fsize = 0
+		return nil
 	}
-	if psz <= 0 || psz > fsize {
-		psz = fsize
+	if span <= 0 || span > fsize {
+		span = fsize
 	}
-	cnt, mod := fsize/psz, fsize%psz
+	cnt, mod := fsize/span, fsize%span
 	ch := make(chan Piece)
 
 	go func() {
 		i := 0
 		for i < cnt {
-			off := i * psz
-			ch <- Piece{off, off + psz}
+			off := i * span
+			ch <- Piece{off, off + span}
 			i++
 		}
 		if mod > 0 {
-			off := cnt * psz
+			off := cnt * span
 			ch <- Piece{off, off + mod}
 		}
 		close(ch)
@@ -280,19 +295,19 @@ type Sumor struct {
 
 //
 // NewSumor 新建一个分片校验和生成器。
-//  ra  输入流需要支持Seek（Seeker接口）。
-//  psz 传递0或负值采用默认分片大小。
+//  ra 输入流需要支持Seek（Seeker接口）。
+//  span 传递0或负值采用默认分片大小。
 //
-func NewSumor(ra io.ReaderAt, fsize, psz int64) *Sumor {
-	if psz <= 0 {
-		psz = DefaultPieceSize
+func NewSumor(ra io.ReaderAt, fsize, span int64) *Sumor {
+	if span <= 0 {
+		span = DefaultPieceSize
 	}
 	sm := Sumor{
 		ra:   ra,
 		list: make(map[int64]HashSum),
 		sem:  make(chan struct{}),
 		// 一个分片服务
-		ch:  Divide(fsize, psz),
+		ch:  Divide(fsize, span),
 		vch: make(chan OffSum),
 	}
 
@@ -364,23 +379,6 @@ func (s *Sumor) FullDo() <-chan error {
 }
 
 //
-// 读取特定片区的数据。
-// 读取出错后返回错误（通知外部）。
-//
-func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
-	if end == 0 {
-		return nil, errZero
-	}
-	buf := make([]byte, begin-end)
-	n, err := r.ReadAt(buf, begin)
-
-	if n < len(buf) {
-		return nil, err
-	}
-	return buf, nil
-}
-
-//
 // SumChecker 校验和检查器。
 // 用于完整文件依据校验清单整体核实。
 // （内部并发检查）
@@ -431,22 +429,34 @@ func (sc *SumChecker) Work(k interface{}) error {
 	data, err := blockRead(sc.RA, os.Off, os.Off+int64(sc.Span))
 
 	if err != nil {
-		return err
+		return PieError{os.Off, err.Error()}
 	}
 	if sha256.Sum256(data) != os.Sum {
-		return errChecksum
+		return PieError{os.Off, "checksum not match"}
 	}
 	return nil
 }
 
 //
-// Do 校验和计算对比。
+// Check 计算校验。
+// 简单计算，有任何一片不符即返回。
 //
-func (sc *SumChecker) Do(limit int) <-chan error {
+func (sc *SumChecker) Check(limit int) <-chan error {
 	if limit <= 0 {
 		limit = DefaultSumThread
 	}
 	return goes.Works(goes.LimitTasker(sc, limit))
+}
+
+//
+// CheckAll 校验和完整计算对比。
+// 返回的错误PieError可用于收集不合格的分片。
+//
+func (sc *SumChecker) CheckAll(limit int) <-chan error {
+	if limit <= 0 {
+		limit = DefaultSumThread
+	}
+	return goes.WorksLong(goes.LimitTasker(sc, limit))
 }
 
 //
@@ -456,7 +466,7 @@ func (sc *SumChecker) Do(limit int) <-chan error {
 // span 为分块大小（bytes）。
 //
 func CheckSum(ra io.ReaderAt, span int64, list map[int64]HashSum) bool {
-	ech := NewSumChecker(ra, span, list).Do(0)
+	ech := NewSumChecker(ra, span, list).Check(0)
 	return <-ech == nil
 }
 
@@ -478,4 +488,21 @@ func Ordered(span int64, list map[int64]HashSum) []HashSum {
 		buf[i] = sum
 	}
 	return buf
+}
+
+//
+// 读取特定片区的数据。
+// 读取出错后返回错误（通知外部）。
+//
+func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
+	if end == 0 {
+		return nil, errZero
+	}
+	buf := make([]byte, begin-end)
+	n, err := r.ReadAt(buf, begin)
+
+	if n < len(buf) {
+		return nil, PieError{begin, err.Error()}
+	}
+	return buf, nil
 }

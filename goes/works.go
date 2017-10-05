@@ -37,9 +37,10 @@ func (l *limitTask) Task() (interface{}, bool) {
 // Work 工作执行覆盖。
 //
 func (l *limitTask) Work(k interface{}) error {
-	err := l.tk.Work(k)
-	<-l.sema
-	return err
+	defer func() {
+		<-l.sema
+	}()
+	return l.tk.Work(k)
 }
 
 //

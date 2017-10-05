@@ -19,7 +19,53 @@ const (
 type (
 	HashSum    = piece.HashSum
 	RestPieces = piece.RestPieces
+	PieError   = piece.PieError
 )
+
+// Status 下载状态。
+type Status struct {
+	Total     int64 // 数据总量
+	completed int64 // 已完成下载字节数
+	mu        sync.Mutex
+}
+
+//
+// NewStatus 新建一个状态实例。
+//
+func NewStatus(rest, total int64) *Status {
+	return &Status{
+		Total:     total,
+		completed: total - rest,
+	}
+}
+
+//
+// Increase 数据量递增。
+//
+func (s *Status) Increase(n int) {
+	s.mu.Lock()
+	s.completed += int64(n)
+	s.mu.Unlock()
+}
+
+func (s *Status) Completed() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.completed
+}
+
+//
+// Progress 完成进度[0-1.0]。
+//
+func (s *Status) Progress() float32 {
+	s.mu.Look()
+	defer s.mu.Unlock()
+
+	if s.completed == s.Total {
+		return 1.0
+	}
+	return float32(s.completed) / float32(s.Total)
+}
 
 //
 // Cacher 缓存器（并发实现）。
@@ -65,7 +111,8 @@ func (c *Cacher) Work(k interface{}) error {
 	v := k.(PieceData)
 
 	if n, err := c.out.WriteAt(v.Bytes, v.Offset); err != nil {
-		return err
+		return PieError{
+			v.Offset, err.Error()}
 	}
 	c.done(v.Offset)
 
@@ -86,10 +133,12 @@ type Server struct {
 	Outer    io.WriterAt   // 数据缓存输出
 	OutSize  int           // 输出最低值
 	Interval time.Duration // 索引保存间隔时间
+	Stat     Status        // 状态存储
 
-	dtch  <-chan PieceData // 数据传递通道
-	speed *Status          // 完成进度
-	rtsem chan struct{}    // 分片索引管理锁
+	dtch   <-chan PieceData // 数据传递通道
+	rtsem  chan struct{}    // 分片索引管理闸
+	span   int              // 分片大小
+	finish bool             // 下载完毕
 }
 
 //
@@ -104,8 +153,9 @@ func (s *Server) Run(rest RestPieces) {
 	if !s.User.Start() || rest.Empty() {
 		return
 	}
-	s.speed = s.User.Status()
 	s.dtch = s.Dler.Run(rest.Span, rest.Indexes())
+	s.span = rest.Span
+
 	// 每存储分片数。
 	amount := s.OutSize / rest.Span
 	// 用户取消行为
@@ -121,7 +171,7 @@ func (s *Server) Run(rest RestPieces) {
 		go s.restManage(rest, rtch)
 
 		for err := range s.serve(amount, rtch) {
-			log.Println(err)
+			go s.User.Errors(err)
 		}
 		close(rtch)
 
@@ -132,6 +182,51 @@ func (s *Server) Run(rest RestPieces) {
 		}
 		s.dtch = s.Dler.Run(rest.Span, rest.Indexes())
 	}
+	s.finish = true
+
+	if err := s.User.Finish(); err != nil {
+		s.User.Errors(err)
+	}
+}
+
+//
+// Speed 下载速度（Bytes/Second）
+// 返回一个定时刷新通道。
+// d 更新时间周期，默认每秒更新一次。
+//
+func (s *Server) Speed(d time.Duration) <-chan int64 {
+	if d <= 0 {
+		d = 1 * time.Second
+	}
+	ch := make(chan int64)
+
+	go func() {
+		old := s.Stat.Completed()
+		tmp := d
+		for {
+			tm := time.Now()
+			if s.finish {
+				break
+			}
+			time.Sleep(d)
+			cur := s.Stat.Completed()
+			// 可能阻塞
+			ch <- (cur - old) * time.Second / tmp
+			old = cur
+			// 实际时间延迟
+			tmp = time.Since(tm)
+		}
+		close(ch)
+	}()
+
+	return ch
+}
+
+//
+// Progress 完成进度[0-1.0]。
+//
+func (s *Server) Progress() float32 {
+	return s.Stat.Progress()
 }
 
 //
@@ -232,7 +327,7 @@ func (s *Server) restManage(rest RestPieces, ch <-chan int64) {
 		default: // through...
 		}
 		delete(rest.Sums, k)
-		s.speed.Add(1)
+		s.Stat.Increase(s.span)
 	}
 	tick.Stop()
 

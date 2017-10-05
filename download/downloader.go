@@ -1,13 +1,17 @@
 package download
 
 import (
+	"crypto/sha256"
+
 	"github.com/qchen-zh/pputil/download/piece"
 	"github.com/qchen-zh/pputil/goes"
 )
 
 type (
-	Piece  = piece.Piece
-	Pieces = piece.Pieces
+	HashSum  = piece.HashSum
+	Piece    = piece.Piece
+	Pieces   = piece.Pieces
+	PieError = piece.PieError
 )
 
 const (
@@ -34,19 +38,14 @@ type PieceData struct {
 
 //
 // Downloader 下载器。
-// 负责目标数据的分片，组合校验，缓存等。
+// 分片下载，校验。向外发送合格的分片数据。
+// 若不赋值验证集，则不执行验证（如http直接下载）。
 //
 type Downloader struct {
-	NewHauler func() Hauler  // 创建数据搬运工
-	pich      chan Piece     // 分片配置获取渠道
-	dtch      chan PieceData // 数据传递渠道
-}
-
-//
-// NewDownloader 新建一个下载器。
-//
-func NewDownloader(fx func() Hauler) *Downloader {
-	return &Downloader{NewHauler: fx}
+	NewHauler func() Hauler     // 创建数据搬运工
+	Sums      map[int64]HashSum // 验证集（可选）
+	pich      chan Piece        // 分片配置获取渠道
+	dtch      chan PieceData    // 数据传递渠道
 }
 
 //
@@ -96,18 +95,28 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 
 //
 // Work 下载单块数据。
-// 下载失败时无数据传递。
+// 下载失败或校验不符合时无数据传递。
 //
 func (d *Downloader) Work(k interface{}) error {
 	p := k.(Piece)
-	bs, err := d.NewWork().Get(p)
+	bs, err := d.NewHauler().Get(p)
 
 	if err != nil {
-		return err
+		return PieError{p.Begin, err.Error()}
+	}
+	if d.Sums != nil {
+		sum, ok := d.Sums[p.Begin]
+		// 不合格丢弃
+		if !ok || sum != sha256.Sum256(bs) {
+			return PieError{p.Begin, "checksum not exist or not match"}
+		}
 	}
 	d.dtch <- PieceData{p.Begin, bs}
+
 	return nil
 }
+
+func checkSum(bs []byte, sum HashSum) bool
 
 //
 // 分片定义取值渠道。
