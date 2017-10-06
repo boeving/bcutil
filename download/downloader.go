@@ -2,22 +2,25 @@ package download
 
 import (
 	"crypto/sha256"
+	"errors"
 
 	"github.com/qchen-zh/pputil/download/piece"
 	"github.com/qchen-zh/pputil/goes"
 )
 
 type (
-	HashSum  = piece.HashSum
-	Piece    = piece.Piece
-	Pieces   = piece.Pieces
-	PieError = piece.PieError
+	Piece  = piece.Piece
+	Pieces = piece.Pieces
+	// HashSum  = piece.HashSum
+	// PieError = piece.PieError
 )
 
 const (
 	// MaxThread 默认下载协程数
 	MaxThread = 8
 )
+
+var errChkSum = errors.New("checksum not exist or not match")
 
 //
 // Hauler 数据搬运工。
@@ -44,7 +47,7 @@ type PieceData struct {
 type Downloader struct {
 	NewHauler func() Hauler     // 创建数据搬运工
 	Sums      map[int64]HashSum // 验证集（可选）
-	pich      chan Piece        // 分片配置获取渠道
+	pich      <-chan Piece      // 分片配置获取渠道
 	dtch      chan PieceData    // 数据传递渠道
 }
 
@@ -54,7 +57,7 @@ type Downloader struct {
 // 返回一个分片数据读取通道。
 // 当下载进程完毕后，通道关闭（可能有下载失败）。
 //
-func (d *Downloader) Run(span int, rest []int64) <-chan PieceData {
+func (d *Downloader) Run(span int64, rest []int64) <-chan PieceData {
 	if len(rest) == 0 {
 		return nil
 	}
@@ -68,7 +71,7 @@ func (d *Downloader) Run(span int, rest []int64) <-chan PieceData {
 	d.dtch = make(chan PieceData, max)
 
 	// 分片索引服务
-	d.pich = pieceGetter(rest, int64(span))
+	d.pich = pieceGetter(rest, span)
 
 	err := goes.WorksLong(goes.LimitTasker(d, max), nil)
 	go func() {
@@ -102,13 +105,13 @@ func (d *Downloader) Work(k interface{}) error {
 	bs, err := d.NewHauler().Get(p)
 
 	if err != nil {
-		return PieError{p.Begin, err.Error()}
+		return PieError{p.Begin, err}
 	}
 	if d.Sums != nil {
 		sum, ok := d.Sums[p.Begin]
 		// 不合格丢弃
 		if !ok || sum != sha256.Sum256(bs) {
-			return PieError{p.Begin, "checksum not exist or not match"}
+			return PieError{p.Begin, errChkSum}
 		}
 	}
 	d.dtch <- PieceData{p.Begin, bs}

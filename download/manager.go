@@ -69,12 +69,12 @@ type UICaller = func() bool
 //  - 文件哈希标识采用P2P传输（peerd）
 //
 type Manager struct {
-	OnStart  UICaller    // 下载开始之前
-	OnPause  UICaller    // 暂停之前
-	OnResume UICaller    // 继续之前（暂停后）
-	OnExit   UICaller    // 结束之前
-	OnFinish UICaller    // 下载完成之后
-	OnError  func(error) // 出错之后
+	OnStart  UICaller     // 下载开始之前
+	OnPause  UICaller     // 暂停之前
+	OnResume UICaller     // 继续之前（暂停后）
+	OnExit   UICaller     // 结束之前
+	OnFinish func() error // 下载完成之后
+	OnError  func(error)  // 出错之后
 
 	chExit  chan struct{} // 取消信号量
 	chPause chan struct{} // 暂停信号量
@@ -105,7 +105,7 @@ func (m *Manager) Start() bool {
 	m.semu.Lock()
 	defer m.semu.Unlock()
 
-	if m.OnStart != nil && !m.OnStart(m.status) {
+	if m.OnStart != nil && !m.OnStart() {
 		return false
 	}
 	m.chExit = make(chan struct{})
@@ -123,7 +123,7 @@ func (m *Manager) Pause() bool {
 	m.semu.Lock()
 	defer m.semu.Unlock()
 
-	if m.OnPause != nil && !m.OnPause(m.status) {
+	if m.OnPause != nil && !m.OnPause() {
 		return false
 	}
 	m.chPause = make(chan struct{})
@@ -137,7 +137,7 @@ func (m *Manager) Resume() bool {
 	m.semu.Lock()
 	defer m.semu.Unlock()
 
-	if m.OnResume != nil && !m.OnResume(m.status) {
+	if m.OnResume != nil && !m.OnResume() {
 		return false
 	}
 	close(m.chPause)
@@ -148,7 +148,7 @@ func (m *Manager) Resume() bool {
 // Exit 结束下载。
 //
 func (m *Manager) Exit() bool {
-	if m.OnExit != nil && !m.OnExit(m.status) {
+	if m.OnExit != nil && !m.OnExit() {
 		return false
 	}
 	close(m.chExit)
@@ -161,7 +161,7 @@ func (m *Manager) Exit() bool {
 //
 func (m *Manager) Finish() error {
 	if m.OnFinish != nil {
-		return m.OnFinish(m.status)
+		return m.OnFinish()
 	}
 	return nil
 }

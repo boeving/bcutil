@@ -5,6 +5,7 @@
 package pkaddr
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/big"
@@ -28,7 +29,7 @@ type PKHash [20]byte
 //
 func (p *PKHash) SetBytes(bs []byte) error {
 	if len(bs) != len(*p) {
-		return errors.New("bs's length must " + len(*p))
+		return fmt.Errorf("bs's length must %d", len(*p))
 	}
 	copy((*p)[:], bs)
 	return nil
@@ -55,7 +56,7 @@ func (p *PKHash) SetString(s string, base int) error {
 // String 显示为十六进制串，附 0x 前缀。
 //
 func (p *PKHash) String() string {
-	fmt.Sprintf("%#x", *p)
+	return fmt.Sprintf("%#x", *p)
 }
 
 // Address 公钥地址。
@@ -95,7 +96,7 @@ func (a *Address) Decode(s, flag string) error {
 	var cksum [LenChecksum]byte
 	copy(cksum[:], dec[n:])
 
-	if checksum(append([]byte(f), dec[:n])) != cksum {
+	if checksum(append([]byte(flag), dec[:n]...)) != cksum {
 		return ErrChecksum
 	}
 	a.Flag = flag
@@ -109,4 +110,15 @@ func (a *Address) Decode(s, flag string) error {
 //
 func (a *Address) String() string {
 	return a.Encode()
+}
+
+//
+// 计算校验和。
+// checksum: first some bytes of sha256^2
+//
+func checksum(input []byte) (cksum [LenChecksum]byte) {
+	h := sha256.Sum256(input)
+	h2 := sha256.Sum256(h[:])
+	copy(cksum[:], h2[:LenChecksum])
+	return
 }

@@ -24,19 +24,21 @@ const (
 	DefaultPieceSize = PieceUnit * 16
 )
 
-// 读取末端为起始0下标。
-var errZero = errors.New("read end offset is zero")
+var (
+	errChkSum = errors.New("checksum not match")
+	errZero   = errors.New("read end offset is zero")
+)
 
 //
 // PieError 分片错误。
 //
 type PieError struct {
 	Off int64
-	Msg string
+	Err error
 }
 
 func (p PieError) Error() string {
-	return fmt.Sprintf("[%d] %s", p.Off, p.Msg)
+	return fmt.Sprintf("[%d] %v", p.Off, p.Err)
 }
 
 // HashSum 哈希校验和。
@@ -54,7 +56,7 @@ type HashSum [SumLength]byte
 //
 type Pieces struct {
 	Amount int               // 分片数量
-	Span   int               // 分片大小（bytes）
+	Span   int64             // 分片大小（bytes）
 	Sums   map[int64]HashSum // 校验集（key: offset）
 }
 
@@ -88,7 +90,7 @@ func (p *Pieces) Head(r io.Reader) error {
 	p.Amount = int(n2 >> 12)
 
 	// 后12bit为分片大小（16k单位）
-	p.Span = int((n2<<20)>>20) * PieceUnit
+	p.Span = int64((n2<<20)>>20) * PieceUnit
 
 	return nil
 }
@@ -107,14 +109,12 @@ func (p *Pieces) Load(r io.Reader) error {
 	if p.Sums == nil {
 		p.Sums = make(map[int64]HashSum)
 	}
-	span := int64(p.Span)
-
 	for i := 0; i < p.Amount; i++ {
-		var sum [SumLength]byte
+		var sum HashSum
 		if _, err := io.ReadFull(r, sum[:]); err != nil {
 			return err
 		}
-		p.Sums[i*span] = sum
+		p.Sums[int64(i)*p.Span] = sum
 
 		if p.Span == 0 {
 			break
@@ -145,8 +145,8 @@ func (p *Pieces) Bytes() []byte {
 func (p *Pieces) HeadBytes() []byte {
 	var buf [4]byte
 
-	n2 := uint32(p.Amount << 12)
-	n2 = n2 | (p.Span/PieceUnit)&0xfff
+	n2 := uint32(p.Amount) << 12
+	n2 = n2 | uint32(p.Span/PieceUnit)&0xfff
 
 	binary.BigEndian.PutUint32(buf[:], n2)
 
@@ -203,8 +203,8 @@ func (p *RestPieces) Load(r io.Reader) error {
 	return nil
 }
 
-func offsetAndSum(buf *[lenOffSum]byte) (uint64, *HashSum) {
-	var sum [SumLength]byte
+func offsetAndSum(buf [lenOffSum]byte) (uint64, *HashSum) {
+	var sum HashSum
 	copy(sum[:], buf[8:])
 
 	return binary.BigEndian.Uint64(buf[0:]), &sum
@@ -257,7 +257,7 @@ func Divide(fsize, span int64) <-chan Piece {
 	ch := make(chan Piece)
 
 	go func() {
-		i := 0
+		var i int64
 		for i < cnt {
 			off := i * span
 			ch <- Piece{off, off + span}
@@ -313,7 +313,7 @@ func NewSumor(ra io.ReaderAt, fsize, span int64) *Sumor {
 
 	// 单独的赋值服务（list非并发安全）
 	go func() {
-		for v := range vch {
+		for v := range sm.vch {
 			sm.list[v.Off] = v.Sum
 		}
 		close(sm.sem)
@@ -385,7 +385,7 @@ func (s *Sumor) FullDo() <-chan error {
 //
 type SumChecker struct {
 	RA   io.ReaderAt
-	Span int
+	Span int64
 	List map[int64]HashSum
 	ch   <-chan OffSum
 }
@@ -394,7 +394,7 @@ type SumChecker struct {
 // NewSumChecker 创建一个校验和检查器。
 // 注：只能使用一次。
 //
-func NewSumChecker(ra io.ReaderAt, span int, list map[int64]HashSum) *SumChecker {
+func NewSumChecker(ra io.ReaderAt, span int64, list map[int64]HashSum) *SumChecker {
 	ch := make(chan OffSum)
 	sc := SumChecker{
 		RA:   ra,
@@ -426,13 +426,13 @@ func (sc *SumChecker) Task() (k interface{}, ok bool) {
 //
 func (sc *SumChecker) Work(k interface{}) error {
 	os := k.(OffSum)
-	data, err := blockRead(sc.RA, os.Off, os.Off+int64(sc.Span))
+	data, err := blockRead(sc.RA, os.Off, os.Off+sc.Span)
 
 	if err != nil {
-		return PieError{os.Off, err.Error()}
+		return PieError{os.Off, err}
 	}
 	if sha256.Sum256(data) != os.Sum {
-		return PieError{os.Off, "checksum not match"}
+		return PieError{os.Off, errChkSum}
 	}
 	return nil
 }
@@ -456,7 +456,7 @@ func (sc *SumChecker) CheckAll(limit int) <-chan error {
 	if limit <= 0 {
 		limit = DefaultSumThread
 	}
-	return goes.WorksLong(goes.LimitTasker(sc, limit))
+	return goes.WorksLong(goes.LimitTasker(sc, limit), nil)
 }
 
 //
@@ -481,7 +481,7 @@ func Ordered(span int64, list map[int64]HashSum) []HashSum {
 	buf := make([]HashSum, len(list))
 
 	for off, sum := range list {
-		i := off / span
+		i := int(off / span)
 		if i >= len(buf) {
 			return nil
 		}
@@ -502,7 +502,7 @@ func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
 	n, err := r.ReadAt(buf, begin)
 
 	if n < len(buf) {
-		return nil, PieError{begin, err.Error()}
+		return nil, PieError{begin, err}
 	}
 	return buf, nil
 }

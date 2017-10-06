@@ -48,12 +48,12 @@ func (au *Auth) Address(pk ed25519.PublicKey, flag string) {
 // @js 时间戳的JSON表示（含外围双引号）。
 //
 func (au *Auth) Timestamp(js string) error {
-	return au.timestamp.UnmarshalJSON(js)
+	return au.timestamp.UnmarshalJSON([]byte(js))
 }
 
 //
 // CheckTime 检查时间符合误差。
-// @t 与当前时间的容许误差。
+// @d 与当前时间的容许误差。
 //
 func (au *Auth) CheckTime(d time.Duration) bool {
 	d0 := time.Since(au.timestamp)
@@ -79,21 +79,11 @@ func (au *Auth) CheckSig(sig []byte) bool {
 	ms := au.timestamp.UnixNano() / 1000000
 	b := make([]byte, 8)
 
-	binary.BigEndian.PutUint64(b, ms)
-	b = append(b, au.pubkey)
+	binary.BigEndian.PutUint64(b, uint64(ms))
+	b = append(b, au.pubkey...)
 
-	return ed25519.Verify(au.pubkey, sha256.Sum256(b), sig)
-}
-
-//
-// 计算校验和。
-// checksum: first some bytes of sha256^2
-//
-func checksum(input []byte) (cksum [LenChecksum]byte) {
-	h := sha256.Sum256(input)
-	h2 := sha256.Sum256(h[:])
-	copy(cksum[:], h2[:LenChecksum])
-	return
+	msg := sha256.Sum256(b)
+	return ed25519.Verify(au.pubkey, msg[:], sig)
 }
 
 //

@@ -42,9 +42,9 @@ func NewStatus(rest, total int64) *Status {
 //
 // Increase 数据量递增。
 //
-func (s *Status) Increase(n int) {
+func (s *Status) Increase(n int64) {
 	s.mu.Lock()
-	s.completed += int64(n)
+	s.completed += n
 	s.mu.Unlock()
 }
 
@@ -111,8 +111,7 @@ func (c *Cacher) Work(k interface{}) error {
 	v := k.(PieceData)
 
 	if n, err := c.out.WriteAt(v.Bytes, v.Offset); err != nil {
-		return PieError{
-			v.Offset, err.Error()}
+		return PieError{v.Offset, err}
 	}
 	c.done(v.Offset)
 
@@ -131,13 +130,13 @@ type Server struct {
 	Dler     Downloader    // 下载器
 	Indexer  io.WriterAt   // 索引缓存
 	Outer    io.WriterAt   // 数据缓存输出
-	OutSize  int           // 输出最低值
+	OutSize  int64         // 输出最低值
 	Interval time.Duration // 索引保存间隔时间
 	Stat     Status        // 状态存储
 
 	dtch   <-chan PieceData // 数据传递通道
 	rtsem  chan struct{}    // 分片索引管理闸
-	span   int              // 分片大小
+	span   int64            // 分片大小
 	finish bool             // 下载完毕
 }
 

@@ -25,7 +25,7 @@ type Stack struct {
 //
 func NewStack() *Stack {
 	return &Stack{
-		pool: make([]net.Addr),
+		pool: []net.Addr{},
 	}
 }
 
@@ -85,7 +85,7 @@ func (s *Stack) Pop(n int) []net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sz = len(s.pool) - n
+	sz := len(s.pool) - n
 
 	if len(s.pool) == 0 || n == 0 || sz < 0 {
 		return nil
