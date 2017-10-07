@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	// IndexInterval 索引存储默认间隔时间。
-	IndexInterval = 5 * time.Minute
+	// IndexFlush 索引存储默认间隔时间。
+	IndexFlush = 5 * time.Minute
 )
 
 type (
@@ -312,7 +312,7 @@ func (s *Server) saveCache(pd []PieceData, ch chan<- int64) <-chan error {
 func (s *Server) restManage(rest RestPieces, ch <-chan int64) {
 	tm := s.Interval
 	if tm == 0 {
-		tm = IndexInterval
+		tm = IndexFlush
 	}
 	tick := time.NewTicker(tm)
 
