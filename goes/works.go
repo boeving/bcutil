@@ -2,8 +2,6 @@ package goes
 
 import (
 	"sync"
-
-	"github.com/qchen-zh/pputil"
 )
 
 //
@@ -72,13 +70,12 @@ func LimitTasker(t Tasker, limit int) Tasker {
 //
 func Works(t Tasker) <-chan error {
 	end := NewCloser()
-	stop := make(chan struct{})
-	cancel := pputil.Canceller(stop)
+	sem := NewSema()
 
 	go func() {
 		var wg sync.WaitGroup
 		for {
-			if cancel() {
+			if sem.Dead() {
 				break
 			}
 			v, ok := t.Task()
@@ -89,9 +86,8 @@ func Works(t Tasker) <-chan error {
 
 			go func(k interface{}) {
 				if err := t.Work(k); err != nil {
+					sem.Exit()
 					end.Close(err)
-					// 容错式关闭
-					Close(stop)
 				}
 				wg.Done()
 			}(v)
@@ -114,15 +110,14 @@ func Works(t Tasker) <-chan error {
 // 正常结束或外部主动结束服务后，通道会被直接关闭。
 //
 // 外部需要清空通道内的值，否则内部Go程会阻塞泄漏。
-// cancel可由Canceller创建。
 //
-func WorksLong(t Tasker, cancel func() bool) <-chan error {
+func WorksLong(t Tasker, s *Sema) <-chan error {
 	bad := make(chan error)
 
 	go func() {
 		var wg sync.WaitGroup
 		for {
-			if cancel != nil && cancel() {
+			if s != nil && s.Dead() {
 				break
 			}
 			v, ok := t.Task()

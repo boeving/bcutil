@@ -1,6 +1,10 @@
 package goes
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/qchen-zh/pputil"
+)
 
 //
 // Send 容错式发送信息。
@@ -71,4 +75,59 @@ func (c *Closer) Close(err error) {
 
 	c.C <- err
 	close(c.C)
+}
+
+//
+// Sema 信号控制器。
+// 用于协调多个协程之间的退出控制。
+// 可以是一对一，或一对多。
+//
+type Sema struct {
+	ch chan struct{}
+	fn func() bool
+}
+
+//
+// NewSema 新建一个信号量控制器。
+//
+func NewSema() *Sema {
+	c := make(chan struct{})
+	return &Sema{
+		ch: c,
+		fn: pputil.Canceller(c),
+	}
+}
+
+//
+// Exit 结束信号。
+// 多次结束不会有更多的效果（静默容错）。
+//
+func (s *Sema) Exit() {
+	Close(s.ch)
+}
+
+//
+// Dead 信号是否已失效。
+//
+func (s *Sema) Dead() bool {
+	return s.fn()
+}
+
+//
+// Sema 返回信号通道。
+// 一般用于select中监控退出信号。
+//
+func (s *Sema) Sema() <-chan struct{} {
+	return s.ch
+}
+
+//
+// Renew 信号重新开始。
+// 如果之前的信号未关闭，会先关闭。
+// 通常很少需要此接口。
+//
+func (s *Sema) Renew() {
+	Close(s.ch)
+	s.ch = make(chan struct{})
+	s.fn = pputil.Canceller(s.ch)
 }

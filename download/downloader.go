@@ -23,12 +23,19 @@ const (
 var errChkSum = errors.New("checksum not exist or not match")
 
 //
-// Hauler 数据搬运工。
+// Getter 数据获取器。
 // 实施单个目标（分片）的具体下载行为，
 //
-type Hauler interface {
+type Getter interface {
 	// 获取数据。
 	Get(Piece) ([]byte, error)
+}
+
+//
+// Hauler 数据搬运工。
+//
+type Hauler interface {
+	New() Getter
 }
 
 //
@@ -45,10 +52,10 @@ type PieceData struct {
 // 若不赋值验证集，则不执行验证（如http直接下载）。
 //
 type Downloader struct {
-	NewHauler func() Hauler     // 创建数据搬运工
-	Sums      map[int64]HashSum // 验证集（可选）
-	pich      <-chan Piece      // 分片配置获取渠道
-	dtch      chan PieceData    // 数据传递渠道
+	Haul Hauler            // 数据搬运工
+	Sums map[int64]HashSum // 验证集（可选）
+	pich <-chan Piece      // 分片配置获取渠道
+	dtch chan PieceData    // 数据传递渠道
 }
 
 //
@@ -102,7 +109,7 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 //
 func (d *Downloader) Work(k interface{}) error {
 	p := k.(Piece)
-	bs, err := d.NewHauler().Get(p)
+	bs, err := d.Haul.New().Get(p)
 
 	if err != nil {
 		return PieError{p.Begin, err}

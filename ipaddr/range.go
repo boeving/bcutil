@@ -18,7 +18,7 @@ import (
 //
 type Range struct {
 	netip      net.IP // 网络地址
-	begin, end uint32 // 起始主机号
+	begin, end uint32 // 起止主机号（不含end）
 }
 
 // NewRange 新建一个范围实例。
@@ -41,20 +41,21 @@ func NewRange(cidr string, begin, end uint32) (*Range, error) {
 // IPAddrs 获取IP序列的微服务。
 // 返回管道内值：net.Addr。
 //
-func (r *Range) IPAddrs(cancel func() bool) <-chan interface{} {
-	return goes.Values(r, 0, 1, cancel)
+func (r *Range) IPAddrs(sem *goes.Sema) <-chan interface{} {
+	return goes.Gets(r, int(r.begin), 1, sem)
 }
 
 //
-// Value 获取下一个IP地址。
+// Get 获取一个IP地址。
 // v存储：net.Addr
 //
-func (r *Range) Value(i int) (interface{}, bool) {
-	if uint32(i) >= r.end {
+func (r *Range) Get(k int) (interface{}, bool) {
+	i := uint32(k)
+	if i >= r.end {
 		return nil, false
 	}
 	var host [4]byte
-	binary.BigEndian.PutUint32(host[:], uint32(i))
+	binary.BigEndian.PutUint32(host[:], i)
 
 	return makeIPv4(r.netip, host), true
 }

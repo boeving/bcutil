@@ -10,36 +10,24 @@ import (
 )
 
 // FileDl 文件下载器。
-// 对 Hauler 接口的实现。
+// 对 Hauler 和 Getter 接口的实现。
 type FileDl struct {
 	URL string
 }
 
 //
 // New 新建一个数据搬运工。
+// 返回自身即可，无并发冲突。
 //
-func New(url string) dl.Hauler {
-	return &FileDl{url}
-}
-
-//
-// FileSize 获取URL文件大小。
-//
-func FileSize(url string) (int64, error) {
-	resp, err := http.Head(url)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	return resp.ContentLength, nil
+func (f FileDl) New() dl.Getter {
+	return f
 }
 
 //
 // Get 下载当前分片。
 // 如果p.End为零，表示下载整个文件。
 //
-func (f *FileDl) Get(p Piece) ([]byte, error) {
+func (f FileDl) Get(p Piece) ([]byte, error) {
 	request, err := http.NewRequest("GET", f.URL, nil)
 	if err != nil {
 		return nil, err
@@ -61,4 +49,17 @@ func (f *FileDl) Get(p Piece) ([]byte, error) {
 	_, err = resp.Body.Read(buf)
 
 	return buf, err
+}
+
+//
+// FileSize 获取URL文件大小。
+//
+func FileSize(url string) (int64, error) {
+	resp, err := http.Head(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	return resp.ContentLength, nil
 }
