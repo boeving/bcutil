@@ -2,9 +2,24 @@ package goes
 
 import (
 	"sync"
-
-	"github.com/qchen-zh/pputil"
 )
+
+//
+// Canceller 取消判断生成器。
+// 与传入的stop管道绑定，判断该管道是否关闭。
+//
+// 常用于服务性Go程，由外部关闭stop管道来终止自己的服务。
+//
+func Canceller(stop <-chan struct{}) func() bool {
+	return func() bool {
+		select {
+		case <-stop:
+			return true
+		default:
+			return false
+		}
+	}
+}
 
 //
 // Send 容错式发送信息。
@@ -94,7 +109,7 @@ func NewSema() *Sema {
 	c := make(chan struct{})
 	return &Sema{
 		ch: c,
-		fn: pputil.Canceller(c),
+		fn: Canceller(c),
 	}
 }
 
@@ -119,15 +134,4 @@ func (s *Sema) Dead() bool {
 //
 func (s *Sema) Sema() <-chan struct{} {
 	return s.ch
-}
-
-//
-// Renew 信号重新开始。
-// 如果之前的信号未关闭，会先关闭。
-// 通常很少需要此接口。
-//
-func (s *Sema) Renew() {
-	Close(s.ch)
-	s.ch = make(chan struct{})
-	s.fn = pputil.Canceller(s.ch)
 }

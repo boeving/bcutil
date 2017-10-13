@@ -30,14 +30,14 @@ var (
 )
 
 //
-// PieError 分片错误。
+// Error 分片错误。
 //
-type PieError struct {
+type Error struct {
 	Off int64
 	Err error
 }
 
-func (p PieError) Error() string {
+func (p Error) Error() string {
 	return fmt.Sprintf("[%d] %v", p.Off, p.Err)
 }
 
@@ -429,10 +429,10 @@ func (sc *SumChecker) Work(k interface{}) error {
 	data, err := blockRead(sc.RA, os.Off, os.Off+sc.Span)
 
 	if err != nil {
-		return PieError{os.Off, err}
+		return Error{os.Off, err}
 	}
 	if sha256.Sum256(data) != os.Sum {
-		return PieError{os.Off, errChkSum}
+		return Error{os.Off, errChkSum}
 	}
 	return nil
 }
@@ -460,12 +460,12 @@ func (sc *SumChecker) CheckAll(limit int) <-chan error {
 }
 
 //
-// CheckSum 输入数据校验核实。
+// SumAll 输入数据校验核实。
 //
 // 内部即为对SumChecker的使用，并发工作（并发量采用默认值）。
 // span 为分块大小（bytes）。
 //
-func CheckSum(ra io.ReaderAt, span int64, list map[int64]HashSum) bool {
+func SumAll(ra io.ReaderAt, span int64, list map[int64]HashSum) bool {
 	ech := NewSumChecker(ra, span, list).Check(0)
 	return <-ech == nil
 }
@@ -502,7 +502,7 @@ func blockRead(r io.ReaderAt, begin, end int64) ([]byte, error) {
 	n, err := r.ReadAt(buf, begin)
 
 	if n < len(buf) {
-		return nil, PieError{begin, err}
+		return nil, Error{begin, err}
 	}
 	return buf, nil
 }

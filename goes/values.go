@@ -24,12 +24,12 @@ type Getter interface {
 //  @i 通用索引号起始值。
 //  @setp 通用索引步进值。
 //
-func Gets(g Getter, i, step int, s *Sema) <-chan interface{} {
+func Gets(g Getter, i, step int, cancel func() bool) <-chan interface{} {
 	ch := make(chan interface{})
 
 	go func() {
 		for {
-			if s != nil && s.Dead() {
+			if cancel != nil && cancel() {
 				break
 			}
 			val, ok := g.Get(i)
@@ -63,12 +63,12 @@ type Valuer interface {
 //
 // Values 创建一个通用取值服务。
 //
-func Values(v Valuer, s *Sema) <-chan interface{} {
+func Values(v Valuer, cancel func() bool) <-chan interface{} {
 	ch := make(chan interface{})
 
 	go func() {
 		for {
-			if s != nil && s.Dead() {
+			if cancel != nil && cancel() {
 				break
 			}
 			k, ok := v.Index()

@@ -62,6 +62,9 @@ func LimitTasker(t Tasker, limit int) Tasker {
 // 返回的通道用于获得t.Work的执行状态。
 // 如果有Go程出错，传递首个出错信息后关闭通道，同时不再创建新Go程。
 //
+// 通常用于LimitTasker场景，因为全部任务的Go程会很快创建完毕（错误来不及中断Go程的创建过程）。
+// 除非任务（Task）本身有阻塞逻辑。
+//
 // 正常结束后，返回的通道传递nil后关闭。
 // 返回的通道保证仅传递一次消息，读取后即无阻塞。
 // （未结束的Go程会继续运行到完成，无阻塞）
@@ -85,11 +88,12 @@ func Works(t Tasker) <-chan error {
 			wg.Add(1)
 
 			go func(k interface{}) {
+				defer wg.Done()
+
 				if err := t.Work(k); err != nil {
 					sem.Exit()
 					end.Close(err)
 				}
-				wg.Done()
 			}(v)
 		}
 		wg.Wait()
@@ -111,13 +115,13 @@ func Works(t Tasker) <-chan error {
 //
 // 外部需要清空通道内的值，否则内部Go程会阻塞泄漏。
 //
-func WorksLong(t Tasker, s *Sema) <-chan error {
+func WorksLong(t Tasker, cancel func() bool) <-chan error {
 	bad := make(chan error)
 
 	go func() {
 		var wg sync.WaitGroup
 		for {
-			if s != nil && s.Dead() {
+			if cancel != nil && cancel() {
 				break
 			}
 			v, ok := t.Task()
@@ -127,10 +131,14 @@ func WorksLong(t Tasker, s *Sema) <-chan error {
 			wg.Add(1)
 
 			go func(v interface{}) {
+				defer wg.Done()
+
+				if cancel != nil && cancel() {
+					return
+				}
 				if err := t.Work(v); err != nil {
 					bad <- err
 				}
-				wg.Done()
 			}(v)
 		}
 		wg.Wait()

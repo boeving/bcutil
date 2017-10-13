@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/qchen-zh/pputil"
 	"github.com/qchen-zh/pputil/download/piece"
 	"github.com/qchen-zh/pputil/goes"
 )
@@ -14,12 +13,6 @@ import (
 const (
 	// IndexFlush 索引存储默认间隔时间。
 	IndexFlush = 5 * time.Minute
-)
-
-type (
-	HashSum    = piece.HashSum
-	RestPieces = piece.RestPieces
-	PieError   = piece.PieError
 )
 
 // Status 下载状态。
@@ -48,6 +41,9 @@ func (s *Status) Increase(n int64) {
 	s.mu.Unlock()
 }
 
+//
+// Completed 返回已完成的下载字节数。
+//
 func (s *Status) Completed() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -58,7 +54,7 @@ func (s *Status) Completed() int64 {
 // Progress 完成进度[0-1.0]。
 //
 func (s *Status) Progress() float32 {
-	s.mu.Look()
+	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.completed == s.Total {
@@ -110,8 +106,8 @@ func (c *Cacher) Task() (k interface{}, ok bool) {
 func (c *Cacher) Work(k interface{}) error {
 	v := k.(PieceData)
 
-	if n, err := c.out.WriteAt(v.Bytes, v.Offset); err != nil {
-		return PieError{v.Offset, err}
+	if _, err := c.out.WriteAt(v.Bytes, v.Offset); err != nil {
+		return piece.Error{Off: v.Offset, Err: err}
 	}
 	c.done(v.Offset)
 
@@ -148,7 +144,7 @@ type Server struct {
 //
 // rest 会被修改，外部不应再使用。
 //
-func (s *Server) Run(rest RestPieces) {
+func (s *Server) Run(rest piece.RestPieces) {
 	if !s.User.Start() || rest.Empty() {
 		return
 	}
@@ -157,8 +153,8 @@ func (s *Server) Run(rest RestPieces) {
 
 	// 每存储分片数。
 	amount := s.OutSize / rest.Span
-	// 用户取消行为
-	cancel := pputil.Canceller(s.User.ChExit())
+	// 用户取消下载
+	cancel := goes.Canceller(s.User.ChExit())
 
 	var done bool
 	for !done {
@@ -169,7 +165,7 @@ func (s *Server) Run(rest RestPieces) {
 		// 分片索引管理服务。
 		go s.restManage(rest, rtch)
 
-		for err := range s.serve(amount, rtch) {
+		for err := range s.serve(int(amount), rtch) {
 			go s.User.Errors(err)
 		}
 		close(rtch)
@@ -210,7 +206,7 @@ func (s *Server) Speed(d time.Duration) <-chan int64 {
 			time.Sleep(d)
 			cur := s.Stat.Completed()
 			// 可能阻塞
-			ch <- (cur - old) * time.Second / tmp
+			ch <- (cur - old) * int64(time.Second/tmp)
 			old = cur
 			// 实际时间延迟
 			tmp = time.Since(tm)
@@ -264,7 +260,7 @@ func (s *Server) serve(amount int, rtch chan<- int64) <-chan error {
 			pbs := buf
 			wg.Add(1)
 			go func() {
-				for err := range saveCache(pbs, rtch) {
+				for err := range s.saveCache(pbs, rtch) {
 					ch <- err
 				}
 				wg.Done()
@@ -274,7 +270,7 @@ func (s *Server) serve(amount int, rtch chan<- int64) <-chan error {
 		// 末尾批次/中断剩余
 		// 不必异步。
 		if len(buf) > 0 {
-			for err := range saveCache(buf, rtch) {
+			for err := range s.saveCache(buf, rtch) {
 				ch <- err
 			}
 		}
@@ -300,7 +296,7 @@ func (s *Server) saveCache(pd []PieceData, ch chan<- int64) <-chan error {
 	// 仅是一个简单的直觉处理。
 	limit := len(pd)/2 + 1
 
-	return goes.WorksLong(goes.LimitTasker(&cc, limit), nil)
+	return goes.WorksLong(goes.LimitTasker(cc, limit), nil)
 }
 
 //
@@ -309,7 +305,7 @@ func (s *Server) saveCache(pd []PieceData, ch chan<- int64) <-chan error {
 //  - 定时刷新未下载索引存储；
 //  - 即时更新下载状态；
 //
-func (s *Server) restManage(rest RestPieces, ch <-chan int64) {
+func (s *Server) restManage(rest piece.RestPieces, ch <-chan int64) {
 	tm := s.Interval
 	if tm == 0 {
 		tm = IndexFlush
@@ -318,8 +314,8 @@ func (s *Server) restManage(rest RestPieces, ch <-chan int64) {
 
 	for k := range ch {
 		select {
-		case <-tick:
-			rest.Total = len(rest.Sums)
+		case <-tick.C:
+			rest.Amount = len(rest.Sums)
 			if _, err := s.Indexer.WriteAt(rest.Bytes(), 0); err != nil {
 				log.Println(err)
 			}

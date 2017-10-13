@@ -5,9 +5,17 @@ package httpd
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	dl "github.com/qchen-zh/pputil/download"
 )
+
+// 下载专用客户端。
+// 外部可根据分片大小设置适当超时。
+// 默认1分钟。
+var Client = &http.Client{
+	Timeout: 1 * time.Minute,
+}
 
 // FileDl 文件下载器。
 // 对 Hauler 和 Getter 接口的实现。
@@ -39,7 +47,7 @@ func (f FileDl) Get(p Piece) ([]byte, error) {
 			fmt.Sprintf("bytes=%d-%d", p.Begin, p.End-1),
 		)
 	}
-	resp, err := http.DefaultClient.Do(request)
+	resp, err := Client.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +63,7 @@ func (f FileDl) Get(p Piece) ([]byte, error) {
 // FileSize 获取URL文件大小。
 //
 func FileSize(url string) (int64, error) {
-	resp, err := http.Head(url)
+	resp, err := Client.Head(url)
 	if err != nil {
 		return 0, err
 	}

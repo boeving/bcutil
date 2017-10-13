@@ -9,7 +9,11 @@
 package download
 
 import (
+	"crypto/sha256"
+	"io"
 	"sync"
+
+	"github.com/qchen-zh/pputil/download/piece"
 )
 
 // 写入缓存常量。
@@ -174,4 +178,23 @@ func (m *Manager) Errors(err error) {
 	if m.OnError != nil {
 		m.OnError(err)
 	}
+}
+
+//
+// CheckSum 计算完整的哈希校验和。
+// 外部可传入一个新打开的文件句柄，或其它输入流。
+//
+// 如果网络连接和速度不是问题（如本机服务器），
+// 这也可用于直接校验URL的网络文件，而无需先下载存储。
+//
+func CheckSum(r io.Reader) (piece.HashSum, error) {
+	h := sha256.New()
+	sum := piece.HashSum{}
+
+	if _, err := io.Copy(h, r); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+
+	return sum, nil
 }

@@ -8,13 +8,6 @@ import (
 	"github.com/qchen-zh/pputil/goes"
 )
 
-type (
-	Piece  = piece.Piece
-	Pieces = piece.Pieces
-	// HashSum  = piece.HashSum
-	// PieError = piece.PieError
-)
-
 const (
 	// MaxThread 默认下载协程数
 	MaxThread = 8
@@ -28,7 +21,7 @@ var errChkSum = errors.New("checksum not exist or not match")
 //
 type Getter interface {
 	// 获取数据。
-	Get(Piece) ([]byte, error)
+	Get(piece.Piece) ([]byte, error)
 }
 
 //
@@ -52,10 +45,10 @@ type PieceData struct {
 // 若不赋值验证集，则不执行验证（如http直接下载）。
 //
 type Downloader struct {
-	Haul Hauler            // 数据搬运工
-	Sums map[int64]HashSum // 验证集（可选）
-	pich <-chan Piece      // 分片配置获取渠道
-	dtch chan PieceData    // 数据传递渠道
+	Haul Hauler                  // 数据搬运工
+	Sums map[int64]piece.HashSum // 验证集（可选）
+	pich <-chan piece.Piece      // 分片配置获取渠道
+	dtch chan PieceData          // 数据传递渠道
 }
 
 //
@@ -108,17 +101,17 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 // 下载失败或校验不符合时无数据传递。
 //
 func (d *Downloader) Work(k interface{}) error {
-	p := k.(Piece)
+	p := k.(piece.Piece)
 	bs, err := d.Haul.New().Get(p)
 
 	if err != nil {
-		return PieError{p.Begin, err}
+		return piece.Error{Off: p.Begin, Err: err}
 	}
 	if d.Sums != nil {
 		sum, ok := d.Sums[p.Begin]
 		// 不合格丢弃
 		if !ok || sum != sha256.Sum256(bs) {
-			return PieError{p.Begin, errChkSum}
+			return piece.Error{Off: p.Begin, Err: errChkSum}
 		}
 	}
 	d.dtch <- PieceData{p.Begin, bs}
@@ -126,18 +119,16 @@ func (d *Downloader) Work(k interface{}) error {
 	return nil
 }
 
-func checkSum(bs []byte, sum HashSum) bool
-
 //
 // 分片定义取值渠道。
 // 对外传递未下载分片定义{Begin, End}。
 //
-func pieceGetter(list []int64, span int64) <-chan Piece {
-	ch := make(chan Piece)
+func pieceGetter(list []int64, span int64) <-chan piece.Piece {
+	ch := make(chan piece.Piece)
 
 	go func() {
 		for _, off := range list {
-			ch <- Piece{off, off + span}
+			ch <- piece.Piece{Begin:off, End:off + span}
 		}
 		close(ch)
 	}()

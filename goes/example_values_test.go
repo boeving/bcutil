@@ -8,8 +8,8 @@ import (
 
 type Team []string
 
-// goes.Valuer 接口的实现。
-func (t Team) Value(i int) (v interface{}, ok bool) {
+// goes.Getter 接口的实现。
+func (t Team) Get(i int) (v interface{}, ok bool) {
 	if len(t) > 0 && i < len(t) {
 		v, ok = t[i], true
 	}
@@ -26,9 +26,9 @@ var th = Team{
 	"Samwell Tarly",
 }
 
-func ExampleValues() {
+func ExampleGets() {
 	// 取偶数索引
-	ch := goes.Values(th, 0, 2, nil)
+	ch := goes.Gets(th, 0, 2, nil)
 
 	for v := range ch {
 		// 确知v存储一个字符串
