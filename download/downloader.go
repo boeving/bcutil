@@ -26,9 +26,10 @@ type Getter interface {
 
 //
 // Hauler 数据搬运工。
+// 新建一个数据获取器接口。
 //
 type Hauler interface {
-	New() Getter
+	Getter() Getter
 }
 
 //
@@ -73,7 +74,7 @@ func (d *Downloader) Run(span int64, rest []int64) <-chan PieceData {
 	// 分片索引服务
 	d.pich = pieceGetter(rest, span)
 
-	err := goes.WorksLong(goes.LimitTasker(d, max), nil)
+	err := goes.WorksLong(goes.LimitTasker(d, max))
 	go func() {
 		for _ = range err {
 			// 忽略下载失败
@@ -102,7 +103,7 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 //
 func (d *Downloader) Work(k interface{}) error {
 	p := k.(piece.Piece)
-	bs, err := d.Haul.New().Get(p)
+	bs, err := d.Haul.Getter().Get(p)
 
 	if err != nil {
 		return piece.Error{Off: p.Begin, Err: err}
@@ -128,7 +129,7 @@ func pieceGetter(list []int64, span int64) <-chan piece.Piece {
 
 	go func() {
 		for _, off := range list {
-			ch <- piece.Piece{Begin:off, End:off + span}
+			ch <- piece.Piece{Begin: off, End: off + span}
 		}
 		close(ch)
 	}()

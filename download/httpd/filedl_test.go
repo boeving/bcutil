@@ -1,4 +1,4 @@
-package downloader
+package httpd_test
 
 import (
 	"fmt"

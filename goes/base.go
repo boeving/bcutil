@@ -1,9 +1,5 @@
 package goes
 
-import (
-	"sync"
-)
-
 //
 // Canceller 取消判断生成器。
 // 与传入的stop管道绑定，判断该管道是否关闭。
@@ -25,7 +21,7 @@ func Canceller(stop <-chan struct{}) func() bool {
 // Send 容错式发送信息。
 //
 // 兼容管道关闭后继续发送信息的情况（屏蔽panic）。
-// 容许ch值为nil，静默返回（无任何效果）。
+// 容许ch值为nil，静默返回（与标准行为不同：除非被读取阻塞，否则总会返回）。
 //
 // 主要应用于多对一的情形，
 // 例如多个Go程中一个出错导致通道关闭，而其它Go程仍未执行结束。
@@ -53,43 +49,6 @@ func Close(ch chan<- struct{}) {
 	}
 	defer func() { recover() }()
 	close(ch)
-}
-
-//
-// Closer 关闭信号器。
-// 保证单次信号发送后关闭通道。
-//
-// 应用场景为多对一时的出错通知（后续关闭操作静默容错）。
-// 保证通道即时关闭，
-// 外部应用仅需读取一次通道即可，无并发协程阻塞泄漏。
-//
-type Closer struct {
-	C  chan error
-	mu sync.Mutex
-}
-
-//
-// NewCloser 创建一个关闭信号器。
-//
-func NewCloser() *Closer {
-	return &Closer{C: make(chan error)}
-}
-
-//
-// Close 发送并关闭。
-// 仅发送一条消息即关闭通道，后续调用静默容错，无阻塞。
-//
-// 通常，应用仅在出错时才调用此方法。
-//
-func (c *Closer) Close(err error) {
-	defer func() {
-		recover()
-		c.mu.Unlock()
-	}()
-	c.mu.Lock()
-
-	c.C <- err
-	close(c.C)
 }
 
 //
@@ -122,16 +81,16 @@ func (s *Sema) Exit() {
 }
 
 //
-// Dead 信号是否已失效。
+// Dead 是否已结束。
 //
 func (s *Sema) Dead() bool {
 	return s.fn()
 }
 
 //
-// Sema 返回信号通道。
+// Chan 返回信号通道。
 // 一般用于select中监控退出信号。
 //
-func (s *Sema) Sema() <-chan struct{} {
+func (s *Sema) Chan() <-chan struct{} {
 	return s.ch
 }

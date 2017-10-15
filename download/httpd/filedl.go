@@ -8,9 +8,10 @@ import (
 	"time"
 
 	dl "github.com/qchen-zh/pputil/download"
+	"github.com/qchen-zh/pputil/download/piece"
 )
 
-// 下载专用客户端。
+// Client 下载专用客户端。
 // 外部可根据分片大小设置适当超时。
 // 默认1分钟。
 var Client = &http.Client{
@@ -25,17 +26,19 @@ type FileDl struct {
 
 //
 // New 新建一个数据搬运工。
-// 返回自身即可，无并发冲突。
+// 实现 download.Hauler 接口。
+// 返回自身即可，仅读取，无并发冲突。
 //
-func (f FileDl) New() dl.Getter {
+func (f FileDl) Getter() dl.Getter {
 	return f
 }
 
 //
 // Get 下载当前分片。
-// 如果p.End为零，表示下载整个文件。
+// 实现 download.Getter 接口。
+// 如果p.End不大于零，表示无分片下载整个文件。
 //
-func (f FileDl) Get(p Piece) ([]byte, error) {
+func (f FileDl) Get(p piece.Piece) ([]byte, error) {
 	request, err := http.NewRequest("GET", f.URL, nil)
 	if err != nil {
 		return nil, err
@@ -48,11 +51,12 @@ func (f FileDl) Get(p Piece) ([]byte, error) {
 		)
 	}
 	resp, err := Client.Do(request)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
 	buf := make([]byte, p.Size())
 	_, err = resp.Body.Read(buf)
 
@@ -67,7 +71,5 @@ func FileSize(url string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
-
 	return resp.ContentLength, nil
 }

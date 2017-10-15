@@ -296,7 +296,7 @@ func (s *Server) saveCache(pd []PieceData, ch chan<- int64) <-chan error {
 	// 仅是一个简单的直觉处理。
 	limit := len(pd)/2 + 1
 
-	return goes.WorksLong(goes.LimitTasker(cc, limit), nil)
+	return goes.WorksLong(goes.LimitTasker(cc, limit))
 }
 
 //

@@ -456,7 +456,7 @@ func (sc *SumChecker) CheckAll(limit int) <-chan error {
 	if limit <= 0 {
 		limit = DefaultSumThread
 	}
-	return goes.WorksLong(goes.LimitTasker(sc, limit), nil)
+	return goes.WorksLong(goes.LimitTasker(sc, limit))
 }
 
 //
