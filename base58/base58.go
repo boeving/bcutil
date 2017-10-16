@@ -52,8 +52,8 @@ func Encode(b []byte) string {
 
 	// 8/log(58,2) = 1.3656...>> 1.37
 	answer := make([]byte, 0, len(b)*137/100)
+	mod := new(big.Int)
 	for x.Cmp(bigZero) > 0 {
-		mod := new(big.Int)
 		x.DivMod(x, bigRadix, mod)
 		answer = append(answer, alphabet[mod.Int64()])
 	}
