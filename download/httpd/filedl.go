@@ -19,26 +19,26 @@ var Client = &http.Client{
 }
 
 // FileDl 文件下载器。
-// 对 Hauler 和 Getter 接口的实现。
+// 对 Hauler 和 PieceGetter 接口的实现。
 type FileDl struct {
 	URL string
 }
 
 //
-// New 新建一个数据搬运工。
+// NewHauler 新建一个数据搬运工。
 // 实现 download.Hauler 接口。
 // 返回自身即可，仅读取，无并发冲突。
 //
-func (f FileDl) Getter() dl.Getter {
+func (f FileDl) NewHauler() dl.PieceGetter {
 	return f
 }
 
 //
-// Get 下载当前分片。
-// 实现 download.Getter 接口。
+// PieceGet 下载当前分片。
+// 实现 download.PieceGetter 接口。
 // 如果p.End不大于零，表示无分片下载整个文件。
 //
-func (f FileDl) Get(p piece.Piece) ([]byte, error) {
+func (f FileDl) PieceGet(p piece.Piece) ([]byte, error) {
 	request, err := http.NewRequest("GET", f.URL, nil)
 	if err != nil {
 		return nil, err

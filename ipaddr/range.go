@@ -42,14 +42,14 @@ func NewRange(cidr string, begin, end uint32) (*Range, error) {
 // 返回管道内值：net.Addr。
 //
 func (r *Range) IPAddrs(cancel func() bool) <-chan interface{} {
-	return goes.Gets(r, int(r.begin), 1, cancel)
+	return goes.IntGets(r, int(r.begin), 1, cancel)
 }
 
 //
-// Get 获取一个IP地址。
+// IntGet 获取一个IP地址。
 // v存储：net.Addr
 //
-func (r *Range) Get(k int) (interface{}, bool) {
+func (r *Range) IntGet(k int) (interface{}, bool) {
 	i := uint32(k)
 	if i >= r.end {
 		return nil, false

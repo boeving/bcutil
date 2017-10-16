@@ -16,12 +16,12 @@ const (
 var errChkSum = errors.New("checksum not exist or not match")
 
 //
-// Getter 数据获取器。
+// PieceGetter 数据获取器。
 // 实施单个目标（分片）的具体下载行为，
 //
-type Getter interface {
+type PieceGetter interface {
 	// 获取数据。
-	Get(piece.Piece) ([]byte, error)
+	PieceGet(piece.Piece) ([]byte, error)
 }
 
 //
@@ -29,7 +29,7 @@ type Getter interface {
 // 新建一个数据获取器接口。
 //
 type Hauler interface {
-	Getter() Getter
+	NewHauler() PieceGetter
 }
 
 //
@@ -103,7 +103,7 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 //
 func (d *Downloader) Work(k interface{}) error {
 	p := k.(piece.Piece)
-	bs, err := d.Haul.Getter().Get(p)
+	bs, err := d.Haul.NewHauler().PieceGet(p)
 
 	if err != nil {
 		return piece.Error{Off: p.Begin, Err: err}

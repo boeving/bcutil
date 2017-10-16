@@ -103,14 +103,14 @@ func (s *Stack) Pop(n int) []net.Addr {
 // 允许地址集在服务期变化（更大的灵活性）。
 //
 func (s *Stack) IPAddrs(cancel func() bool) <-chan interface{} {
-	return goes.Gets(s, 0, 1, cancel)
+	return goes.IntGets(s, 0, 1, cancel)
 }
 
 //
-// Get 提取下一个地址。
+// IntGet 提取下一个地址。
 // v存储：net.Addr
 //
-func (s *Stack) Get(i int) (v interface{}, ok bool) {
+func (s *Stack) IntGet(i int) (v interface{}, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
