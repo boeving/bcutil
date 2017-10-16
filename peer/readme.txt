@@ -3,4 +3,4 @@ P2P网络端点
 数据传输支持：
 - Gob（encoding/gob）
 - MessagePack（tinylib/msgp）
-- JSON（encoding/json）
+- JSON（msgp.ToJSON）
