@@ -12,6 +12,13 @@ import (
 	"strings"
 )
 
+//
+// 注记：
+// 引用标准库encoding/base32源码，删除了Padding相关的代码，
+// 即不支持填充字符。
+// 修改默认字符序列（EncodeStd）的数字段 [2-7] 为 [4-9]。
+//
+
 /*
  * Encodings
  */
@@ -23,23 +30,16 @@ import (
 type Encoding struct {
 	encode    string
 	decodeMap [256]byte
-	padChar   rune
 }
 
-const (
-	StdPadding rune = '=' // Standard padding character
-	NoPadding  rune = -1  // No padding
-)
-
-const encodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-const encodeHex = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+// EncodeStd 默认标准字符序列 [A-Z4-9]。
+const EncodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZ456789"
 
 // NewEncoding returns a new Encoding defined by the given alphabet,
 // which must be a 32-byte string.
 func NewEncoding(encoder string) *Encoding {
 	e := new(Encoding)
 	e.encode = encoder
-	e.padChar = StdPadding
 
 	for i := 0; i < len(e.decodeMap); i++ {
 		e.decodeMap[i] = 0xFF
@@ -52,37 +52,13 @@ func NewEncoding(encoder string) *Encoding {
 
 // StdEncoding is the standard base32 encoding, as defined in
 // RFC 4648.
-var StdEncoding = NewEncoding(encodeStd)
-
-// HexEncoding is the ``Extended Hex Alphabet'' defined in RFC 4648.
-// It is typically used in DNS.
-var HexEncoding = NewEncoding(encodeHex)
+var StdEncoding = NewEncoding(EncodeStd)
 
 var removeNewlinesMapper = func(r rune) rune {
 	if r == '\r' || r == '\n' {
 		return -1
 	}
 	return r
-}
-
-// WithPadding creates a new encoding identical to enc except
-// with a specified padding character, or NoPadding to disable padding.
-// The padding character must not be '\r' or '\n', must not
-// be contained in the encoding's alphabet and must be a rune equal or
-// below '\xff'.
-func (enc Encoding) WithPadding(padding rune) *Encoding {
-	if padding == '\r' || padding == '\n' || padding > 0xff {
-		panic("invalid padding")
-	}
-
-	for i := 0; i < len(enc.encode); i++ {
-		if rune(enc.encode[i]) == padding {
-			panic("padding contained in alphabet")
-		}
-	}
-
-	enc.padChar = padding
-	return &enc
 }
 
 /*
@@ -136,25 +112,8 @@ func (enc *Encoding) Encode(dst, src []byte) {
 			}
 		}
 
-		// Pad the final quantum
+		// the final quantum
 		if len(src) < 5 {
-			if enc.padChar == NoPadding {
-				break
-			}
-
-			dst[7] = byte(enc.padChar)
-			if len(src) < 4 {
-				dst[6] = byte(enc.padChar)
-				dst[5] = byte(enc.padChar)
-				if len(src) < 3 {
-					dst[4] = byte(enc.padChar)
-					if len(src) < 2 {
-						dst[3] = byte(enc.padChar)
-						dst[2] = byte(enc.padChar)
-					}
-				}
-			}
-
 			break
 		}
 
@@ -251,10 +210,7 @@ func NewEncoder(enc *Encoding, w io.Writer) io.WriteCloser {
 // EncodedLen returns the length in bytes of the base32 encoding
 // of an input buffer of length n.
 func (enc *Encoding) EncodedLen(n int) int {
-	if enc.padChar == NoPadding {
-		return (n*8 + 4) / 5
-	}
-	return (n + 4) / 5 * 8
+	return (n*8 + 4) / 5
 }
 
 /*
@@ -280,42 +236,14 @@ func (enc *Encoding) decode(dst, src []byte) (n int, end bool, err error) {
 
 		for j := 0; j < 8; {
 
-			// We have reached the end and are missing padding
-			if len(src) == 0 && enc.padChar != NoPadding {
-				return n, false, CorruptInputError(olen - len(src) - j)
-			}
-
 			// We have reached the end and are not expecing any padding
-			if len(src) == 0 && enc.padChar == NoPadding {
+			if len(src) == 0 {
 				dlen, end = j, true
 				break
 			}
-
 			in := src[0]
 			src = src[1:]
-			if in == byte(enc.padChar) && j >= 2 && len(src) < 8 {
-				// We've reached the end and there's padding
-				if len(src)+j < 8-1 {
-					// not enough padding
-					return n, false, CorruptInputError(olen)
-				}
-				for k := 0; k < 8-1-j; k++ {
-					if len(src) > k && src[k] != byte(enc.padChar) {
-						// incorrect padding
-						return n, false, CorruptInputError(olen - len(src) + k - 1)
-					}
-				}
-				dlen, end = j, true
-				// 7, 5 and 2 are not valid padding lengths, and so 1, 3 and 6 are not
-				// valid dlen values. See RFC 4648 Section 6 "Base 32 Encoding" listing
-				// the five valid padding lengths, and Section 9 "Illustrations and
-				// Examples" for an illustration for how the 1st, 3rd and 6th base32
-				// src bytes do not yield enough information to decode a dst byte.
-				if dlen == 1 || dlen == 3 || dlen == 6 {
-					return n, false, CorruptInputError(olen - len(src) - 1)
-				}
-				break
-			}
+
 			dbuf[j] = enc.decodeMap[in]
 			if dbuf[j] == 0xFF {
 				return n, false, CorruptInputError(olen - len(src) - 1)
@@ -498,9 +426,5 @@ func NewDecoder(enc *Encoding, r io.Reader) io.Reader {
 // DecodedLen returns the maximum length in bytes of the decoded data
 // corresponding to n bytes of base32-encoded data.
 func (enc *Encoding) DecodedLen(n int) int {
-	if enc.padChar == NoPadding {
-		return n * 5 / 8
-	}
-
-	return n / 8 * 5
+	return n * 5 / 8
 }
