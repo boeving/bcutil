@@ -16,7 +16,7 @@ import (
 // 注记：
 // 引用标准库encoding/base32源码，删除了Padding相关的代码，
 // 即不支持填充字符。
-// 修改默认字符序列（EncodeStd）的数字段 [2-7] 为 [4-9]。
+// 定义外观友好（视觉）的默认字符序列（EncodeStd）。
 //
 
 /*
@@ -32,8 +32,16 @@ type Encoding struct {
 	decodeMap [256]byte
 }
 
-// EncodeStd 默认标准字符序列 [A-Z4-9]。
-const EncodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZ456789"
+//
+// EncodeStd 默认标准字符序列。
+// 选取原则：
+//  1. 外观差异较大，便于视觉区分；
+//  2. 大小写字符均衡，小写字母向下延展的优先（如gjqy）；
+//
+// 大写字母17个，小写字母15个。未使用数字。
+// wjbNTrQGeHbtuFzGhyGeCRzEmChSzTEQwjqKzrQGeHbtuFzGhyGeCRTEmChSHAECwtSNhrFxmzerLNHGbjqSPPQmwSAKE
+//
+const EncodeStd = "ABCDEFGHKLNPQRSTVabeghjmqrtuwxyz"
 
 // NewEncoding returns a new Encoding defined by the given alphabet,
 // which must be a 32-byte string.
