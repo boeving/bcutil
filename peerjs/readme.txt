@@ -1,10 +1,5 @@
 P2P网络端点
-标准RPC（net/rpc）方式联系。
-数据传输支持：
-- Gob（encoding/gob）
-- MessagePack（tinylib/msgp）
-- JSON（msgp.ToJSON）
-
+标准RPC（net/rpc）方式连接。数据传输采用JSON/msgp（MessagePack）。
 
 msgp Options
 -o      - output file name (default is {input}_gen.go)

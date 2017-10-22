@@ -1,5 +1,5 @@
 //
-// Package peerjs 采用JSON编解码方式的RPC模块。
+// Package peerjs 采用JSON编解码方式的RPC服务包。
 // 由标准库 net/rpc 定制而来。
 // 考虑执行效率和节约网络带宽，编码器采用 MessagePack（github.com/tinylib/msgp）。
 //
@@ -9,17 +9,13 @@
 package peerjs
 
 import (
-	"errors"
 	"io"
 	"log"
+	"net"
 	"net/rpc"
+	"sync"
 
 	"github.com/tinylib/msgp/msgp"
-)
-
-var (
-	errDecodable = errors.New("msgp: the data not implement DecodeMsg")
-	errEncodable = errors.New("msgp: the data not implement EncodeMsg")
 )
 
 // 写入响应出错提示。
@@ -45,7 +41,7 @@ func NewServer() *Server {
 // 这样使得.Accept方法可以直接使用。
 //
 func (s *Server) ServeConn(conn io.ReadWriteCloser) {
-	s.ServeCodec(newServerCodec(conn))
+	s.ServeCodec(NewServerCodec(conn))
 }
 
 //
@@ -54,11 +50,17 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 //
 type msgpServerCodec struct {
 	rwc    io.ReadWriteCloser
-	req    Request
 	closed bool
+	wmu    sync.Mutex
+	// 临时存储
+	req  Request
+	resp Response
 }
 
-func newServerCodec(conn io.ReadWriteCloser) rpc.ServerCodec {
+//
+// NewServerCodec 创建一个msgp服务器端编解码器。
+//
+func NewServerCodec(conn io.ReadWriteCloser) rpc.ServerCodec {
 	return &msgpServerCodec{rwc: conn}
 }
 
@@ -67,6 +69,7 @@ func newServerCodec(conn io.ReadWriteCloser) rpc.ServerCodec {
 // 方法名称格式：Service.Method，区分大小写。
 //
 func (mc *msgpServerCodec) ReadRequestHeader(r *rpc.Request) error {
+	mc.req.reset()
 	if err := msgp.Decode(mc.rwc, &mc.req); err != nil {
 		return err
 	}
@@ -92,7 +95,7 @@ func (mc *msgpServerCodec) ReadRequestBody(v interface{}) error {
 
 //
 // v 结果类型需要实现 msgp.Encodable 接口。
-// 要求并发安全（无此问题）。
+// 要求并发安全（两段连续写入）。
 //
 func (mc *msgpServerCodec) WriteResponse(r *rpc.Response, v interface{}) error {
 	body, ok := v.(msgp.Encodable)
@@ -101,8 +104,11 @@ func (mc *msgpServerCodec) WriteResponse(r *rpc.Response, v interface{}) error {
 		log.Println(msgResponse, errEncodable)
 		return errEncodable
 	}
-	head := Response{r.Seq, r.Error}
-	err := msgp.Encode(mc.rwc, &head)
+	mc.wmu.Lock()
+	defer mc.wmu.Unlock()
+
+	mc.resp.set(r.Seq, r.Error)
+	err := msgp.Encode(mc.rwc, &mc.resp)
 
 	if r.Error == "" && err == nil {
 		err = msgp.Encode(mc.rwc, body)
@@ -123,4 +129,40 @@ func (mc *msgpServerCodec) Close() error {
 	}
 	mc.closed = true
 	return mc.rwc.Close()
+}
+
+////////////
+// 源码引用
+// 复制 net/rpc 服务代码，DefaultServer 为当前包成员。
+///////////////////////////////////////////////////////////////////////////////
+
+// Register publishes the receiver's methods in the DefaultServer.
+func Register(rcvr interface{}) error {
+	return DefaultServer.Register(rcvr)
+}
+
+// RegisterName is like Register but uses the provided name for the type
+// instead of the receiver's concrete type.
+func RegisterName(name string, rcvr interface{}) error {
+	return DefaultServer.RegisterName(name, rcvr)
+}
+
+// Accept accepts connections on the listener and serves requests
+// to DefaultServer for each incoming connection.
+// Accept blocks; the caller typically invokes it in a go statement.
+func Accept(lis net.Listener) {
+	DefaultServer.Accept(lis)
+}
+
+// HandleHTTP registers an HTTP handler for RPC messages to DefaultServer
+// on DefaultRPCPath and a debugging handler on DefaultDebugPath.
+// It is still necessary to invoke http.Serve(), typically in a go statement.
+func HandleHTTP() {
+	DefaultServer.HandleHTTP(DefaultRPCPath, DefaultDebugPath)
+}
+
+// ServeRequest is like ServeCodec but synchronously serves a single request.
+// It does not close the codec upon completion.
+func ServeRequest(codec rpc.ServerCodec) error {
+	return DefaultServer.ServeRequest(codec)
 }
