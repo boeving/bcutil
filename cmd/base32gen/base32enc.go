@@ -20,6 +20,8 @@ func main() {
 	fmt.Println(len(line), line)
 	ens := base32.StdEncoding.EncodeToString([]byte(line))
 	fmt.Println(len(ens), ens)
+
+	ens = base32.NiceEncoding.EncodeToString([]byte(line))
+	fmt.Println(len(ens), ens)
 }
 
-// SRtHErPBRgVGNueDRxbGNwaSEBCGCxDBEBumEtPgSabjwKDgRw

@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package base32 implements base32 encoding as specified by RFC 4648.
+// Package base32 专用于区块链地址的Base32编码。
+// 引用标准库encoding/base32源码，删除了其中Padding相关的代码（即不支持填充字符）。
 package base32
 
 import (
@@ -12,36 +13,31 @@ import (
 	"strings"
 )
 
-//
-// 注记：
-// 引用标准库encoding/base32源码，删除了Padding相关的代码，
-// 即不支持填充字符。
-// 定义外观友好（视觉）的默认字符序列（EncodeStd）。
-//
-
 /*
  * Encodings
  */
 
 // An Encoding is a radix 32 encoding/decoding scheme, defined by a
-// 32-character alphabet. The most common is the "base32" encoding
-// introduced for SASL GSSAPI and standardized in RFC 4648.
-// The alternate "base32hex" encoding is used in DNSSEC.
+// 32-character alphabet.
 type Encoding struct {
 	encode    string
 	decodeMap [256]byte
 }
 
+// 标准字符序列。
+// 便于外观和读音区分（视觉/听觉）。
+// 6s9l9zf4r5s4jfxiu8boleum7cx5x4m9wpsyzoxfrcdo9pei7ctyn4fhrex8lefm7ctyt576rhrybaq
+// [a-z4-9]
+const EncodeStd = "abcdefjhijklmnopqrstuvwxyz456789"
+
 //
-// EncodeStd 默认标准字符序列。
 // 选取原则：
 //  1. 外观差异较大，便于视觉区分；
 //  2. 大小写字符均衡，小写字母向下延展的优先（如gjqy）；
 //
 // 大写字母17个，小写字母15个。未使用数字。
 // wjbNTrQGeHbtuFzGhyGeCRzEmChSzTEQwjqKzrQGeHbtuFzGhyGeCRTEmChSHAECwtSNhrFxmzerLNHGbjqSPPQmwSAKE
-//
-const EncodeStd = "ABCDEFGHKLNPQRSTVabeghjmqrtuwxyz"
+const EncodeNice = "ABCDEFGHKLNPQRSTVabeghjmqrtuwxyz"
 
 // NewEncoding returns a new Encoding defined by the given alphabet,
 // which must be a 32-byte string.
@@ -58,9 +54,11 @@ func NewEncoding(encoder string) *Encoding {
 	return e
 }
 
-// StdEncoding is the standard base32 encoding, as defined in
-// RFC 4648.
+// 标准编码（含数字）。
 var StdEncoding = NewEncoding(EncodeStd)
+
+// 纯字母编码。
+var NiceEncoding = NewEncoding(EncodeNice)
 
 var removeNewlinesMapper = func(r rune) rune {
 	if r == '\r' || r == '\n' {
