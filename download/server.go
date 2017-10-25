@@ -13,6 +13,9 @@ import (
 const (
 	// IndexFlush 索引存储默认间隔时间。
 	IndexFlush = 5 * time.Minute
+
+	// ServeSleep 批次服务休息时间
+	ServeSleep = 5 * time.Minute
 )
 
 // Status 下载状态。
@@ -64,20 +67,19 @@ func (s *Status) Progress() float32 {
 }
 
 //
-// Cacher 缓存器（并发实现）。
+// Store 存储器（并发）。
+// 将下载数据保存到外部持久存储。
 //
-type Cacher struct {
+type Store struct {
 	data []PieceData     // 分片数据集
 	out  io.WriterAt     // 缓存输出
 	ch   chan PieceData  // 服务通道
 	done func(off int64) // 每存储成功回调
 }
 
-//
-// NewCacher 新建一个缓存器。
-//
-func NewCacher(pd []PieceData, out io.WriterAt, fx func(int64)) *Cacher {
-	cc := Cacher{
+// 新建一个存储器。
+func newStore(pd []PieceData, out io.WriterAt, fx func(int64)) *Store {
+	cc := Store{
 		pd,
 		out,
 		make(chan PieceData),
@@ -95,7 +97,7 @@ func NewCacher(pd []PieceData, out io.WriterAt, fx func(int64)) *Cacher {
 //
 // Task 获取每一次分片任务。
 //
-func (c *Cacher) Task() (k interface{}, ok bool) {
+func (c *Store) Task() (k interface{}, ok bool) {
 	k, ok = <-c.ch
 	return
 }
@@ -103,7 +105,7 @@ func (c *Cacher) Task() (k interface{}, ok bool) {
 //
 // Work 完成每片数据存储。
 //
-func (c *Cacher) Work(k interface{}) error {
+func (c *Store) Work(k interface{}) error {
 	v := k.(PieceData)
 
 	if _, err := c.out.WriteAt(v.Bytes, v.Offset); err != nil {
@@ -124,8 +126,8 @@ func (c *Cacher) Work(k interface{}) error {
 type Server struct {
 	User     Monitor       // 下载监控器
 	Dler     Downloader    // 下载器
-	Indexer  io.WriterAt   // 索引缓存
-	Outer    io.WriterAt   // 数据缓存输出
+	Indexer  io.WriterAt   // 索引暂存，写入|截断|新建
+	Outer    io.WriterAt   // 数据输出
 	OutSize  int64         // 输出最低值
 	Interval time.Duration // 索引保存间隔时间
 	Stat     Status        // 状态存储
@@ -156,8 +158,7 @@ func (s *Server) Run(rest piece.RestPieces) {
 	// 用户取消下载
 	cancel := goes.Canceller(s.User.ChExit())
 
-	var done bool
-	for !done {
+	for {
 		rtch := make(chan int64)
 		if cancel() {
 			break
@@ -175,6 +176,7 @@ func (s *Server) Run(rest piece.RestPieces) {
 		if rest.Empty() {
 			break
 		}
+		time.Sleep(ServeSleep)
 		s.dtch = s.Dler.Run(rest.Span, rest.Indexes())
 	}
 	s.finish = true
@@ -242,15 +244,19 @@ func (s *Server) serve(amount int, rtch chan<- int64) <-chan error {
 	go func() {
 		buf := make([]PieceData, 0, amount)
 		var wg sync.WaitGroup
+		var pd PieceData
 	L:
-		for pd := range s.dtch {
-			// 状态控制
+		// 不采用range方式，使得可以立即退出。
+		// for pd := range s.dtch {
+		for {
 			select {
 			case <-s.User.ChExit():
+				s.Dler.Stop()
 				break L
-			case <-s.User.ChPause():
-				// blocking or through
+			case pd = <-s.dtch:
 			}
+			<-s.User.ChPause()
+
 			buf = append(buf, pd)
 			if len(buf) < amount {
 				continue
@@ -290,7 +296,7 @@ func (s *Server) saveCache(pd []PieceData, ch chan<- int64) <-chan error {
 	done := func(k int64) {
 		ch <- k // 已存储分片的索引
 	}
-	cc := NewCacher(pd, s.Outer, done)
+	cc := newStore(pd, s.Outer, done)
 
 	// 取集合大小的一半为并发量，
 	// 仅是一个简单的直觉处理。
@@ -312,18 +318,24 @@ func (s *Server) restManage(rest piece.RestPieces, ch <-chan int64) {
 	}
 	tick := time.NewTicker(tm)
 
+	// 存储刷新
+	save := func(r *piece.RestPieces) {
+		r.Amount = len(r.Sums)
+		if _, err := s.Indexer.WriteAt(r.Bytes(), 0); err != nil {
+			log.Println(err)
+		}
+	}
+
 	for k := range ch {
 		select {
 		case <-tick.C:
-			rest.Amount = len(rest.Sums)
-			if _, err := s.Indexer.WriteAt(rest.Bytes(), 0); err != nil {
-				log.Println(err)
-			}
+			save(&rest)
 		default: // through...
 		}
 		delete(rest.Sums, k)
 		s.Stat.Increase(s.span)
 	}
+	save(&rest)
 	tick.Stop()
 
 	// 服务完毕

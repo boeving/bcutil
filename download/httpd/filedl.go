@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	dl "github.com/qchen-zh/pputil/download"
+	"github.com/qchen-zh/pputil/download"
 	"github.com/qchen-zh/pputil/download/piece"
 )
 
@@ -29,7 +29,7 @@ type FileDl struct {
 // 实现 download.Hauler 接口。
 // 返回自身即可，仅读取，无并发冲突。
 //
-func (f FileDl) NewHauler() dl.Getter {
+func (f FileDl) NewHauler() download.Getter {
 	return f
 }
 

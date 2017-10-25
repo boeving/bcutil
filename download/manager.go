@@ -122,6 +122,7 @@ func (m *Manager) Start() bool {
 
 //
 // Pause 暂停。
+// 返回true表示成功执行暂停。
 //
 func (m *Manager) Pause() bool {
 	m.semu.Lock()
@@ -136,6 +137,7 @@ func (m *Manager) Pause() bool {
 
 //
 // Resume 继续下载。
+// 返回true表示成功开启继续下载。
 //
 func (m *Manager) Resume() bool {
 	m.semu.Lock()
@@ -150,6 +152,7 @@ func (m *Manager) Resume() bool {
 
 //
 // Exit 结束下载。
+// 返回true表示成功执行结束（未被外部阻挡）。
 //
 func (m *Manager) Exit() bool {
 	if m.OnExit != nil && !m.OnExit() {

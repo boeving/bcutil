@@ -46,15 +46,19 @@ type PieceData struct {
 // 若不赋值验证集，则不执行验证（如http直接下载）。
 //
 type Downloader struct {
-	Haul Hauler                  // 数据搬运工
-	Sums map[int64]piece.HashSum // 验证集（可选）
-	pich <-chan piece.Piece      // 分片配置获取渠道
-	dtch chan PieceData          // 数据传递渠道
+	Haul  Hauler                  // 数据搬运工
+	Sums  map[int64]piece.HashSum // 验证集（可选）
+	Cache *Cache                  // 已下载缓存（用于RPC分享）
+
+	// 过程中赋值成员
+	pich <-chan piece.Piece // 分片配置获取渠道
+	dtch chan PieceData     // 数据传递渠道
+	stop chan struct{}      // 停止信号
 }
 
 //
 // Run 执行下载。
-// rest 为外部传递的一个待下载分片下标集。
+// rest 为外部传递的一个待下载分片起始下标集。
 // 返回一个分片数据读取通道。
 // 当下载进程完毕后，通道关闭（可能有下载失败）。
 //
@@ -71,8 +75,10 @@ func (d *Downloader) Run(span int64, rest []int64) <-chan PieceData {
 	// 通道的效率与外部存储IO相关。
 	d.dtch = make(chan PieceData, max)
 
+	d.stop = make(chan struct{})
+
 	// 分片索引服务
-	d.pich = pieceGetter(rest, span)
+	d.pich = pieceGetter(rest, span, d.stop)
 
 	err := goes.WorksLong(goes.LimitTasker(d, max))
 	go func() {
@@ -83,6 +89,13 @@ func (d *Downloader) Run(span int64, rest []int64) <-chan PieceData {
 	}()
 
 	return d.dtch
+}
+
+//
+// Stop 停止下载。
+//
+func (d *Downloader) Stop() {
+	close(d.stop)
 }
 
 ///////////////////
@@ -115,7 +128,13 @@ func (d *Downloader) Work(k interface{}) error {
 			return piece.Error{Off: p.Begin, Err: errChkSum}
 		}
 	}
-	d.dtch <- PieceData{p.Begin, bs}
+	pb := PieceData{p.Begin, bs}
+
+	// 已下载缓存&分享。
+	if d.Cache != nil {
+		d.Cache.Add(pb.Offset, &pb)
+	}
+	d.dtch <- pb // 传递至存储
 
 	return nil
 }
@@ -124,12 +143,17 @@ func (d *Downloader) Work(k interface{}) error {
 // 分片定义取值渠道。
 // 对外传递未下载分片定义{Begin, End}。
 //
-func pieceGetter(list []int64, span int64) <-chan piece.Piece {
+func pieceGetter(list []int64, span int64, stop chan struct{}) <-chan piece.Piece {
 	ch := make(chan piece.Piece)
 
 	go func() {
+	L:
 		for _, off := range list {
-			ch <- piece.Piece{Begin: off, End: off + span}
+			select {
+			case <-stop:
+				break L
+			case ch <- piece.Piece{Begin: off, End: off + span}:
+			}
 		}
 		close(ch)
 	}()

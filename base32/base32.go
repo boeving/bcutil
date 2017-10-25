@@ -24,13 +24,13 @@ type Encoding struct {
 	decodeMap [256]byte
 }
 
-// 标准字符序列。
+// EncodeStd 标准字符序列。
 // 便于外观和读音区分（视觉/听觉）。
 // 6s9l9zf4r5s4jfxiu8boleum7cx5x4m9wpsyzoxfrcdo9pei7ctyn4fhrex8lefm7ctyt576rhrybaq
 // [a-z4-9]
 const EncodeStd = "abcdefjhijklmnopqrstuvwxyz456789"
 
-//
+// 纯字母序列。
 // 选取原则：
 //  1. 外观差异较大，便于视觉区分；
 //  2. 大小写字符均衡，小写字母向下延展的优先（如gjqy）；
@@ -54,7 +54,7 @@ func NewEncoding(encoder string) *Encoding {
 	return e
 }
 
-// 标准编码（含数字）。
+// StdEncoding 标准编码（含数字）。
 var StdEncoding = NewEncoding(EncodeStd)
 
 // 纯字母编码。

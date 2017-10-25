@@ -45,9 +45,9 @@ func (p Error) Error() string {
 type HashSum [SumLength]byte
 
 //
-// Pieces 分片集。
-// 头部4字节存储分片数量和分片大小（16k单位）。
-// 其中前20位定义分片数量，后12位定义分片大小。
+// Pieces 分片定义集。
+// 头部4字节存储分片数量和分片大小（16k单位），然后是各分片的哈希存储。
+// 头部4字节中：前20位定义分片数量，后12位定义分片大小。
 //  - 最小分片16k（16k*1）；
 //  - 最大分片约64MB（16k*4096）。
 //  - 0分片大小表示不分片；
@@ -55,20 +55,20 @@ type HashSum [SumLength]byte
 // 小于16k的文本文档无需分片，简化逻辑。
 //
 type Pieces struct {
-	Amount int               // 分片数量
-	Span   int64             // 分片大小（bytes）
-	Sums   map[int64]HashSum // 校验集（key: offset）
+	Amount int   // 分片数量
+	Span   int64 // 分片大小（bytes）
+
+	// 校验集（key: offset），
+	// 可能从文件中读取已经存在的分片存储。
+	// 或外部直接赋值，然后可构造字节序列用于存储。
+	Sums map[int64]HashSum
 }
 
 //
-// NewPieces 新建一个分片集。
-// 设置为单一分片的默认值（也即未分片）。
-// 常用于对种子文件的直接下载。
+// OnePieces 单分片定义。
+// 设置为单一分片的值（也即未分片），常用于对种子文件的直接下载。
 //
-// 通常情况下，外部是直接声明一个实例，
-// 然后调用Head和Load从种子文件中载入配置。
-//
-func NewPieces(sum HashSum) *Pieces {
+func OnePieces(sum HashSum) *Pieces {
 	return &Pieces{
 		1, 0,
 		map[int64]HashSum{0: sum},
