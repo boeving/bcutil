@@ -1,12 +1,12 @@
 //
-// Package peerjs 采用JSON编解码方式的RPC服务包。
+// Package rpcjs 采用JSON编解码方式的RPC服务包。
 // 由标准库 net/rpc 定制而来。
 // 考虑执行效率和节约网络带宽，编码器采用 MessagePack（github.com/tinylib/msgp）。
 //
 // 主要用于轻量级的RPC交互，客户端/服务器需要协调参数与响应类型的msgp编解码。
 // 注：中大型的RPC应用可考虑peerpb包（由ProtoBuf支持）。
 //
-package peerjs
+package rpcjs
 
 import (
 	"io"

@@ -1,4 +1,4 @@
-package peerjs
+package rpcjs
 
 import (
 	"bufio"
@@ -30,7 +30,6 @@ type msgpClientCodec struct {
 func (mc *msgpClientCodec) WriteRequest(r *rpc.Request, param interface{}) error {
 	req, ok := param.(msgp.Encodable)
 	if !ok {
-		mc.Close()
 		log.Println(msgRequest, errEncodable)
 		return errEncodable
 	}
@@ -46,7 +45,6 @@ func (mc *msgpClientCodec) WriteRequest(r *rpc.Request, param interface{}) error
 		err = msgp.Encode(mc.rwc, req)
 	}
 	if err != nil {
-		mc.Close()
 		log.Println(msgRequest, err)
 	}
 	return err

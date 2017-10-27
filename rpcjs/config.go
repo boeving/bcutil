@@ -1,4 +1,4 @@
-package peerjs
+package rpcjs
 
 import "errors"
 
