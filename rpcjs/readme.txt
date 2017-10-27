@@ -1,5 +1,4 @@
-P2P网络端点
-标准RPC（net/rpc）方式连接。数据传输采用JSON/msgp（MessagePack）。
+用json/msgp编解码传输的标准RPC（net/rpc）覆盖实现。
 
 msgp Options
 -o      - output file name (default is {input}_gen.go)
