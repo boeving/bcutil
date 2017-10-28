@@ -38,12 +38,6 @@ type Piece struct {
 	End   int64 `protobuf:"varint,2,opt,name=end" json:"end,omitempty"`
 }
 
-// Size 分片大小。
-// 与 piece.Piece 定义相同。
-func (p *Piece) Size() int {
-	return int(p.End - p.Begin)
-}
-
 func (m *Piece) Reset()                    { *m = Piece{} }
 func (m *Piece) String() string            { return proto.CompactTextString(m) }
 func (*Piece) ProtoMessage()               {}

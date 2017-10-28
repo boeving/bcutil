@@ -68,7 +68,7 @@ func (c *Cache) Add(k int64, pd *PieceData) bool {
 // 外部可恰当/随机的导入部分文件规划分享。
 //
 func (c *Cache) Load(data io.ReaderAt, index, rest io.Reader) error {
-
+	return nil
 }
 
 //
