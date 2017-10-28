@@ -75,6 +75,7 @@ func (mc *msgpServerCodec) ReadRequestHeader(r *rpc.Request) error {
 	}
 	r.Seq = mc.req.ID
 	r.ServiceMethod = mc.req.Method
+	log.Println("Read request header", mc.req)
 	return nil
 }
 
@@ -90,7 +91,9 @@ func (mc *msgpServerCodec) ReadRequestBody(v interface{}) error {
 	if !ok {
 		return errDecodable
 	}
-	return msgp.Decode(mc.rwc, dec)
+	err := msgp.Decode(mc.rwc, dec)
+	log.Println("Read request body ", dec)
+	return err
 }
 
 //
@@ -98,6 +101,7 @@ func (mc *msgpServerCodec) ReadRequestBody(v interface{}) error {
 // 要求并发安全（两段连续写入）。
 //
 func (mc *msgpServerCodec) WriteResponse(r *rpc.Response, v interface{}) error {
+	log.Println(v)
 	body, ok := v.(msgp.Encodable)
 	if !ok {
 		mc.Close()
@@ -118,6 +122,7 @@ func (mc *msgpServerCodec) WriteResponse(r *rpc.Response, v interface{}) error {
 		mc.Close()
 		log.Println(msgResponse, err)
 	}
+	log.Println("Write response done")
 	return err
 }
 

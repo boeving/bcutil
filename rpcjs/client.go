@@ -40,13 +40,19 @@ func (mc *msgpClientCodec) WriteRequest(r *rpc.Request, param interface{}) error
 	mc.pending[r.Seq] = r.ServiceMethod
 
 	head := Request{r.Seq, r.ServiceMethod}
-	err := msgp.Encode(mc.rwc, head)
+	buf := bufio.NewWriter(mc.rwc)
+
+	err := msgp.Encode(buf, head)
 	if err == nil {
-		err = msgp.Encode(mc.rwc, req)
+		err = msgp.Encode(buf, req)
+		log.Println("Encode req-body done...")
 	}
 	if err != nil {
 		log.Println(msgRequest, err)
 	}
+	buf.Flush()
+	log.Println("Encode head&req done", head, req)
+	// mc.Close()
 	return err
 }
 
