@@ -5,15 +5,15 @@ import (
 	"log"
 	"net"
 
-	"github.com/mytest/rpc2cs/server"
-	"github.com/qchen-zh/pputil/rpcjs"
+	"github.com/qchen-zh/pputil/废弃/rpcjs"
+	"github.com/qchen-zh/pputil/废弃/rpcjs/rpc2cs/server"
 	"github.com/tinylib/msgp/msgp"
 )
 
 const serverAddress = "127.0.0.1"
 
 func main() {
-	conn, err := net.Dial("tcp", serverAddress+":1234")
+	conn, err := net.Dial("tcp", "127.0.0.1:1234")
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
@@ -27,14 +27,14 @@ func main() {
 	// var reply server.Quotient
 	// err = client.Call("Arith.Divide", args, &reply)
 
-	msgp.Encode(conn, &ids)
+	msgp.Encode(conn, ids)
 	// 添加完全无关的该行后接收端正常，
 	// 且接收端接收的args/args2值不确定。
 	// 此为已脱离rpc方式的测试。
 	// log.Println("hai")
-	msgp.Encode(conn, &args)
+	msgp.Encode(conn, args)
 	// log.Println("hai2") // 同上效果
-	msgp.Encode(conn, &args2)
+	msgp.Encode(conn, args2)
 	if err != nil {
 		log.Fatal("arith error:", err)
 	}
