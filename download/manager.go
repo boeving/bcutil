@@ -62,10 +62,6 @@ type Monitor interface {
 	Errors(err error)
 }
 
-// UICaller 用户行为前置约束。
-// 返回false否决目标行为（如：Start、Pause等）
-type UICaller = func() bool
-
 //
 // Manager 下载管理器。
 // 实现 Monitor 接口。
@@ -73,10 +69,10 @@ type UICaller = func() bool
 //  - 文件哈希标识采用P2P传输（peerd）
 //
 type Manager struct {
-	OnStart  UICaller     // 下载开始之前
-	OnPause  UICaller     // 暂停之前
-	OnResume UICaller     // 继续之前（暂停后）
-	OnExit   UICaller     // 结束之前
+	OnStart  func() bool  // 下载开始之前
+	OnPause  func() bool  // 暂停之前
+	OnResume func() bool  // 继续之前（暂停后）
+	OnExit   func() bool  // 结束之前
 	OnFinish func() error // 下载完成之后
 	OnError  func(error)  // 出错之后
 
