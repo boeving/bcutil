@@ -1,5 +1,4 @@
 // Package httpd 直接网址下载方式的实现。
-//
 package httpd
 
 import (
