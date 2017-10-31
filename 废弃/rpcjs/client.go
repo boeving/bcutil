@@ -38,21 +38,17 @@ func (mc *msgpClientCodec) WriteRequest(r *rpc.Request, param interface{}) error
 
 	// 缓存方法名
 	mc.pending[r.Seq] = r.ServiceMethod
-
 	head := Request{r.Seq, r.ServiceMethod}
-	buf := bufio.NewWriter(mc.rwc)
 
-	err := msgp.Encode(buf, head)
+	err := msgp.Encode(mc.rwc, head)
 	if err == nil {
-		err = msgp.Encode(buf, req)
+		err = msgp.Encode(mc.rwc, req)
 		log.Println("Encode req-body done...")
 	}
 	if err != nil {
 		log.Println(msgRequest, err)
 	}
-	buf.Flush()
 	log.Println("Encode head&req done", head, req)
-	// mc.Close()
 	return err
 }
 

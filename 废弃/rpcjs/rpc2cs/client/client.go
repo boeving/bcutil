@@ -27,17 +27,27 @@ func main() {
 	// var reply server.Quotient
 	// err = client.Call("Arith.Divide", args, &reply)
 
-	msgp.Encode(conn, ids)
+	// msgp.Encode(conn, ids)
+	wd := msgp.NewWriter(conn)
+
+	err = ids.EncodeMsg(wd)
+	if err != nil {
+		log.Fatal("EncodeMsg ids:", err)
+	}
 	// 添加完全无关的该行后接收端正常，
 	// 且接收端接收的args/args2值不确定。
 	// 此为已脱离rpc方式的测试。
 	// log.Println("hai")
-	msgp.Encode(conn, args)
-	// log.Println("hai2") // 同上效果
-	msgp.Encode(conn, args2)
+	err = args.EncodeMsg(wd)
 	if err != nil {
-		log.Fatal("arith error:", err)
+		log.Fatal("EncodeMsg args:", err)
 	}
+	// log.Println("hai2") // 同上效果
+	err = args2.EncodeMsg(wd)
+	if err != nil {
+		log.Fatal("EncodeMsg args2:", err)
+	}
+	wd.Flush()
 	// fmt.Printf("Arith: %d, %d => %v\n", args.A, args.B, reply)
 
 	// time.Sleep(10 * time.Second)

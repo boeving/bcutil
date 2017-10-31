@@ -30,18 +30,19 @@ func main() {
 		var req rpcjs.Request
 		var arg server.Args
 		var arg2 server.Args
-		msgp.Decode(conn, &req)
+		rd := msgp.NewReader(conn)
+		// msgp.Decode(conn, &req)
+		req.DecodeMsg(rd)
 		fmt.Println(req)
 
-		msgp.Decode(conn, &arg)
+		// msgp.Decode(conn, &arg)
+		arg.DecodeMsg(rd)
+
 		fmt.Println(arg)
 
-		msgp.Decode(conn, &arg2)
+		// msgp.Decode(conn, &arg2)
+		arg2.DecodeMsg(rd)
 		fmt.Println(arg2)
-		// io.Copy(os.Stdout, conn)
-
-		// time.Sleep(2 * time.Second)
-		// aclient(conn)
 	}
 }
 
