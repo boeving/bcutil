@@ -46,27 +46,32 @@ type HashSum [SumLength]byte
 
 //
 // Pieces 分片定义集。
-// 头部4字节存储分片数量和分片大小（16k单位），然后是各分片的哈希存储。
+// 定义分片数据的基本属性：分片大小、分片数量和计算的哈希校验和。
+// 这些属性会被存储于外部，用于文件分享传递的依据。
+//
+// 存储头部4字节为分片数量和分片大小（16k单位），
+// 然后是各分片的哈希校验和（连续串接，无间隔字节）。
+//
 // 头部4字节中：前20位定义分片数量，后12位定义分片大小。
-//  - 最小分片16k（16k*1）；
-//  - 最大分片约64MB（16k*4096）。
+//  - 分片单位16k；
+//  - 分片最大支持到64MB（16k*4095）。
 //  - 0分片大小表示不分片；
-// 友好：
-// 小于16k的文本文档无需分片，简化逻辑。
+//  - 小于16k的文本文档无法分片（简化）。
 //
 type Pieces struct {
 	Amount int   // 分片数量
 	Span   int64 // 分片大小（bytes）
 
 	// 校验集（key: offset），
-	// 可能从文件中读取已经存在的分片存储。
-	// 或外部直接赋值，然后可构造字节序列用于存储。
+	// 可能从文件中读取已经存在的分片定义。
+	// 或外部计算校验和后（Sumor）赋值，然后可用于构造存储。
 	Sums map[int64]HashSum
 }
 
 //
 // OnePieces 单分片定义。
 // 设置为单一分片的值（也即未分片），常用于对种子文件的直接下载。
+// sum 即为文件本身的哈希。
 //
 func OnePieces(sum HashSum) *Pieces {
 	return &Pieces{
@@ -154,7 +159,8 @@ func (p *Pieces) HeadBytes() []byte {
 }
 
 //
-// Indexes 下标索引集。
+// Indexes 返回分片定义集的下标索引集。
+// 返回值可能是一个0长度的分片（如果为零分片的话）。
 //
 func (p *Pieces) Indexes() []int64 {
 	buf := make([]int64, 0, len(p.Sums))
@@ -166,16 +172,19 @@ func (p *Pieces) Indexes() []int64 {
 }
 
 //
-// Empty 分片集是否为空
+// Empty 分片集是否为空。
 //
 func (p *Pieces) Empty() bool {
 	return len(p.Sums) == 0
 }
 
 //
-// RestPieces 剩余分片。
-// 存储结构与Pieces有区别（含下标偏移）
-// 注：因分片已不连续。
+// RestPieces 剩余待下载分片。
+// 存储结构与Pieces类似，但包含下标偏移。
+// 注：因分片不连续。
+//
+// 仅用于下载过程中的状态存储，下载完毕即无用。
+// 如果存在一个文件对应的剩余分片定义，则表示未下载完毕。
 //
 type RestPieces struct {
 	Pieces
@@ -211,8 +220,8 @@ func offsetAndSum(buf [lenOffSum]byte) (uint64, *HashSum) {
 }
 
 //
-// Bytes 编码剩余分片索引集（整体）。
-// 包含位置下标偏移值，结构：4+[8+32][8+32]...
+// Bytes 编码剩余分片索引集。
+// 结构：4+[8+32][8+32]...
 //
 func (p *RestPieces) Bytes() []byte {
 	buf := make([]byte, 0, 4+len(p.Sums)*lenOffSum)
