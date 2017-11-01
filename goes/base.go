@@ -42,7 +42,7 @@ func Send(ch chan<- error, err error) {
 // 外部仍需将ch内的信号清空，以防关闭前有Go程阻塞。
 // 如果“一旦出错就应该关闭”，则使用Closer更便捷。
 //
-// 除非是明确回避多次关闭，否在应避免使用。隐藏的多次关闭可能有逻辑上的问题。
+// 除非是明确回避多次关闭的panic，否在应避免使用。暗藏的多次关闭可能有逻辑上的问题。
 //
 func Close(ch chan<- struct{}) {
 	if ch == nil {
