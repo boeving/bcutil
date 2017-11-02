@@ -1,74 +1,106 @@
-//
 // Package peeval 网络端点价值评估。
-// 考虑三个方面：
-//  1. 响应时间（RTT）；
-//  2. 传输数据量和连接次数（活跃度）；
-//  3. 破坏性行为评估；
+// 仅用IP和端口对目标端点进行短时间的标识和评估，不设计特别的ID标识（会增加复杂性并带来隐私问题）。
+// 端点价值可能用于连接&数据传递优先性，或暂时性屏蔽。
+//
+// 评估的四个方面：
+//  1. 平均响应时间（RTT）；
+//  2. 传输的有效数据量；
+//  3. 破坏性行为减分；
+//  4. 通用的3级加分（如增值服务）；
 //
 package peeval
 
 import (
 	"fmt"
 	"net"
-	"sync"
 	"time"
+)
+
+// Score 记分类型。
+type Score int
+
+// 行为与分值
+const (
+	Good    Score = 1  // 普通加分
+	Better  Score = 2  // 较好加分
+	Best    Score = 3  // 最高加分
+	BadData Score = -1 // 传递无效数据
+	Abuse   Score = -2 // 滥用资源（对端）
+	Attack  Score = -3 // 恶意攻击
 )
 
 // 基本常量。
 const (
 	UpLimit    = 0xff             // 满分上限值
-	MaxAmount  = 1 << 34          // 满分数据量（16G）
+	MaxAmount  = 1 << 33          // 满分数据量（8G）
 	RTTTimeout = 20 * time.Second // RTT 超时线
 )
 
 //
-// Peer 端点基本信息。
-// 端点按IP识别，一段时间后取消IP标识的有效性。
-// 注记：
-// 不另设ID字段。会有隐私问题和长时间保持顾虑。
+// PeerID 端点标识。
 //
-type Peer struct {
-	IP   net.IP // 监听IP
-	Port int    // 监听端口
+type PeerID struct {
+	IP   net.IP
+	Port int
 }
 
 //
-// String 端点显示形式如 190.168.10.200:3456。
+// String 类似URL形式。
+// 如 190.168.10.2:6500。
 //
-func (p Peer) String() string {
+func (p PeerID) String() string {
 	return fmt.Sprintf("%s:%d", p.IP, p.Port)
 }
 
 //
 // Resume 端点概要。
-// 记录端点的行为评估因子。并发安全。
-//  - 效益得分（Score）；
-//  - 破坏性点数（Blame）；
-//  - 连接效率（往返时间）；
-// 注：
-// RTT与端点查询筛选策略相关：假定RTT相似者相近。
 //
 type Resume struct {
-	Peer
-	Score               // 效益得分
-	Blame               // 破坏性权衡
-	RTT   time.Duration // Round Trip Time
+	ID    PeerID        // 端点标识
+	rtt   time.Duration // 连通效率（平均）
+	score Score         // 积分值
+	dsize int64         // 有效数据量
 }
 
 //
 // String 包含综合评分值。
-// 取地址方式，因为Score/Blame中包含锁字段。
+// 格式：ID[分值]
 //
-func (r *Resume) String() string {
-	return fmt.Sprintf("%s[%d]", r.Peer, r.Value())
+func (r Resume) String() string {
+	return fmt.Sprintf("%s[%d]", r.ID, r.Value())
 }
 
 //
-// Value 返回总评分值 [0-255]。
-// Blame值两倍加权。
+// Plus 累计记分。
+// 实参通常为预定义的几个常量值。
+//
+// 参数未强制约束范围，因此外部可传递一个差距很大的值。
+// 明确的类型转换表示用户意愿。
+//
+func (r *Resume) Plus(n Score) {
+	r.score += n
+}
+
+//
+// TimeTrip 平均时间（RTT）效率。
+//
+func (r *Resume) TimeTrip(tm time.Duration) {
+	r.rtt = (r.rtt + tm) / 2
+}
+
+//
+// Supply 有效数据累计。
+//
+func (r *Resume) Supply(sz int64) {
+	r.dsize += sz
+}
+
+//
+// Value 端点评估值 [0-255]。
+// 积分值没有255的上限，故可能抢占优势。
 //
 func (r *Resume) Value() int {
-	v := r.Trips() + r.Hits() - r.Bads()*2
+	v := (r.trips() + int(r.score) + r.dvalue()) / 3
 
 	if v < 0 {
 		return 0
@@ -80,14 +112,14 @@ func (r *Resume) Value() int {
 }
 
 //
-// Trips 返回时间效率 [0-255]。
+// 时间效率得分 [0-255]。
 // 按20秒超时计算，约80ms可获得满分。
 //
-func (r *Resume) Trips() int {
-	if r.RTT > RTTTimeout {
+func (r *Resume) trips() int {
+	if r.rtt > RTTTimeout {
 		return 0
 	}
-	v := int(RTTTimeout / r.RTT)
+	v := int(RTTTimeout / r.rtt)
 
 	if v < UpLimit {
 		return v
@@ -96,167 +128,11 @@ func (r *Resume) Trips() int {
 }
 
 //
-// Hits 返回效益分值 [0-255]。
+// 数据量评估得分 [0-255]。
 //
-func (r *Resume) Hits() int {
-	return r.Score.Value()
-}
-
-//
-// Bads 返回破坏值 [0-255]。
-//
-func (r *Resume) Bads() int {
-	return r.Blame.Value()
-}
-
-//
-// Score 得分评估器。
-//  1. 端点活跃度；
-//  2. 端点提供的有效数据量；
-//
-// 可能在多个协程中更新，故设计为并发安全。
-//
-type Score struct {
-	counts int   // 连接次数（活跃度）
-	amount int64 // 有效数据量（字节数）
-	mu     sync.Mutex
-}
-
-//
-// LinkIn 连接计数。
-// 超过255次连接为满分。
-//
-func (s *Score) LinkIn() {
-	s.mu.Lock()
-
-	if s.counts < UpLimit {
-		s.counts++
+func (r *Resume) dvalue() int {
+	if r.dsize >= MaxAmount {
+		return UpLimit
 	}
-	s.mu.Unlock()
-}
-
-//
-// LinkOut 连接退出。
-// 一般用于没有提供有效数据断开，或很快退出。
-//
-func (s *Score) LinkOut() {
-	s.mu.Lock()
-
-	if s.counts > 0 {
-		s.counts--
-	}
-	s.mu.Unlock()
-}
-
-//
-// Amount 数据量累计。
-// 超过16G数据为满分。
-// 注：应该只针对有效数据。
-//
-func (s *Score) Amount(sz int64) {
-	s.mu.Lock()
-
-	if s.amount < MaxAmount {
-		s.amount += sz
-	}
-	if s.amount > MaxAmount {
-		s.amount = MaxAmount
-	}
-	s.mu.Unlock()
-}
-
-//
-// Value 计算并返回评估分值 [0-255]。
-// 算法：
-//  - 活跃度权重1/4；
-//  - 有效数据权重3/4；
-//
-func (s *Score) Value() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	d := s.amount * UpLimit / MaxAmount
-	return int(d*3/4) + s.counts/4
-}
-
-//
-// Reset 状态重置。
-// 通常在一定时间后调用，消除IP标识端点的失误。
-//
-func (s *Score) Reset() {
-	s.mu.Lock()
-	s.amount = 0
-	s.counts = 0
-	s.mu.Unlock()
-}
-
-//
-// Blame 追责计算器。
-//  1. 传递无效数据（交易/区块头等）；
-//  2. 滥用连接资源（主观判断），危害中等；
-//  3. 视为攻击性的行为；
-//
-// 需要用于不定数量的协程中，故设计并发安全。
-//
-type Blame struct {
-	result int
-	mu     sync.Mutex
-}
-
-//
-// Invalid 传递无效数据。
-// 包括无效的交易、区块头等。
-// 普通缺点：计数加1个点。
-//
-func (t *Blame) Invalid() {
-	t.mu.Lock()
-	t.setVal(1)
-	t.mu.Unlock()
-}
-
-//
-// Abuse 滥用连接资源。
-// 中等危害：计数加2个点。
-//
-func (t *Blame) Abuse() {
-	t.mu.Lock()
-	t.setVal(2)
-	t.mu.Unlock()
-}
-
-//
-// Attack 攻击性行为。
-// 有意破坏：计数加3个点。
-//
-func (t *Blame) Attack() {
-	t.mu.Lock()
-	t.setVal(3)
-	t.mu.Unlock()
-}
-
-//
-// Value 返回攻击值 [0-255]。
-//
-func (t *Blame) Value() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	return t.result
-}
-
-//
-// Reset 重置计数。
-//
-func (t *Blame) Reset() {
-	t.mu.Lock()
-	t.result = 0
-	t.mu.Unlock()
-}
-
-func (t *Blame) setVal(n int) {
-	t.result += n
-
-	if t.result > UpLimit {
-		t.result = UpLimit
-	}
+	return int(r.dsize * int64(UpLimit) / int64(MaxAmount))
 }
