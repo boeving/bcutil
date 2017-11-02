@@ -23,10 +23,10 @@ type Score int
 const (
 	Good    Score = 1  // 普通加分
 	Better  Score = 2  // 较好加分
-	Best    Score = 3  // 最高加分
+	Best    Score = 4  // 最高加分
 	BadData Score = -1 // 传递无效数据
 	Abuse   Score = -2 // 滥用资源（对端）
-	Attack  Score = -3 // 恶意攻击
+	Attack  Score = -4 // 恶意攻击
 )
 
 // 基本常量。
