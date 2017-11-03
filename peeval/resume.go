@@ -19,7 +19,8 @@ import (
 // Score 记分类型。
 type Score int
 
-// 行为与分值
+// 行为与分值。
+// 通常，外部对选取的权衡仅仅是一种直觉。
 const (
 	Good    Score = 1  // 普通加分
 	Better  Score = 2  // 较好加分
@@ -89,7 +90,7 @@ func (r *Resume) TimeTrip(tm time.Duration) {
 }
 
 //
-// Supply 有效数据累计。
+// Supply 有效数据量累计。
 //
 func (r *Resume) Supply(sz int64) {
 	r.dsize += sz

@@ -1,7 +1,7 @@
-// Package ping 快速发送ICMP数据包测试目标网络地址。
-// 支持多地址（实现Addrs.Next接口）并发的发送测试。
+// Package ping ICMP数据包回显模块。
+// 支持多地址并发测试，地址提供者实现Address接口。
 //
-// 示例:
+// 例:
 //	ip, err := net.ResolveIPAddr("ip", os.Args[1])
 //	if err != nil {
 //		fmt.Println(err)
@@ -71,17 +71,17 @@ var (
 	}
 )
 
-// 取消判断生成器。
-var canceller = goes.Canceller
-
 //
 // Listen 启动监听。
-// @network 采用的网络，"ip" 或 "udp"
-// @address 监听地址，空串视为IPv4网络，可为IPv4或IPv6地址
+// network 指采用的网络，"ip" 或 "udp"；
+// address 为监听地址，可为IPv4或IPv6。空串视为IPv4地址："0.0.0.0"。
 //
 func Listen(network, address string) (*icmp.PacketConn, error) {
 	if network != "ip" && network != "udp" {
 		return nil, errors.New(network + " can't be used as ICMP endpoint")
+	}
+	if address == "" {
+		address = "0.0.0.0"
 	}
 	proto, err := addressProto(network, address)
 	if err != nil {
@@ -214,8 +214,8 @@ type Pinger struct {
 
 //
 // NewPinger 创建一个Ping实例。
-// @network 网络名称，"ip" 或 "udp"
-// @address 本地监听地址，可为空串
+// network 指网络名称，如："ip" 或 "udp"，
+// address 指本地监听地址和端口，也可为空串。
 //
 func NewPinger(network, address string) (*Pinger, error) {
 	conn, err := Listen(network, address)
@@ -225,7 +225,7 @@ func NewPinger(network, address string) (*Pinger, error) {
 	stop := make(chan struct{})
 
 	return &Pinger{
-		s:       NewSender(conn, canceller(stop)),
+		s:       NewSender(conn, goes.Canceller(stop)),
 		r:       NewReceiver(conn, stop),
 		stop:    stop,
 		network: network,
@@ -363,7 +363,7 @@ func (p *Pinger) PingLoop(dst net.Addr, t time.Duration, cnt int) error {
 //
 func Pings(p *Pinger, as Address) error {
 	go pingSends(
-		as.IPAddrs(canceller(p.stop)),
+		as.IPAddrs(goes.Canceller(p.stop)),
 		p.s.Send)
 
 	var rd *Packet
@@ -407,7 +407,9 @@ func pingSends(ch <-chan net.Addr, send func(net.Addr) error) {
 	}
 }
 
+//
 // Address IP地址生成器。
+//
 type Address interface {
 	IPAddrs(cancel func() bool) <-chan net.Addr
 }
@@ -518,9 +520,6 @@ func icmpReceive(conn *icmp.PacketConn) *Packet {
 // 默认为IPv4类网络协议（ip4:icmp）
 //
 func addressProto(network, address string) (string, error) {
-	if address == "" {
-		return ipv4Proto[network], nil
-	}
 	ip := net.ParseIP(address)
 
 	if isIPv4(ip) {
@@ -529,7 +528,7 @@ func addressProto(network, address string) (string, error) {
 	if isIPv6(ip) {
 		return ipv6Proto[network], nil
 	}
-	return nil, errors.New(address + " is not valid IPv4/IPv6 address")
+	return "", errors.New(address + " is not valid IPv4/IPv6 address")
 }
 
 //

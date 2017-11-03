@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-
-	"github.com/qchen-zh/pputil/goes"
 )
 
 //
@@ -98,24 +96,31 @@ func (s *Stack) Pop(n int) []net.Addr {
 
 //
 // IPAddrs 获取IP序列的微服务。
-// 返回管道内值：net.Addr。
+// 实现 ping.Address 接口。
 //
-// 允许地址集在服务期变化（更大的灵活性）。
-//
-func (s *Stack) IPAddrs(cancel func() bool) <-chan interface{} {
-	return goes.IntGets(s, 0, 1, cancel)
+func (s *Stack) IPAddrs(cancel func() bool) <-chan net.Addr {
+	ch := make(chan net.Addr)
+
+	go func() {
+		for i := 0; i < len(s.pool); i++ {
+			if cancel != nil && cancel() {
+				break
+			}
+			ch <- s.Get(i)
+		}
+		close(ch)
+	}()
+
+	return ch
 }
 
 //
-// IntGet 提取下一个地址。
-// v存储：net.Addr
+// Get 提取下一个地址。
+// 允许地址集在服务期变化（更大的灵活性）。
+// 用单独的函数调用，使得锁可以即时释放。
 //
-func (s *Stack) IntGet(i int) (v interface{}, ok bool) {
+func (s *Stack) Get(i int) net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if 0 < len(s.pool) && i < len(s.pool) {
-		v, ok = s.pool[i], true
-	}
-	return
+	return s.pool[i]
 }
