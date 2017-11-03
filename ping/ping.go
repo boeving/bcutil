@@ -422,7 +422,7 @@ type Handler interface {
 	//  @dt 内有id/seq相应的字段对应，两者应相等。
 	//  @stop 终止ping行为的反向控制函数（主要用于并发）。
 	// stop可能类似：func() { close(ch) }
-	Receive(a net.Addr, id, seq int, dt *icmp.Echo, stop func()) error
+	Receive(a net.Addr, id, seq int, mb icmp.MessageBody, stop func()) error
 
 	// 错误时操作。
 	// 包含连接读取错误和回应非EchoReply类型视为错误。
@@ -441,7 +441,7 @@ type Handler interface {
 //
 func icmpSend(conn *icmp.PacketConn, addr net.Addr, msg []byte, cancel func() bool) {
 	for {
-		if _, err := conn.WriteTo(msg, ip); err != nil {
+		if _, err := conn.WriteTo(msg, addr); err != nil {
 			if neterr, ok := err.(*net.OpError); ok {
 				if neterr.Err == syscall.ENOBUFS {
 					if cancel() {
@@ -462,7 +462,7 @@ func icmpSend(conn *icmp.PacketConn, addr net.Addr, msg []byte, cancel func() bo
 func icmpType(dst net.Addr) (icmp.Type, error) {
 	addr, ok := dst.(*net.IPAddr)
 	if !ok {
-		return nil, errors.New("dst argument has not *net.IPAddr address")
+		return nil, errors.New("argument not a *net.IPAddr address")
 	}
 	if isIPv4(addr.IP) {
 		return ipv4.ICMPTypeEcho, nil
@@ -470,6 +470,7 @@ func icmpType(dst net.Addr) (icmp.Type, error) {
 	if isIPv6(addr.IP) {
 		return ipv6.ICMPTypeEchoRequest, nil
 	}
+	return nil, fmt.Errorf("invalid IP address: %s", addr.IP)
 }
 
 //
@@ -482,7 +483,7 @@ func icmpMsg(typ icmp.Type, code, id, seq int, dt []byte) ([]byte, error) {
 	if len(dt) > 0 {
 		t = append(t, dt...)
 	}
-	return &icmp.Message{
+	msg := icmp.Message{
 		Type: typ,
 		Code: code,
 		Body: &icmp.Echo{
@@ -490,7 +491,8 @@ func icmpMsg(typ icmp.Type, code, id, seq int, dt []byte) ([]byte, error) {
 			Seq:  seq,
 			Data: t,
 		},
-	}.Marshal(nil)
+	}
+	return msg.Marshal(nil)
 }
 
 //
@@ -528,18 +530,19 @@ func addressProto(network, address string) (string, error) {
 	if isIPv6(ip) {
 		return ipv6Proto[network], nil
 	}
-	return "", errors.New(address + " is not valid IPv4/IPv6 address")
+	return "", fmt.Errorf("invalid IPv4/IPv6 address: %s", address)
 }
 
 //
 // 解析回应消息。
 //
-func replyEchoParse(p *Packet, network string) (*icmp.Echo, error) {
+func replyEchoParse(p *Packet, network string) (icmp.MessageBody, error) {
 	addr, ok := p.addr.(*net.IPAddr)
 	if !ok {
 		return nil, errors.New("bad IPAddr with reply message")
 	}
 	var proto int
+	var buf []byte
 
 	if isIPv4(addr.IP) {
 		if network == "ip" {
@@ -607,11 +610,15 @@ type Reverb struct{}
 
 //
 // Receive 成功接收。
-func (r Reverb) Receive(a net.Addr, id, seq int, dt *icmp.Echo) error {
-	if id != dt.ID || seq != dt.Seq {
-		return errors.New("the id or seq not match message's item")
+func (r Reverb) Receive(a net.Addr, id, seq int, mb icmp.MessageBody, stop func()) error {
+	echo, ok := mb.(*icmp.Echo)
+	if !ok {
+		return errors.New("message body not Echo type")
 	}
-	rtt := time.Since(bytesToTime(dt.Data[:TimeSliceLength]))
+	if id != echo.ID || seq != echo.Seq {
+		return errors.New("id or seq not match message's item")
+	}
+	rtt := time.Since(bytesToTime(echo.Data[:TimeSliceLength]))
 	fmt.Println(a, rtt)
 	return nil
 }
