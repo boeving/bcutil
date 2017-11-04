@@ -12,7 +12,7 @@ import (
 //
 type Tasker interface {
 	Task() (k interface{}, ok bool)
-	Work(k interface{}) error
+	Work(k interface{}, sm *Sema) error
 }
 
 //
@@ -34,11 +34,11 @@ func (l *limitTask) Task() (interface{}, bool) {
 //
 // Work 工作执行覆盖。
 //
-func (l *limitTask) Work(k interface{}) error {
+func (l *limitTask) Work(k interface{}, sm *Sema) error {
 	defer func() {
 		<-l.sema
 	}()
-	return l.tk.Work(k)
+	return l.tk.Work(k, sm)
 }
 
 //
@@ -94,7 +94,7 @@ func Works(t Tasker) <-chan error {
 			go func(k interface{}) {
 				defer wg.Done()
 
-				if err := t.Work(k); err != nil {
+				if err := t.Work(k, sem); err != nil {
 					sem.Exit()
 					// 只写，竞争
 					ge = err
@@ -120,7 +120,7 @@ func Works(t Tasker) <-chan error {
 // 外部需要持续读取通道，否则通道不会关闭，内部Go程也会阻塞泄漏。
 // 如果外部需要提前结束服务，提前结束其Task/Work即可。
 //
-func WorksLong(t Tasker) <-chan error {
+func WorksLong(t Tasker, sm *Sema) <-chan error {
 	bad := make(chan error)
 
 	go func() {
@@ -135,7 +135,7 @@ func WorksLong(t Tasker) <-chan error {
 			go func(v interface{}) {
 				defer wg.Done()
 
-				if err := t.Work(v); err != nil {
+				if err := t.Work(v, sm); err != nil {
 					bad <- err
 				}
 			}(v)
@@ -152,7 +152,7 @@ func WorksLong(t Tasker) <-chan error {
 //
 type Firster interface {
 	Task() (k interface{}, ok bool)
-	First(k interface{}) (v interface{}, ok bool)
+	First(k interface{}, sm *Sema) (v interface{}, ok bool)
 }
 
 //
@@ -174,11 +174,11 @@ func (l *limitFirst) Task() (interface{}, bool) {
 //
 // First 工作执行覆盖。
 //
-func (l *limitFirst) First(k interface{}) (interface{}, bool) {
+func (l *limitFirst) First(k interface{}, sm *Sema) (interface{}, bool) {
 	defer func() {
 		<-l.sema
 	}()
-	return l.ft.First(k)
+	return l.ft.First(k, sm)
 }
 
 //
@@ -213,7 +213,7 @@ func First(f Firster) interface{} {
 				break
 			}
 			go func(v interface{}) {
-				if v, ok := f.First(v); ok {
+				if v, ok := f.First(v, sem); ok {
 					select {
 					case vch <- v:
 						sem.Exit()
