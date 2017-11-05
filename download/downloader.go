@@ -80,7 +80,7 @@ func (d *Downloader) Run(span int64, rest []int64) <-chan PieceData {
 	// 分片索引服务
 	d.pich = pieceGetter(rest, span, d.stop)
 
-	err := goes.WorksLong(goes.LimitTasker(d, max))
+	err := goes.WorksLong(goes.LimitTasker(d, max), nil)
 	go func() {
 		for _ = range err {
 			// 忽略下载失败
@@ -114,7 +114,7 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 // Work 下载单块数据。
 // 下载失败或校验不符合时无数据传递。
 //
-func (d *Downloader) Work(k interface{}) error {
+func (d *Downloader) Work(k interface{}, _ *goes.Sema) error {
 	p := k.(piece.Piece)
 	bs, err := d.Haul.NewHauler().Get(p)
 

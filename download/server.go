@@ -105,7 +105,7 @@ func (c *Store) Task() (k interface{}, ok bool) {
 //
 // Work 完成每片数据存储。
 //
-func (c *Store) Work(k interface{}) error {
+func (c *Store) Work(k interface{}, _ *goes.Sema) error {
 	v := k.(PieceData)
 
 	if _, err := c.out.WriteAt(v.Bytes, v.Offset); err != nil {
@@ -302,7 +302,7 @@ func (s *Server) saveCache(pd []PieceData, ch chan<- int64) <-chan error {
 	// 仅是一个简单的直觉处理。
 	limit := len(pd)/2 + 1
 
-	return goes.WorksLong(goes.LimitTasker(cc, limit))
+	return goes.WorksLong(goes.LimitTasker(cc, limit), nil)
 }
 
 //

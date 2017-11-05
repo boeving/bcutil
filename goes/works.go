@@ -82,7 +82,7 @@ func Works(t Tasker) <-chan error {
 			ge error
 		)
 		for {
-			if sem.Dead() {
+			if sem.Offed() {
 				break
 			}
 			v, ok := t.Task()
@@ -95,7 +95,7 @@ func Works(t Tasker) <-chan error {
 				defer wg.Done()
 
 				if err := t.Work(k, sem); err != nil {
-					sem.Exit()
+					sem.Off()
 					// 只写，竞争
 					ge = err
 				}
@@ -111,14 +111,14 @@ func Works(t Tasker) <-chan error {
 
 //
 // WorksLong 创建并发工作集。
-// 用法与Works类似，但会一直工作并持续传递可能有的出错信息。
-// 正常结束后（所有Work运行完毕），通道会被关闭。
+// 用法与Works类似，但会一直工作并持续传递可能有的出错信息，直到被主动结束。
+// 工作结束后（所有协程运行完毕），通道会被关闭。
 //
 // 适用于很多工作中容许部分工作失效（后续有效依然可行）的场景。
 // 如：文件的分片下载/存储，失效部分被收集重做。
 //
-// 外部需要持续读取通道，否则通道不会关闭，内部Go程也会阻塞泄漏。
-// 如果外部需要提前结束服务，提前结束其Task/Work即可。
+// 外部需要持续读取通道，否则通道不会关闭，内部协程也会阻塞泄漏。
+// 如果外部需要提前结束服务，可提前结束其Task或在Work中调用sm.Off()。
 //
 func WorksLong(t Tasker, sm *Sema) <-chan error {
 	bad := make(chan error)
@@ -126,6 +126,9 @@ func WorksLong(t Tasker, sm *Sema) <-chan error {
 	go func() {
 		var wg sync.WaitGroup
 		for {
+			if sm.Offed() {
+				break
+			}
 			v, ok := t.Task()
 			if !ok {
 				break
@@ -205,7 +208,7 @@ func First(f Firster) interface{} {
 
 	go func() {
 		for {
-			if sem.Dead() {
+			if sem.Offed() {
 				break
 			}
 			v, ok := f.Task()
@@ -216,7 +219,7 @@ func First(f Firster) interface{} {
 				if v, ok := f.First(v, sem); ok {
 					select {
 					case vch <- v:
-						sem.Exit()
+						sem.Off()
 					default:
 					}
 				}

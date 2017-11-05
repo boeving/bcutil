@@ -351,7 +351,7 @@ func (s *Sumor) Task() (k interface{}, ok bool) {
 //
 // Work 计算一个分片数据的校验和。
 //
-func (s *Sumor) Work(k interface{}) error {
+func (s *Sumor) Work(k interface{}, _ *goes.Sema) error {
 	p := k.(Piece)
 	data, err := blockRead(s.ra, p.Begin, p.End)
 
@@ -433,7 +433,7 @@ func (sc *SumChecker) Task() (k interface{}, ok bool) {
 // Work 读取数据核实校验和。
 // 不符合则返回一个错误。
 //
-func (sc *SumChecker) Work(k interface{}) error {
+func (sc *SumChecker) Work(k interface{}, _ *goes.Sema) error {
 	os := k.(OffSum)
 	data, err := blockRead(sc.RA, os.Off, os.Off+sc.Span)
 
@@ -465,7 +465,7 @@ func (sc *SumChecker) CheckAll(limit int) <-chan error {
 	if limit <= 0 {
 		limit = DefaultSumThread
 	}
-	return goes.WorksLong(goes.LimitTasker(sc, limit))
+	return goes.WorksLong(goes.LimitTasker(sc, limit), nil)
 }
 
 //

@@ -54,8 +54,10 @@ func Close(ch chan<- struct{}) {
 
 //
 // Sema 信号控制器。
-// 用于协调多个协程之间的退出控制。
+// 用于协调多个协程之间的退出控制（并发安全）。
 // 可以是一对一，或一对多。
+// 注：
+// 功能类似标准库context的WithCancel。但无继承逻辑（极简版）。
 //
 type Sema struct {
 	ch chan struct{}
@@ -74,24 +76,37 @@ func NewSema() *Sema {
 }
 
 //
-// Exit 结束信号。
+// Off 结束信号。
 // 多次结束不会有更多的效果（静默容错）。
 //
-func (s *Sema) Exit() {
+func (s *Sema) Off() {
 	Close(s.ch)
 }
 
 //
-// Dead 是否已结束。
+// Offed 是否已终止。
 //
-func (s *Sema) Dead() bool {
+func (s *Sema) Offed() bool {
 	return s.fn()
 }
 
 //
-// Chan 返回信号通道。
-// 一般用于select中监控退出信号。
+// Done 返回信号通道。
+// 常用于select中监控退出信号。
+// 应直接读取而非保存到一个外部变量，否则On之后变量值会失效。
+// 如：
+//  select {
+//  case <-x.Done(): ...
 //
-func (s *Sema) Chan() <-chan struct{} {
+func (s *Sema) Done() <-chan struct{} {
 	return s.ch
+}
+
+//
+// On 信号器重启。
+// 实际上为创建一个新的信号器并原地赋值。
+// （注：不常用，通常Off之后逻辑已经完成）
+//
+func (s *Sema) On() {
+	*s = *NewSema()
 }
