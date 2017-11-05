@@ -9,7 +9,7 @@ import (
 type Team []string
 
 // goes.Getter 接口的实现。
-func (t Team) Get(i int) (v interface{}, ok bool) {
+func (t Team) IntGet(i int) (v interface{}, ok bool) {
 	if len(t) > 0 && i < len(t) {
 		v, ok = t[i], true
 	}

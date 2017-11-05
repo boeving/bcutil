@@ -3,17 +3,16 @@
 package goes
 
 //
-// IntGetter 整型索引取值接口。
-// 通用于微服务方式的取值传递。
+// Getter 简单整型索引取值接口。
+// 用于按整数索引取值服务。
 //
-type IntGetter interface {
+type Getter interface {
 	// ok返回false表示结束取值。
-	// 允许传递一个通用索引号。
 	IntGet(i int) (v interface{}, ok bool)
 }
 
 //
-// IntGets 创建一个整型索引取值服务。
+// Gets 创建一个整型索引取值服务。
 //
 // 返回的信道用于获取任意类型值，外部需用一个类型断言取值。
 // 具体的实现会很清楚获取的是何种类型。
@@ -24,7 +23,7 @@ type IntGetter interface {
 //  @i 通用索引号起始值。
 //  @setp 通用索引步进值。
 //
-func IntGets(g IntGetter, i, step int, cancel func() bool) <-chan interface{} {
+func Gets(g Getter, i, step int, cancel func() bool) <-chan interface{} {
 	ch := make(chan interface{})
 
 	go func() {
@@ -47,23 +46,23 @@ func IntGets(g IntGetter, i, step int, cancel func() bool) <-chan interface{} {
 }
 
 //
-// IndexValuer 通用取值接口。
-// 含迭代逻辑（Index），比Getter稍复杂但也更灵活一些。
+// Valuer 通用取值接口。
+// 含迭代取键逻辑，比Getter稍复杂但也更灵活。
 //
-type IndexValuer interface {
-	// 获取索引。
-	// 返回值用于Value取值。
-	Index() (i interface{}, ok bool)
+type Valuer interface {
+	// 获取值索引键。
+	// 返回值用于Value检索取值。
+	Key() (k interface{}, ok bool)
 
 	// 获取目标值。
 	// 通常，返回一个nil表示无效值（非接口内的nil）。
-	Value(i interface{}) interface{}
+	Value(k interface{}) interface{}
 }
 
 //
-// IndexValues 创建一个通用取值服务。
+// Values 创建一个通用取值服务。
 //
-func IndexValues(v IndexValuer, cancel func() bool) <-chan interface{} {
+func Values(v Valuer, cancel func() bool) <-chan interface{} {
 	ch := make(chan interface{})
 
 	go func() {
@@ -71,7 +70,7 @@ func IndexValues(v IndexValuer, cancel func() bool) <-chan interface{} {
 			if cancel != nil && cancel() {
 				break
 			}
-			k, ok := v.Index()
+			k, ok := v.Key()
 
 			if !ok {
 				break

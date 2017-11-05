@@ -199,10 +199,10 @@ func LimitFirster(f Firster, limit int) Firster {
 }
 
 //
-// First 仅获取首个成功执行的结果。
+// WorksFirst 仅获取首个成功执行的结果。
 // 应用：如对多个镜像网站相同目标的数据请求。
 //
-func First(f Firster) interface{} {
+func WorksFirst(f Firster) interface{} {
 	vch := make(chan interface{})
 	sem := NewSema()
 
