@@ -13,6 +13,7 @@ package peeval
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -50,7 +51,7 @@ type PeerID struct {
 // 如 190.168.10.2:6500。
 //
 func (p PeerID) String() string {
-	return fmt.Sprintf("%s:%d", p.IP, p.Port)
+	return net.JoinHostPort(p.IP.String(), strconv.Itoa(p.Port))
 }
 
 //
