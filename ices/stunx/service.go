@@ -33,14 +33,14 @@ const (
 	GET_ADDR_CMD
 )
 
-func sendMessage(msg *Message, conn *net.UDPAddr, udp_conn *net.UDPConn) {
+func sendMessage(msg *Message, addr *net.UDPAddr, conn *net.UDPConn) {
 	buffer, err := json.Marshal(msg)
 	if err != nil {
 		log.Println("can't marshal message: ", err)
 		return
 	}
 
-	_, err = udp_conn.WriteToUDP(buffer, conn)
+	_, err = conn.WriteToUDP(buffer, addr)
 	if err != nil {
 		log.Println("can't send message: ", err)
 		return
@@ -55,20 +55,20 @@ func msgIsGood(msg *Message) bool {
 	return true
 }
 
-func handleMessage(raw_data []byte, conn *net.UDPAddr, udp_conn *net.UDPConn) {
+func handleMessage(raw_data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 	var msg Message
 
 	err := json.Unmarshal(raw_data, &msg)
 	if err != nil {
 		log.Println("can't parse message: ", err)
 		sendMessage(&Message{msg.SeqNum, ERROR_CMD, "bad message format"},
-			conn, udp_conn)
+			addr, conn)
 		return
 	}
 
 	if !msgIsGood(&msg) {
 		sendMessage(&Message{msg.SeqNum, ERROR_CMD, "bad message body"},
-			conn, udp_conn)
+			addr, conn)
 		return
 	}
 
@@ -77,17 +77,17 @@ func handleMessage(raw_data []byte, conn *net.UDPAddr, udp_conn *net.UDPConn) {
 
 	switch msg.Cmd {
 	case UPDATE_ADDR_CMD:
-		mobile_to_addr[msg.Body] = *conn
-		sendMessage(&Message{msg.SeqNum, UPDATE_ADDR_CMD, ""}, conn, udp_conn)
+		mobile_to_addr[msg.Body] = *addr
+		sendMessage(&Message{msg.SeqNum, UPDATE_ADDR_CMD, ""}, addr, conn)
 
 	case GET_ADDR_CMD:
 		if address, ok := mobile_to_addr[msg.Body]; ok {
 			sendMessage(&Message{msg.SeqNum, GET_ADDR_CMD, address.String()},
-				conn, udp_conn)
+				addr, conn)
 		} else {
 			log.Println("can't find addr for " + msg.Body)
 			sendMessage(&Message{msg.SeqNum, ERROR_CMD, "addr not found"},
-				conn, udp_conn)
+				addr, conn)
 		}
 
 	default:
@@ -96,27 +96,27 @@ func handleMessage(raw_data []byte, conn *net.UDPAddr, udp_conn *net.UDPConn) {
 }
 
 func main() {
-	udp_addr, err := net.ResolveUDPAddr("udp4", ":65000")
+	addr, err := net.ResolveUDPAddr("udp4", ":65000")
 	if err != nil {
 		log.Println("can't resolve udp: ", err)
 		os.Exit(1)
 	}
 
-	udp_conn, err := net.ListenUDP("udp4", udp_addr)
+	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
 		log.Println("can't listen udp: ", err)
 		os.Exit(1)
 	}
-	defer udp_conn.Close()
+	defer conn.Close()
 
-	buffer := make([]byte, BUFFER_SIZE)
+	buf := make([]byte, BUFFER_SIZE)
 	for {
-		n, conn, err := udp_conn.ReadFromUDP(buffer)
+		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Println("can't read from udp: ", err)
 			continue
 		}
 
-		go handleMessage(buffer[0:n], conn, udp_conn)
+		go handleMessage(buf[0:n], addr, conn)
 	}
 }
