@@ -21,14 +21,20 @@ import (
 type Score int
 
 // 行为与分值。
-// 通常，外部对选取的权衡仅仅是一种直觉。
+// 注：权衡取值仅出于一种直觉。
 const (
 	Good    Score = 1  // 普通加分
 	Better  Score = 2  // 较好加分
 	Best    Score = 4  // 最高加分
+
+        Bad     Score = -1 // 普通扣分
+        Worse   Score = -2 // 比较糟糕扣分
+        Worst   Score = -3 // 很差扣分
+
 	BadData Score = -1 // 传递无效数据
-	Abuse   Score = -2 // 滥用资源（对端）
-	Attack  Score = -4 // 恶意攻击
+	Abuse   Score = -2 // 资源滥用（对端）
+	Expired Score = -2 // 穿透存活期太短
+	Attack  Score = -4 // 攻击行为
 )
 
 // 基本常量。
