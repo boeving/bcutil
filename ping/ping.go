@@ -68,7 +68,7 @@ type Handler interface {
 	//  @id 为发送时的标记值，
 	//  @echo 回应的id用于匹配分辨。
 	//  @exit 终止ping行为的控制函数。
-	Receive(a net.Addr, id int, echo *icmp.Echo, exit func()) error
+	Receive(a net.Addr, id int, echo *icmp.Echo, exit func())
 
 	// 错误时的回调。
 	// 包含连接读取错误和回应非EchoReply类型视为错误。
@@ -263,22 +263,18 @@ func (r *receiver) Exit() {
 
 //
 // 处理接收的数据包。
-// 返回的错误可能是Fail或Receive回调返回的值。
 //
-func (r *receiver) Process(rd *packet) error {
-	if rd == nil {
-		return errors.New("package data is nil")
-	}
+func (r *receiver) Process(rd *packet) {
 	if rd.Err != nil {
 		r.proc.Fail(rd.Addr, rd.Err, r.Exit)
-		return rd.Err
+		return
 	}
 	echo, err := replyEchoParse(rd, r.conn.name)
 	if err != nil {
 		r.proc.Fail(rd.Addr, err, r.Exit)
-		return err
+		return
 	}
-	return r.proc.Receive(rd.Addr, r.id, echo, r.Exit)
+	r.proc.Receive(rd.Addr, r.id, echo, r.Exit)
 }
 
 /////////
