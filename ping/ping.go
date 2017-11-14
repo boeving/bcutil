@@ -28,7 +28,7 @@ const (
 	TimeSliceLength  = 8  // 时间值字节数
 	ProtocolICMP     = 1  // IPv4 ICMP 协议号
 	ProtocolIPv6ICMP = 58 // IPv6 ICMP 协议号
-	MaxInt32         = 1<<31 - 1
+	Timeout          = 2 * time.Second
 )
 
 const (
@@ -50,7 +50,7 @@ var (
 		"udp": "udp6",
 	}
 
-	errExit = errors.New("the Pinger is exited")
+	errTimeout = errors.New("Timeout on reveive")
 )
 
 //
@@ -68,7 +68,7 @@ type Handler interface {
 	//  @id 为发送时的标记值，
 	//  @echo 回应的id用于匹配分辨。
 	//  @exit 终止ping行为的控制函数。
-	Receive(a net.Addr, id int, echo *icmp.Echo, exit func())
+	Receive(a net.Addr, id int, echo *icmp.Echo, exit func()) error
 
 	// 错误时的回调。
 	// 包含连接读取错误和回应非EchoReply类型视为错误。
@@ -115,8 +115,9 @@ func Listen(network, address string) (*Conn, error) {
 // ICMP数据发送器。
 //
 type sender struct {
-	id     int        // Echo ID
-	seq    <-chan int // 计数器
+	id     int          // Echo ID
+	seq    <-chan int   // 计数器
+	bad    <-chan error // 接收器回馈出错信息通道
 	conn   *icmp.PacketConn
 	cancel func() bool
 
@@ -128,8 +129,9 @@ type sender struct {
 //
 // 创建一个发送器实例。
 // @conn 参数为必须，非nil。
+// @bad 为接收器来的出错信息通道，配对使用。
 //
-func newSender(conn *icmp.PacketConn, id int, cancel func() bool) *sender {
+func newSender(conn *icmp.PacketConn, id int, bad <-chan error, cancel func() bool) *sender {
 	if conn == nil {
 		log.Println("conn is nil (valid)")
 		return nil
@@ -137,38 +139,41 @@ func newSender(conn *icmp.PacketConn, id int, cancel func() bool) *sender {
 	return &sender{
 		id:     id,
 		seq:    seqCounts(0, 0xffff, cancel),
+		bad:    bad,
 		conn:   conn,
 		cancel: cancel,
 	}
 }
 
 //
-// Sends 对目标地址连续发送信息包。
+// Sends 对目标地址连续间断发送信息。
 //
 func (s *sender) Sends(dst net.Addr, t time.Duration, cnt int) error {
 	typ, err := icmpType(dst)
 	if err != nil {
 		return err
 	}
-	for i := 0; i < cnt; i++ {
+	var msg []byte
+	for cnt > 0 {
 		if s.cancel() {
 			break
 		}
-		msg, err := icmpMsg(typ, 0, s.id, <-s.seq, s.Extra)
+		msg, err = icmpMsg(typ, 0, s.id, <-s.seq, s.Extra)
 		if err != nil {
-			// log.Println(err)
-			continue
+			break
 		}
 		go icmpSend(s.conn, dst, msg, s.cancel)
+		cnt--
 		time.Sleep(t)
 	}
-	return nil
+	return err
 }
 
 //
-// Send 对目标地址发送一次信息包。
+// Send 对目标地址发送信息（成功一次即可）。
+// 如果存在接收器的错误回馈，重复尝试（最多cnt次）。
 //
-func (s *sender) Send(dst net.Addr) error {
+func (s *sender) Send(dst net.Addr, cnt int) error {
 	typ, err := icmpType(dst)
 	if err != nil {
 		return err
@@ -177,8 +182,20 @@ func (s *sender) Send(dst net.Addr) error {
 	if err != nil {
 		return err
 	}
+	// first time
 	go icmpSend(s.conn, dst, msg, s.cancel)
-	return nil
+
+	// 无反馈通道时不尝试
+	if s.bad == nil {
+		return nil
+	}
+	for i := 0; i < cnt; i++ {
+		if err = <-s.bad; err == nil {
+			break
+		}
+		go icmpSend(s.conn, dst, msg, s.cancel)
+	}
+	return err
 }
 
 //
@@ -221,36 +238,61 @@ type packet struct {
 type receiver struct {
 	id   int
 	conn *Conn
-	stop chan struct{}
-	proc Handler // 接收处理器
+	proc Handler       // 接收处理器
+	stop chan struct{} // 停止服务信号
+	fail chan<- error  // 向发送器反馈出错信息
 }
 
 //
 // 创建一个接收器实例。
+// @fail 为通知发送器端的出错信息信道，可为nil。注意配对使用。
 //
-func newReceiver(conn *Conn, id int, h Handler, stop chan struct{}) *receiver {
+func newReceiver(conn *Conn, id int, h Handler, fail chan<- error, stop chan struct{}) *receiver {
 	return &receiver{
 		id:   id,
 		conn: conn,
 		proc: h,
 		stop: stop,
+		fail: fail,
 	}
 }
 
 //
 // Serve 启动接收服务。
 // 每个接收器只应开启一个服务，阻塞。
+// 如果必要，接收超时会发送一个超时错误到发送器。
 //
-func (r *receiver) Serve() {
+func (r *receiver) Serve(timeout time.Duration) {
+	recv := r.recvServe()
 End:
 	for {
 		select {
 		case <-r.stop:
 			break End
-		default:
+		case <-time.After(timeout):
+			goes.Send(r.fail, errTimeout)
+		case rd := <-recv:
+			go r.Process(rd)
 		}
-		go r.Process(icmpReceive(r.conn.conn))
 	}
+}
+
+//
+// 持续接收响应信息服务。
+//
+func (r *receiver) recvServe() <-chan *packet {
+	ch := make(chan *packet)
+	go func() {
+	End:
+		for {
+			select {
+			case <-r.stop:
+				break End
+			case ch <- icmpReceive(r.conn.conn):
+			}
+		}
+	}()
+	return ch
 }
 
 //
@@ -263,18 +305,32 @@ func (r *receiver) Exit() {
 
 //
 // 处理接收的数据包。
+// 如果必要，向发送器传递出错信息。
 //
 func (r *receiver) Process(rd *packet) {
+	if rd == nil {
+		return
+	}
+	if err := r.process(rd); err != nil {
+		goes.Send(r.fail, err)
+	}
+}
+
+//
+// 处理接收的数据包。
+// 返回值也可以是用户成功接收后返回一个错误信息。
+//
+func (r *receiver) process(rd *packet) error {
 	if rd.Err != nil {
 		r.proc.Fail(rd.Addr, rd.Err, r.Exit)
-		return
+		return rd.Err
 	}
 	echo, err := replyEchoParse(rd, r.conn.name)
 	if err != nil {
 		r.proc.Fail(rd.Addr, err, r.Exit)
-		return
+		return err
 	}
-	r.proc.Receive(rd.Addr, r.id, echo, r.Exit)
+	return r.proc.Receive(rd.Addr, r.id, echo, r.Exit)
 }
 
 /////////
@@ -283,12 +339,12 @@ func (r *receiver) Process(rd *packet) {
 
 //
 // Pinger ICMP ping 处理器。
-// 一个实例对应一个随机的消息ID（发送/接收）。
+// 一个实例共享附加数据，该值应当在任何ping之前设置（如果需要）。
 //
 type Pinger struct {
-	s    *sender       // 消息发送器
-	stop chan struct{} // 停止信号量
-	end  bool          // 是否已终止
+	conn  *Conn
+	h     Handler
+	Extra []byte // 消息包附加数据，可选
 }
 
 //
@@ -299,108 +355,103 @@ func NewPinger(conn *Conn, caller Handler) (*Pinger, error) {
 	if caller == nil {
 		return nil, errors.New("must be a handler")
 	}
-	stop := make(chan struct{})
 	rand.Seed(time.Now().UnixNano())
-	id := rand.Intn(0xffff)
-
-	// 接收处理器
-	rec := newReceiver(conn, id, caller, stop)
-	go rec.Serve()
 
 	return &Pinger{
-		s:    newSender(conn.conn, id, goes.Canceller(stop)),
-		stop: stop,
+		conn: conn,
+		h:    caller,
 	}, nil
 }
 
 //
-// ExtraData 设置消息包附加数据。
-// 该设置需要在实际调用 Ping 系列之前执行。
+// 创建一对发送器/接收器实例。
+// @errback 指是否创建接收器到发送器的出错回馈信道。
 //
-func (p *Pinger) ExtraData(data []byte) {
-	p.s.Extra = data
-}
-
-//
-// Exit 结束处理。
-// 可能由外部处理操作触发，或用户直接调用。
-//
-// 结束后的实例不能再次使用。
-//
-func (p *Pinger) Exit() {
-	goes.Close(p.stop)
-	p.end = true
-}
-
-//
-// Ping 单次ping。
-// 如果需要出错后重试，可在处理器的Fail中再次调用本函数。
-//
-func (p *Pinger) Ping(dst net.Addr) error {
-	if p.end {
-		return errExit
+func (p *Pinger) getRecSnd(stop chan struct{}, errback bool) (*receiver, *sender) {
+	var fail chan error
+	if errback {
+		fail = make(chan error)
 	}
-	return p.s.Send(dst)
+	id := rand.Intn(0xffff)
+
+	rec := newReceiver(p.conn, id, p.h, fail, stop)
+	snd := newSender(p.conn.conn, id, fail, goes.Canceller(stop))
+	snd.Extra = p.Extra
+
+	return rec, snd
+}
+
+//
+// Ping 单地址发送信息。
+// 如果收到错误可以再次尝试最多cnt次，成功则停止。
+// 等待接收信息超时也算是一种错误，会导致再次尝试。
+//
+// 返回值用于外部停止ping行为（x.End()），下同。
+//
+func (p *Pinger) Ping(dst net.Addr, cnt int, timeout time.Duration) *goes.Stop {
+	stop := goes.NewStop()
+
+	rec, snd := p.getRecSnd(stop.C, true)
+	go rec.Serve(timeout)
+	go snd.Send(dst, cnt)
+
+	return stop
 }
 
 //
 // PingLoop 向单个地址循环ping。
-// 需要注册消息处理器，否则直接退出。
+// 发送器无需理会接收端的出错状况。
 // 	@t 循环间隔时间
-// 	@cnt 循环次数，-1表示无限
+// 	@cnt 循环次数，int最大值可表示68年秒
 //
-func (p *Pinger) PingLoop(dst net.Addr, t time.Duration, cnt int) error {
-	if p.end {
-		return errExit
-	}
+func (p *Pinger) PingLoop(dst net.Addr, t time.Duration, cnt int) *goes.Stop {
 	if cnt == 0 {
 		return nil
 	}
-	if cnt > 0 {
-		return p.s.Sends(dst, t, cnt)
-	}
-	cancel := goes.Canceller(p.stop)
-	for {
-		if cancel() {
-			break
-		}
-		p.s.Sends(dst, t, MaxInt32)
-	}
-	return nil
+	stop := goes.NewStop()
+	rec, snd := p.getRecSnd(stop.C, false)
+	go rec.Serve(Timeout)
+	go snd.Sends(dst, t, cnt)
+
+	return stop
 }
 
 //
-// Pings 对地址集批量ping（单次）。
+// Pings 对地址集发送信息。
+// 与Ping方法逻辑类似。
+//
 // 失败的ping地址可以通过Fail()获得。
 //
-func (p *Pinger) Pings(as Address) error {
-	if p.end {
-		return errExit
-	}
-	pingSends(
-		as.IPAddrs(goes.Canceller(p.stop)),
-		func(a net.Addr) {
-			p.s.Send(a)
-		},
+func (p *Pinger) Pings(as Address, cnt int, timeout time.Duration) *goes.Stop {
+	stop := goes.NewStop()
+
+	rec, snd := p.getRecSnd(stop.C, true)
+	go rec.Serve(timeout)
+
+	go pingSends(
+		as.IPAddrs(goes.Canceller(stop.C)),
+		func(a net.Addr) { snd.Send(a, cnt) },
 	)
-	return nil
+	return stop
 }
 
 //
-// PingsLoop 对地址集批量ping（多次）。
-// 每一个地址都会按照时间间隔尝试多次，cnt不支持无限。
+// PingsLoop 对地址集持续间断发送信息。
+// PingLoop 的多地址版。容易构成信息滥发，请节制使用。
 //
-func (p *Pinger) PingsLoop(as Address, t time.Duration, cnt int) error {
-	if p.end {
-		return errExit
+func (p *Pinger) PingsLoop(as Address, t time.Duration, cnt int) *goes.Stop {
+	if cnt == 0 {
+		return nil
 	}
-	pingSends(
-		as.IPAddrs(goes.Canceller(p.stop)),
-		func(a net.Addr) {
-			p.s.Sends(a, t, cnt)
-		},
+	stop := goes.NewStop()
+	rec, snd := p.getRecSnd(stop.C, false)
+	go rec.Serve(Timeout)
+
+	go pingSends(
+		as.IPAddrs(goes.Canceller(stop.C)),
+		func(a net.Addr) { snd.Sends(a, t, cnt) },
 	)
-	return nil
+	return stop
 }
 
 ////////
