@@ -53,6 +53,28 @@ func Close(ch chan<- struct{}) {
 }
 
 //
+// Stop 停止控制器。
+//
+type Stop struct {
+	C chan struct{}
+}
+
+//
+// NewStop 创建一个停止控制器。
+//
+func NewStop() *Stop {
+	return &Stop{make(chan struct{})}
+}
+
+//
+// Off 执行停止。
+// 调用之后实例不再可用。
+//
+func (s *Stop) Off() {
+	close(s.C)
+}
+
+//
 // Sema 信号控制器。
 // 用于协调多个协程之间的退出控制（并发安全）。
 // 可以是一对一，或一对多。
