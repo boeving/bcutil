@@ -67,10 +67,10 @@ func NewStop() *Stop {
 }
 
 //
-// Off 执行停止。
+// Exit 停止并退出。
 // 调用之后实例不再可用。
 //
-func (s *Stop) Off() {
+func (s *Stop) Exit() {
 	close(s.C)
 }
 
