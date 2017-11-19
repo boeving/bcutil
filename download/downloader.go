@@ -25,11 +25,11 @@ type Getter interface {
 }
 
 //
-// Hauler 数据搬运工。
-// 新建一个数据获取器接口。
+// Hauler 数据搬运器。
 //
 type Hauler interface {
-	NewHauler() Getter
+	// 新建一个分片数据获取器。
+	NewGetter() Getter
 }
 
 //
@@ -46,8 +46,8 @@ type PieceData struct {
 // 若不赋值验证集，则不执行验证（如http直接下载）。
 //
 type Downloader struct {
-	Haul  Hauler                  // 数据搬运工
-	Sums  map[int64]piece.HashSum // 验证集（可选）
+	Haul  Hauler                  // 数据搬运器
+	Sums  map[int64]piece.HashSum // 待下载分片验证集（可选）
 	Cache *Cache                  // 已下载缓存（用于RPC分享）
 
 	// 过程中赋值成员
@@ -116,7 +116,9 @@ func (d *Downloader) Task() (k interface{}, ok bool) {
 //
 func (d *Downloader) Work(k interface{}, _ *goes.Sema) error {
 	p := k.(piece.Piece)
-	bs, err := d.Haul.NewHauler().Get(p)
+	// 每一个分片重新申请一个搬运工，
+	// 便于实现灵活的分片数据源选择。
+	bs, err := d.Haul.NewGetter().Get(p)
 
 	if err != nil {
 		return piece.Error{Off: p.Begin, Err: err}
@@ -132,7 +134,7 @@ func (d *Downloader) Work(k interface{}, _ *goes.Sema) error {
 
 	// 已下载缓存&分享。
 	if d.Cache != nil {
-		d.Cache.Add(pb.Offset, &pb)
+		d.Cache.Add(pb.Offset, pb.Bytes)
 	}
 	d.dtch <- pb // 传递至存储
 

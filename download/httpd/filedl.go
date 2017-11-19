@@ -24,11 +24,11 @@ type FileDl struct {
 }
 
 //
-// NewHauler 新建一个数据搬运工。
+// NewGetter 新建一个数据获取器。
 // 实现 download.Hauler 接口。
 // 返回自身即可，仅读取，无并发冲突。
 //
-func (f FileDl) NewHauler() download.Getter {
+func (f FileDl) NewGetter() download.Getter {
 	return f
 }
 
