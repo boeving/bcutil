@@ -75,6 +75,22 @@ func (s *Stop) Exit() {
 }
 
 //
+// Empty 清空信道内的全部error值。
+// 可选的第二个参数用于转出这些error值。阻塞。
+// 常用：goes.Empty(ch, nil)
+//
+func Empty(ch <-chan error, out chan<- error) {
+	if out == nil {
+		for _ = range ch {
+		}
+		return
+	}
+	for err := range ch {
+		out <- err
+	}
+}
+
+//
 // Sema 信号控制器。
 // 用于协调多个协程之间的退出控制（并发安全）。
 // 可以是一对一，或一对多。
