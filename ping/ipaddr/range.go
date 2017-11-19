@@ -7,6 +7,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"time"
+
+	"github.com/qchen-zh/pputil/tick"
 )
 
 //
@@ -39,17 +42,20 @@ func NewRange(cidr string, begin, end int) (*Range, error) {
 // IPAddrs 获取IP序列的微服务。
 // 实现 ping.Address 接口。
 //
-func (r *Range) IPAddrs(cancel func() bool) <-chan net.Addr {
+func (r *Range) IPAddrs(t time.Duration, cancel func() bool) <-chan net.Addr {
 	ch := make(chan net.Addr)
 
 	go func() {
+		tk := tick.NewTicker(t)
 		for i := r.begin; i < r.end; i++ {
 			if cancel != nil && cancel() {
 				break
 			}
 			ch <- r.Get(i)
+			tk.Tick()
 		}
 		close(ch)
+		tk.Stop()
 	}()
 
 	return ch

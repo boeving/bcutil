@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
+
+	"github.com/qchen-zh/pputil/tick"
 )
 
 //
@@ -98,17 +101,20 @@ func (s *Stack) Pop(n int) []net.Addr {
 // IPAddrs 获取IP序列的微服务。
 // 实现 ping.Address 接口。
 //
-func (s *Stack) IPAddrs(cancel func() bool) <-chan net.Addr {
+func (s *Stack) IPAddrs(t time.Duration, cancel func() bool) <-chan net.Addr {
 	ch := make(chan net.Addr)
 
 	go func() {
+		tk := tick.NewTicker(t)
 		for i := 0; i < len(s.pool); i++ {
 			if cancel != nil && cancel() {
 				break
 			}
 			ch <- s.Get(i)
+			tk.Tick()
 		}
 		close(ch)
+		tk.Stop()
 	}()
 
 	return ch
