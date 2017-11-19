@@ -54,10 +54,13 @@ var (
 )
 
 //
-// Address IP地址生成器。
+// Address IP地址生成器接口。
 //
 type Address interface {
-	IPAddrs(cancel func() bool) <-chan net.Addr
+	// tick 为每提供一个地址的间歇时间。
+	// 需大于或等于零，零值表示无需时间间歇。
+	// 通常，5~10ms是一个折中的值。
+	IPAddrs(tick time.Duration, cancel func() bool) <-chan net.Addr
 }
 
 //
@@ -78,7 +81,7 @@ type Handler interface {
 }
 
 //
-// Conn icmp.PacketConn 封装。
+// Conn 包含网络名称的 icmp.PacketConn 封装。
 //
 type Conn struct {
 	name string
@@ -386,7 +389,7 @@ func (p *Pinger) getRecSnd(stop chan struct{}, errback bool) (*receiver, *sender
 // 如果收到错误可以再次尝试最多cnt次，成功则停止。
 // 等待接收信息超时也算是一种错误，会导致再次尝试。
 //
-// 返回值用于外部停止ping行为（x.End()），下同。
+// 返回值用于外部停止ping行为（x.Exit()），下同。
 //
 func (p *Pinger) Ping(dst net.Addr, cnt int, timeout time.Duration) *goes.Stop {
 	stop := goes.NewStop()
