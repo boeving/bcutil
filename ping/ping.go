@@ -29,6 +29,7 @@ const (
 	ProtocolICMP     = 1  // IPv4 ICMP 协议号
 	ProtocolIPv6ICMP = 58 // IPv6 ICMP 协议号
 	Timeout          = 2 * time.Second
+	Interval         = 20 * time.Millisecond // IP生成间隔时间
 )
 
 const (
@@ -422,6 +423,7 @@ func (p *Pinger) PingLoop(dst net.Addr, t time.Duration, cnt int) *goes.Stop {
 //
 // Pings 对地址集发送信息。
 // 与Ping方法逻辑类似。
+// 每个IP生成的时间间隔约20毫秒，即每秒钟50个IP以内的发送速率。
 //
 // 失败的ping地址可以通过Fail()获得。
 //
@@ -432,7 +434,7 @@ func (p *Pinger) Pings(as Address, cnt int, timeout time.Duration) *goes.Stop {
 	go rec.Serve(timeout)
 
 	go pingSends(
-		as.IPAddrs(goes.Canceller(stop.C)),
+		as.IPAddrs(Interval, goes.Canceller(stop.C)),
 		func(a net.Addr) { snd.Send(a, cnt) },
 	)
 	return stop
@@ -440,7 +442,8 @@ func (p *Pinger) Pings(as Address, cnt int, timeout time.Duration) *goes.Stop {
 
 //
 // PingsLoop 对地址集持续间断发送信息。
-// PingLoop 的多地址版。容易构成信息滥发，请节制使用。
+// PingLoop 的多地址版。会形成持续的大量信息流，注意控制使用。
+// IP 发送速率与 Pings 相同。
 //
 func (p *Pinger) PingsLoop(as Address, t time.Duration, cnt int) *goes.Stop {
 	if cnt == 0 {
@@ -451,7 +454,7 @@ func (p *Pinger) PingsLoop(as Address, t time.Duration, cnt int) *goes.Stop {
 	go rec.Serve(Timeout)
 
 	go pingSends(
-		as.IPAddrs(goes.Canceller(stop.C)),
+		as.IPAddrs(Interval, goes.Canceller(stop.C)),
 		func(a net.Addr) { snd.Sends(a, t, cnt) },
 	)
 	return stop
