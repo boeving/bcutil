@@ -69,8 +69,8 @@ type Address interface {
 //
 type Handler interface {
 	// 正常接收回调。
-	//  @id 为发送时的标记值，
-	//  @echo 回应的id用于匹配分辨。
+	//  @id 发送时的标记ID值，
+	//  @echo 回应里的id用于匹配分辨。
 	//  @exit 终止ping行为的控制函数。
 	Receive(a net.Addr, id int, echo *icmp.Echo, exit func()) error
 
@@ -343,12 +343,15 @@ func (r *receiver) process(rd *packet) error {
 
 //
 // Pinger ICMP ping 处理器。
-// 一个实例共享附加数据，该值应当在任何ping之前设置（如果需要）。
+// Extra 为实例共享的Ping附加数据，应当在Ping操作之前设置（如果需要）。
+// Intv 实际上为限制IP地址的获取速率，仅用于Pings[Loop]类型操作。
 //
 type Pinger struct {
-	conn  *Conn
-	h     Handler
-	Extra []byte // 消息包附加数据，可选
+	Extra []byte        // 消息包附加数据，可选
+	Intv  time.Duration // 发送信息包到不同地址的间隔时间，默认20ms
+
+	conn *Conn
+	h    Handler
 }
 
 //
@@ -364,6 +367,7 @@ func NewPinger(conn *Conn, caller Handler) (*Pinger, error) {
 	return &Pinger{
 		conn: conn,
 		h:    caller,
+		Intv: Interval,
 	}, nil
 }
 
@@ -423,9 +427,9 @@ func (p *Pinger) PingLoop(dst net.Addr, t time.Duration, cnt int) *goes.Stop {
 //
 // Pings 对地址集发送信息。
 // 与Ping方法逻辑类似。
-// 每个IP生成的时间间隔约20毫秒，即每秒钟50个IP以内的发送速率。
+// IP生成的速度受到限制，默认间隔约20毫秒，即每秒钟50个IP以内的发送速率。
 //
-// 失败的ping地址可以通过Fail()获得。
+// 失败的地址可以通过Fail()获得。
 //
 func (p *Pinger) Pings(as Address, cnt int, timeout time.Duration) *goes.Stop {
 	stop := goes.NewStop()
@@ -434,7 +438,7 @@ func (p *Pinger) Pings(as Address, cnt int, timeout time.Duration) *goes.Stop {
 	go rec.Serve(timeout)
 
 	go pingSends(
-		as.IPAddrs(Interval, goes.Canceller(stop.C)),
+		as.IPAddrs(p.Intv, goes.Canceller(stop.C)),
 		func(a net.Addr) { snd.Send(a, cnt) },
 	)
 	return stop
@@ -443,7 +447,7 @@ func (p *Pinger) Pings(as Address, cnt int, timeout time.Duration) *goes.Stop {
 //
 // PingsLoop 对地址集持续间断发送信息。
 // PingLoop 的多地址版。会形成持续的大量信息流，注意控制使用。
-// IP 发送速率与 Pings 相同。
+// IP 生成速度受限与 Pings 相同（Intv成员决定）。
 //
 func (p *Pinger) PingsLoop(as Address, t time.Duration, cnt int) *goes.Stop {
 	if cnt == 0 {
@@ -454,7 +458,7 @@ func (p *Pinger) PingsLoop(as Address, t time.Duration, cnt int) *goes.Stop {
 	go rec.Serve(Timeout)
 
 	go pingSends(
-		as.IPAddrs(Interval, goes.Canceller(stop.C)),
+		as.IPAddrs(p.Intv, goes.Canceller(stop.C)),
 		func(a net.Addr) { snd.Sends(a, t, cnt) },
 	)
 	return stop

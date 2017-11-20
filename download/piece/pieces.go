@@ -1,8 +1,18 @@
 // Package piece 数据分片。
 package piece
 
+////////////////
+// 校验和规则：
+// 文件的数据校验和采用分片校验，然后对各分片的校验和序列作整体哈希而得。
+// 这样设计便于文件局部修改后重新计算整体校验和（仅限于局部修改的地方）。
+// 这一校验和称为分片总集校验和，或整集哈希。
+// - 整集哈希 = Sha1(分片校验和...)
+// - 各分片按顺序串连。
+// - 对文件本身直接的校验和计算值称为文件哈希。
+///////////////////////////////////////////////////////////////////////////////
+
 import (
-	"crypto/sha256"
+	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,15 +23,18 @@ import (
 
 // 基本常量
 const (
-	SumLength = 32      // 校验和哈希长度（sha256）
-	PieceUnit = 1 << 14 // 分片单位值（16k）
+	// 校验和哈希长度（sha1）
+	// 通常由文件或整集哈希定位后，再询问分片，故长度已足够。
+	SumLength = 20
+	// 分片单位值（8k）
+	PieceUnit = 1 << 13
 
 	// 分片校验和构造默认并发量
 	// 行为：读取分片数据，Hash计算
 	DefaultSumThread = 8
 	// 默认分片大小
-	// 16k*16 = 256k
-	DefaultPieceSize = PieceUnit * 16
+	// 8k*32 = 256k
+	DefaultPieceSize = PieceUnit * 32
 )
 
 var (
@@ -46,17 +59,17 @@ type HashSum [SumLength]byte
 
 //
 // Pieces 分片定义集。
-// 定义分片数据的基本属性：分片大小、分片数量和计算的哈希校验和。
+// 定义分片数据的基本属性：分片数量、分片大小和哈希校验和。
 // 这些属性会被存储于外部，用于文件分享传递的依据。
 //
-// 存储头部4字节为分片数量和分片大小（16k单位），
+// 存储头部4字节为分片数量和分片大小，
 // 然后是各分片的哈希校验和（连续串接，无间隔字节）。
 //
 // 头部4字节中：前20位定义分片数量，后12位定义分片大小。
-//  - 分片单位16k；
-//  - 分片最大支持到64MB（16k*4095）。
+//  - 分片单位8k（PieceUnit）；
+//  - 分片最大支持到32MB（8k*4095）。
 //  - 0分片大小表示不分片；
-//  - 小于16k的文本文档无法分片（简化）。
+//  - PieceUnit
 //
 type Pieces struct {
 	Amount int   // 分片数量
@@ -94,7 +107,7 @@ func (p *Pieces) Head(r io.Reader) error {
 	// 前20bit为分片总数
 	p.Amount = int(n2 >> 12)
 
-	// 后12bit为分片大小（16k单位）
+	// 后12bit为分片大小（8k单位）
 	p.Span = int64((n2<<20)>>20) * PieceUnit
 
 	return nil
@@ -102,8 +115,8 @@ func (p *Pieces) Head(r io.Reader) error {
 
 //
 // Load 读取分片定义。
-// 分片定义为32字节哈希连续存储。
-// 结构：4+[32][32]...
+// 分片定义为20字节哈希连续存储。
+// 结构：4+[20][20]...
 //
 // 0值表示无分片，应仅读取一个哈希序列。
 // 正常返回的error值为io.EOF。
@@ -130,7 +143,7 @@ func (p *Pieces) Load(r io.Reader) error {
 
 //
 // Bytes 编码分片集整体字节序列。
-// 结构：4+[32][32]...
+// 结构：4+[20][20]...
 //
 func (p *Pieces) Bytes() []byte {
 	buf := make([]byte, 0, 4+len(p.Sums)*SumLength)
@@ -194,7 +207,7 @@ const lenOffSum = 8 + SumLength
 
 //
 // Load 读取未下载索引数据。
-// 结构：4+[8+32][8+32]...
+// 结构：4+[8+20][8+20]...
 //
 func (p *RestPieces) Load(r io.Reader) error {
 	if p.Sums == nil {
@@ -221,7 +234,7 @@ func offsetAndSum(buf [lenOffSum]byte) (uint64, *HashSum) {
 
 //
 // Bytes 编码剩余分片索引集。
-// 结构：4+[8+32][8+32]...
+// 结构：4+[8+20][8+20]...
 //
 func (p *RestPieces) Bytes() []byte {
 	buf := make([]byte, 0, 4+len(p.Sums)*lenOffSum)
@@ -359,7 +372,7 @@ func (s *Sumor) Work(k interface{}, _ *goes.Sema) error {
 		return err
 	}
 	s.vch <- OffSum{
-		p.Begin, sha256.Sum256(data)}
+		p.Begin, sha1.Sum(data)}
 
 	return nil
 }
@@ -440,7 +453,7 @@ func (sc *SumChecker) Work(k interface{}, _ *goes.Sema) error {
 	if err != nil {
 		return Error{os.Off, err}
 	}
-	if sha256.Sum256(data) != os.Sum {
+	if sha1.Sum(data) != os.Sum {
 		return Error{os.Off, errChkSum}
 	}
 	return nil
