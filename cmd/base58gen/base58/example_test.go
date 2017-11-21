@@ -7,7 +7,7 @@ package base58_test
 import (
 	"fmt"
 
-	"github.com/qchen-zh/pputil/base58"
+	"github.com/qchen-zh/pputil/cmd/base58gen/base58"
 )
 
 // This example demonstrates how to decode modified base58 encoded data.
