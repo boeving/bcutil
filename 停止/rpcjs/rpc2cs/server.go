@@ -5,8 +5,8 @@ import (
 	"log"
 	"net"
 
-	"github.com/qchen-zh/pputil/废弃/rpcjs"
-	"github.com/qchen-zh/pputil/废弃/rpcjs/rpc2cs/server"
+	"github.com/qchen-zh/pputil/停止/rpcjs"
+	"github.com/qchen-zh/pputil/停止/rpcjs/rpc2cs/server"
 	"github.com/tinylib/msgp/msgp"
 )
 
