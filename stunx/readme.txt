@@ -13,7 +13,7 @@ TCP的穿透仅采用TRUNS中继服务方式。
 
 名称简写
 --------
-	Pub 	Public 公网IP
+	Pub 	Public 开放公共域（端口可控）
 	FullC   Full Cone 完全圆锥型，任意IP和Port
 	RC	Restricted Cone 受限圆锥型（IP相同, Port任意）
 	P-RC	Port Restricted Cone 端口受限圆锥型（IP/Port都相同）
