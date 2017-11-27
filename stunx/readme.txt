@@ -8,9 +8,9 @@ P2P互连穿透服务。
 名称简写
 --------
 	FullC   Full Cone 完全圆锥型，任意IP和Port（IP+, Port+）
-	RC	  Restricted Cone 受限圆锥型（=IP, Port+）
+	RC	Restricted Cone 受限圆锥型（=IP, Port+）
 	P-RC	Port Restricted Cone 端口受限圆锥型（=IP, =Port）
-	Sym	 Symmetric NAT
+	Sym	Symmetric NAT
 
 可连接性
 --------
