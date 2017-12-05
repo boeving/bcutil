@@ -141,10 +141,8 @@ func (s *Sema) Done() <-chan struct{} {
 }
 
 //
-// On 信号器重启。
-// 实际上为创建一个新的信号器并原地赋值。
-// （注：不常用，通常Off之后逻辑已经完成）
+// Fn 返回状态判断函数。
 //
-func (s *Sema) On() {
-	*s = *NewSema()
+func (s *Sema) Fn() func() bool {
+	return s.fn
 }
