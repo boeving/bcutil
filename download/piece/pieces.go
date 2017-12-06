@@ -10,14 +10,15 @@
 //
 // 1. 校验集文件。
 //  格式：8+[20] + [20][20]...
-// 	- 前8字节定义版本、分片大小和分片数量。
-// 		[8]  版本号。默认0，遵循默认规则（如下）。
-// 		[24] 分片大小，最大支持到16MB。
-// 		[32] 分片数量，最大支持到4G。
-// 	- 随后20字节为分片校验和序列的根哈希（又名整集哈希，串连合并计算）。
-// 	- 再后面为每单元20字节的各分片校验和序列。
+//  - 前8字节定义版本、分片大小和分片数量。
+//  	[8]  版本号。默认0，遵循默认规则（如下）。
+//  	[24] 分片大小，最大支持到16MB。
+//  	[32] 分片数量，最大支持到4G。
+//  - 随后20字节为分片校验和序列的根哈希（又名整集哈希，串连合并计算）。
+//  - 再后面为每单元20字节的各分片校验和序列。
 //
 // 2. 多级分片。
+//
 // 对于大型文件，校验集文件本身会很大，因此作为普通文件再做分片。
 // 通常，2级分片已经足够。
 //
@@ -26,8 +27,9 @@
 // 校验集文件已足够小。
 //
 // 3. 校验算法。
-// 保持尽量小的校验数据，仍采用20字节输出。
-// 	sha1x.Sum256 = sha1(sha256(..))
+//
+// 保持尽量小的校验和数据，仍采用20字节输出。
+// 	sha1x.Sum256 = sha1( sha256(...) )
 //
 // 注：
 // 对文件本身直接的校验和计算称为文件哈希，同上算法，20字节。
@@ -55,11 +57,11 @@ const (
 )
 
 const (
-	lenHead   = 8 + 20     // 头部长度
-	lenSum    = 20         // 哈希长度（bytes）
-	lenRest   = 8 + 20     // 剩余分片存储单元长度
-	maxAmount = 0xffffffff // 最多分片数量（4字节）
-	maxSpan   = 0xffffff   // 最大分片大小（3字节）
+	lenHead   = 8 + 20    // 头部长度
+	lenSum    = 20        // 哈希长度（bytes）
+	lenRest   = 8 + 20    // 剩余分片存储单元长度
+	maxAmount = 1<<32 - 1 // 最多分片数量（4字节）
+	maxSpan   = 1<<24 - 1 // 最大分片大小（3字节）
 )
 
 var (
@@ -100,7 +102,7 @@ type Hash20 [20]byte
 //
 type Head struct {
 	Ver    byte   // 版本
-	Span   int    // 分片大小（bytes）
+	Span   int    // 分片大小（<=16MB）
 	Amount uint32 // 分片数量
 	Root   Hash20 // 整集哈希
 }
@@ -264,7 +266,8 @@ func (s *Sums) Offsets() []int64 {
 
 //
 // Rests 剩余分片哈希集。
-// 存储结构：[8+20][8+20]...
+// 存储结构：
+// 	[8+20][8+20]...
 // 分片偏移值（8字节）存储在每一段20字节哈希之前。
 //
 // 仅用于下载过程中的状态存储，下载完毕即无用。
@@ -357,7 +360,9 @@ type Piece struct {
 	End   int64
 }
 
-// Size 分片大小。
+//
+// Size 分片大小（Begin～End）。
+//
 func (p Piece) Size() int {
 	return int(p.End - p.Begin)
 }
@@ -371,7 +376,7 @@ func (p Piece) Size() int {
 //  - 文件大小应该大于等于零；
 //  - 分片大小大于文件大小时，即等于文件大小。
 //
-func Divide(fsize, span int64) <-chan Piece {
+func Divide(fsize, span int64, stop *goes.Stop) <-chan Piece {
 	if span > fsize {
 		span = fsize
 	}
@@ -379,11 +384,14 @@ func Divide(fsize, span int64) <-chan Piece {
 	ch := make(chan Piece)
 
 	go func() {
-		var i int64
-		for i < cnt {
+		for i := int64(0); i < cnt; i++ {
 			off := i * span
-			ch <- Piece{off, off + span}
-			i++
+			select {
+			case <-stop.C:
+				close(ch)
+				return
+			case ch <- Piece{off, off + span}:
+			}
 		}
 		if mod > 0 {
 			off := cnt * span
@@ -412,33 +420,32 @@ type Sumor struct {
 	list map[int64]Hash20
 	ch   <-chan Piece
 	vch  chan offSum
-	sem  chan struct{} // 取值锁
+	end  *goes.Stop // 取值锁
 }
 
 //
 // NewSumor 新建一个分片校验和生成器。
-//  ra 输入流需要支持Seek（Seeker接口）。
-//  span 传递0或负值采用默认分片大小。
+// 返回值仅可执行一次Do方法用于生成输入源的校验和。
+// span 传递0或负值采用默认分片大小。
 //
 func NewSumor(ra io.ReaderAt, fsize, span int64) *Sumor {
 	if span <= 0 {
 		span = PieceSize
 	}
+	stop := goes.NewStop()
 	sm := Sumor{
 		ra:   ra,
 		list: make(map[int64]Hash20),
-		sem:  make(chan struct{}),
-		// 一个分片服务
-		ch:  Divide(fsize, span),
-		vch: make(chan offSum),
+		end:  stop,
+		ch:   Divide(fsize, span, stop), // 一个分片服务
+		vch:  make(chan offSum),
 	}
-
-	// 单独的赋值服务（list非并发安全）
+	// 单独的赋值服务
 	go func() {
 		for v := range sm.vch {
 			sm.list[v.Off] = v.Sum
 		}
-		close(sm.sem)
+		sm.end.Exit()
 	}()
 
 	return &sm
@@ -446,27 +453,31 @@ func NewSumor(ra io.ReaderAt, fsize, span int64) *Sumor {
 
 //
 // List 返回校验和清单。
-// 需要在 Do|FullDo 成功构建之后调用。
+// 需要在 Do 成功构建之后调用，否则阻塞。
 //
 func (s *Sumor) List() map[int64]Hash20 {
-	<-s.sem
+	<-s.end.C
 	return s.list
 }
 
 //
 // Task 获取一个分片定义。
+// 实现 goes.Worker 接口。
 //
-func (s *Sumor) Task() (k interface{}, ok bool) {
-	k, ok = <-s.ch
+func (s *Sumor) Task(over func() bool) (k interface{}, ok bool) {
+	if !over() {
+		k, ok = <-s.ch
+	}
 	return
 }
 
 //
 // Work 计算一个分片数据的校验和。
+// 实现 goes.Worker 接口。
 //
 func (s *Sumor) Work(k interface{}, over func() bool) error {
 	if over() {
-		return errExit
+		return s.done(errExit)
 	}
 	p := k.(Piece)
 	data, err := blockRead(s.ra, p.Begin, p.End)
@@ -475,7 +486,7 @@ func (s *Sumor) Work(k interface{}, over func() bool) error {
 		return err
 	}
 	if over() {
-		return errExit
+		return s.done(errExit)
 	}
 	s.vch <- offSum{
 		p.Begin,
@@ -485,12 +496,23 @@ func (s *Sumor) Work(k interface{}, over func() bool) error {
 }
 
 //
+// 工作结束。
+// 返回传入的错误实参。
+//
+func (s *Sumor) done(err error) error {
+	close(s.vch)
+	return err
+}
+
+//
 // Do 计算/设置分片校验和（有限并发）。
 //
 // 启动 limit 个并发计算，传递0采用内置默认值（SumThread）。
-// 返回的等待对象用于等待全部工作完成。
+// 返回值为nil表示正确完成，否则为第一个错误信息。
 //
 func (s *Sumor) Do(limit int) error {
+	defer s.done(nil)
+
 	if limit <= 0 {
 		limit = SumThread
 	}
@@ -507,41 +529,60 @@ type SumChecker struct {
 	Span int64
 	List map[int64]Hash20
 	ch   <-chan offSum
+	end  *goes.Stop
 }
 
 //
 // NewSumChecker 创建一个校验和检查器。
-// 注：只能使用一次。
+// 返回的检测器仅可执行一次Check或CheckAll，再次执行之前需Reset。
 //
 func NewSumChecker(ra io.ReaderAt, span int64, list map[int64]Hash20) *SumChecker {
-	ch := make(chan offSum)
 	sc := SumChecker{
 		RA:   ra,
 		Span: span,
 		List: list,
-		ch:   ch,
 	}
+	return sc.Reset()
+}
+
+//
+// Reset 检查状态重置。
+//
+func (sc *SumChecker) Reset() *SumChecker {
+	end := goes.NewStop()
+	ch := make(chan offSum)
+
 	go func() {
 		for k, sum := range sc.List {
-			// no sc.ch (only read)
-			ch <- offSum{k, sum}
+			select {
+			case <-end.C:
+				close(ch)
+				return
+			case ch <- offSum{k, sum}:
+			}
 		}
 		close(ch)
 	}()
-	return &sc
+
+	sc.ch = ch
+	sc.end = end
+	return sc
 }
 
 //
 // Task 返回偏移下标。
+// 实现 goes.Worker 接口。
 //
-func (sc *SumChecker) Task() (k interface{}, ok bool) {
-	k, ok = <-sc.ch
+func (sc *SumChecker) Task(over func() bool) (k interface{}, ok bool) {
+	if !over() {
+		k, ok = <-sc.ch
+	}
 	return
 }
 
 //
 // Work 读取数据核实校验和。
-// 不符合则返回一个错误。
+// 不符合则返回一个错误。实现 goes.Worker 接口。
 //
 func (sc *SumChecker) Work(k interface{}, over func() bool) error {
 	if over() {
@@ -564,9 +605,12 @@ func (sc *SumChecker) Work(k interface{}, over func() bool) error {
 
 //
 // Check 计算校验。
-// 简单计算，有任何一片不符即返回。
+// 简单计算，有任何一片不符即停止校验工作。
+// 返回值非nil表示有错，值为首个错误信息。
 //
 func (sc *SumChecker) Check(limit int) error {
+	defer sc.end.Exit()
+
 	if limit <= 0 {
 		limit = SumThread
 	}
@@ -575,22 +619,33 @@ func (sc *SumChecker) Check(limit int) error {
 
 //
 // CheckAll 校验和完整计算对比。
-// 返回的错误Error可用于收集不合格的分片。
+// 返回校验和不符或读取错误的分片的源数据的起始下标集。
+// 返回值为nil表示全部校验无错。
 //
-func (sc *SumChecker) CheckAll(limit int) <-chan error {
+func (sc *SumChecker) CheckAll(limit int) []int64 {
+	defer sc.end.Exit()
+
 	if limit <= 0 {
 		limit = SumThread
 	}
-	return goes.WorksLong(goes.LimitWorker(sc, limit), nil)
+	ech := goes.WorksLong(goes.LimitWorker(sc, limit), nil)
+
+	var buf []int64
+
+	for err := range ech {
+		// 应当仅有Error类型
+		buf = append(buf, err.(Error).Off)
+	}
+	return buf
 }
 
 //
-// SumAll 输入数据校验核实。
+// ChkSum 输入数据校验核实。
 //
 // 内部即为对SumChecker的使用，并发工作（并发量采用默认值）。
 // span 为分块大小（bytes）。
 //
-func SumAll(ra io.ReaderAt, span int64, list map[int64]Hash20) bool {
+func ChkSum(ra io.ReaderAt, span int64, list map[int64]Hash20) bool {
 	return NewSumChecker(ra, span, list).Check(0) == nil
 }
 
@@ -599,7 +654,7 @@ func SumAll(ra io.ReaderAt, span int64, list map[int64]Hash20) bool {
 // 已知分片大小的优化版。
 //
 // list需为完整的清单，如果下标偏移超出范围，返回nil。
-// 主要用于默克尔树及树根的计算。
+// 主要用于哈希树根的计算。
 //
 func Ordered(span int64, list map[int64]Hash20) []Hash20 {
 	buf := make([]Hash20, len(list))
