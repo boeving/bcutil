@@ -71,7 +71,7 @@ func NewStop() *Stop {
 // 调用之后实例不再可用。
 //
 func (s *Stop) Exit() {
-	close(s.C)
+	Close(s.C)
 }
 
 //

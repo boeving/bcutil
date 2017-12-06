@@ -6,10 +6,18 @@ import (
 
 //
 // Worker 并发工作器。
+// 获得一个任务（Task）之后，新建一个Go程执行Work。
+//
+// 两个接口中都会传递一个over函数，用于判断是否被外部结束。
+// 接口的实现中可据此决定是否或何时中途退出。
+//
+// 这有点像现实中的工厂工作，通知结束后，工人自行决定手上的活儿。
+// 在Work中，通常在一些关键节点处判断。
 //
 type Worker interface {
 	// 任务分发，ok返回false表示分发结束。
-	Task() (k interface{}, ok bool)
+	// over为通知结束的判断函数。
+	Task(over func() bool) (k interface{}, ok bool)
 
 	// over 判断外部是否已取消工作。
 	// 返回非nil表示出错，由外部执行处理逻辑或忽略。
@@ -27,9 +35,9 @@ type limitTask struct {
 //
 // Task 延迟控制获取任务。
 //
-func (l *limitTask) Task() (interface{}, bool) {
+func (l *limitTask) Task(over func() bool) (interface{}, bool) {
 	l.sem <- struct{}{}
-	return l.w.Task()
+	return l.w.Task(over)
 }
 
 //
@@ -43,7 +51,7 @@ func (l *limitTask) Work(k interface{}, over func() bool) error {
 }
 
 //
-// LimitWorker 创建一个有限并发任务工作器。
+// LimitWorker 创建一个有限并发工作器。
 //
 func LimitWorker(w Worker, limit int) Worker {
 	if limit <= 0 {
@@ -57,7 +65,7 @@ func LimitWorker(w Worker, limit int) Worker {
 }
 
 //
-// Works 并发工作，直到出现首个错误。
+// Works 并发阻塞直到工作结束。
 // 有一个出错即不再创建新的工作，但会等待已经开始的工作结束。
 // 返回首个出错的信息。
 //
@@ -66,8 +74,6 @@ func LimitWorker(w Worker, limit int) Worker {
 //
 // 出错后仅写入一个错误信息，但不保证是首个返回的错误信息。
 // 外部读取返回通道的值（单次即可），阻塞等待内部工作全部结束。
-//
-// Task与Work总是成对执行，无论是否出错。
 //
 func Works(w Worker) error {
 	bad := make(chan error)
@@ -79,7 +85,7 @@ func Works(w Worker) error {
 			if sem.Offed() {
 				break
 			}
-			v, ok := w.Task()
+			v, ok := w.Task(sem.Fn())
 			if !ok {
 				break
 			}
@@ -115,18 +121,21 @@ func Works(w Worker) error {
 // 如：文件的分片下载/存储，失效部分被收集重做。
 //
 // 外部需要持续读取通道以避免内部阻塞，否则通道不会关闭。
-// 外部提前结束可在Task或在Work中调用 sem.Off()。
+// 注：外部提前结束通过 sem.Off() 实施。
 //
 func WorksLong(w Worker, sem *Sema) <-chan error {
 	bad := make(chan error)
-
+	// 占位简化
+	if sem == nil {
+		sem = longSem
+	}
 	go func() {
 		var wg sync.WaitGroup
 		for {
 			if sem.Offed() {
 				break
 			}
-			v, ok := w.Task()
+			v, ok := w.Task(sem.Fn())
 			if !ok {
 				break
 			}
@@ -146,3 +155,10 @@ func WorksLong(w Worker, sem *Sema) <-chan error {
 
 	return bad
 }
+
+//
+// 长信号，永不关闭。
+// 用于占位，简化编码。
+// 注：本库编码中调用者注意不可关闭！
+//
+var longSem = NewSema()
