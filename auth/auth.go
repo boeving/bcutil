@@ -1,4 +1,4 @@
-package pkaddr
+package auth
 
 import (
 	"crypto/sha256"
