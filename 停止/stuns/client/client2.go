@@ -9,10 +9,10 @@ import (
 )
 
 func main() {
-	raddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:7788")
+	raddr, err := net.ResolveUDPAddr("udp", "192.168.31.24:7788")
 	log.Println("Server address: ", raddr, err)
 
-	laddr, err := net.ResolveUDPAddr("udp", ":27788")
+	laddr, err := net.ResolveUDPAddr("udp", ":17799")
 	log.Println("Local: ", laddr, err)
 
 	conn, err := net.DialUDP("udp", laddr, raddr)

@@ -5,7 +5,8 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
+	"strings"
+	//"os"
 )
 
 func main() {
@@ -15,17 +16,21 @@ func main() {
 	}
 
 	go func() {
-		laddr, _ := net.ResolveUDPAddr("udp", ":7799")
-		raddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:17799")
-		conn, err := net.DialUDP("udp", laddr, raddr)
+		//laddr, _ := net.ResolveUDPAddr("udp", ":7799")
+		//raddr, _ := net.ResolveUDPAddr("udp", "192.168.31.154:17799")
+		raddr, _ := net.ResolveUDPAddr("udp", "192.168.31.24:17799")
+		conn, err := net.DialUDP("udp", saddr, raddr)
 		if err != nil {
 			log.Fatalln(err)
 		}
 		defer conn.Close()
 
-		go mustCopy(os.Stdout, conn)
-		mustCopy(conn, os.Stdin)
+		//go mustCopy(os.Stdout, conn)
+		//mustCopy(conn, os.Stdin)
+		var buf [10]byte
+		fmt.Println(conn.ReadFromUDP(buf[:]))
 	}()
+
 	listen(saddr)
 
 	fmt.Println("UDP Server Done!")
@@ -46,7 +51,7 @@ func listen(laddr *net.UDPAddr) {
 			fmt.Println(err)
 			break
 		}
-		fmt.Println(string(buf), n, addr, err)
+		fmt.Println(strings.Trim(string(buf), "\000"), n, addr, err)
 	}
 	conn.Close()
 }
