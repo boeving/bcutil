@@ -9,13 +9,13 @@
 // 客户端不必在内存中构造一个大型的默克尔树，分片的校验和可以从磁盘读取后直接比较验证。
 //
 // 1. 校验集文件。
-//  格式：8+[20] + [20][20]...
+//  格式：8+[32] + [32][32]...
 //  - 前8字节定义版本、分片大小和分片数量。
 //  	[8]  版本号。默认0，遵循默认规则（如下）。
 //  	[24] 分片大小，最大支持到16MB。
 //  	[32] 分片数量，最大支持到4G。
-//  - 随后20字节为分片校验和序列的根哈希（又名整集哈希，串连合并计算）。
-//  - 再后面为每单元20字节的各分片校验和序列。
+//  - 随后32字节为分片校验和序列的根哈希（又名整集哈希，串连合并计算）。
+//  - 再后面为每单元32字节的各分片校验和序列。
 //
 // 2. 多级分片。
 //
@@ -23,27 +23,24 @@
 // 通常，2级分片已经足够。
 //
 // 假设都取最大值，分片大小为16MB，分片数量为4G，则最大文件可支持到64PB（16MB * 4G）。
-// 此时1级校验集文件为80GB，如果2级分片大小定义为1MB，则分片校验集文件为1.6MB（80000/1000 * 20）。
-// 校验集文件已足够小。
+// 此时1级校验集文件为128GB，如果2级分片大小定义为1MB，则分片校验集文件为4MB（128000/1000 * 32）。
+// 校验集文件大小已可接受。
 //
-// 3. 校验算法。
-//
-// 保持尽量小的校验和数据，仍采用20字节输出。
-// 	sha1x.Sum256 = sha1( sha256(...) )
+// 3. 校验算法：sha256.Sum256(...)
 //
 // 注：
-// 对文件本身直接的校验和计算称为文件哈希，同上算法，20字节。
+// 对文件本身直接的校验和计算称为文件哈希，算法同上。
 //
 package piece
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 
 	"github.com/qchen-zh/pputil/goes"
-	"github.com/qchen-zh/pputil/sha1x"
 )
 
 // 基本常量
@@ -57,9 +54,9 @@ const (
 )
 
 const (
-	lenHead   = 8 + 20    // 头部长度
-	lenSum    = 20        // 哈希长度（bytes）
-	lenRest   = 8 + 20    // 剩余分片存储单元长度
+	lenHead   = 8 + 32    // 头部长度
+	lenSum    = 32        // 哈希长度（bytes）
+	lenRest   = 8 + 32    // 剩余分片存储单元长度
 	maxAmount = 1<<32 - 1 // 最多分片数量（4字节）
 	maxSpan   = 1<<24 - 1 // 最大分片大小（3字节）
 )
@@ -92,19 +89,19 @@ func Output(w io.WriterAt, h *Head, ss *Sums) (int, error) {
 	return n + h.Size(), err
 }
 
-// Hash20 20字节哈希校验和。
-type Hash20 [20]byte
+// Hash32 32字节哈希校验和。
+type Hash32 [lenSum]byte
 
 //
 // Head 分片头部定义。
-// 结构：8 + 20
+// 结构：8 + 32
 // 分片大小为0表示不分片。此时分片数量为1，整集哈希为文件哈希。
 //
 type Head struct {
 	Ver    byte   // 版本
 	Span   int    // 分片大小（<=16MB）
 	Amount uint32 // 分片数量
-	Root   Hash20 // 整集哈希
+	Root   Hash32 // 整集哈希
 }
 
 //
@@ -135,10 +132,10 @@ func (h *Head) Read(r io.Reader) error {
 }
 
 //
-// Bytes 构造头部字节序列（28bytes）。
+// Bytes 构造头部字节序列（40bytes）。
 //
 func (h *Head) Bytes() []byte {
-	var buf [8 + 20]byte
+	var buf [lenHead]byte
 
 	binary.BigEndian.PutUint32(buf[:4], uint32(h.Span))
 	buf[0] = h.Ver
@@ -155,7 +152,7 @@ func (h *Head) Bytes() []byte {
 //
 type Sums struct {
 	Span int64            // 分片大小
-	list map[int64]Hash20 // 分片哈希集[offset]。
+	list map[int64]Hash32 // 分片哈希集[offset]。
 }
 
 //
@@ -164,7 +161,7 @@ type Sums struct {
 // 仅自身，不包含应当存在的头部长度。
 //
 func (s Sums) Size() int {
-	return len(s.list) * 20
+	return len(s.list) * lenSum
 }
 
 //
@@ -179,7 +176,7 @@ func (s Sums) Empty() bool {
 // off参数为源数据分片的起始下标位置。
 // 如果不存在目标位置的哈希存储，返回nil。
 //
-func (s Sums) Item(off int64) *Hash20 {
+func (s Sums) Item(off int64) *Hash32 {
 	if sum, ok := s.list[off]; ok {
 		return &sum
 	}
@@ -189,7 +186,7 @@ func (s Sums) Item(off int64) *Hash20 {
 //
 // List 返回校验和清单。
 //
-func (s Sums) List() map[int64]Hash20 {
+func (s Sums) List() map[int64]Hash32 {
 	return s.list
 }
 
@@ -198,7 +195,7 @@ func (s Sums) List() map[int64]Hash20 {
 // rs为校验集输入源，其分片哈希按分片数据在原始文件内的偏移顺序排列。
 // 注：输入源中包含全部分片的哈希存储。
 //
-// start/amount 指20字节的哈希单元计数。
+// start/amount 指32字节的哈希单元计数。
 // start指起始数量；amount表示载入的数量，-1表示载入全部。
 //
 // 返回io.EOF表示已读取到末尾。
@@ -208,7 +205,7 @@ func (s Sums) Load(rs io.ReadSeeker, start, amount int64) error {
 		return errZero
 	}
 	if s.list == nil {
-		s.list = make(map[int64]Hash20)
+		s.list = make(map[int64]Hash32)
 	}
 	if _, err := rs.Seek(start*lenSum+lenHead, io.SeekStart); err != nil {
 		return err
@@ -217,8 +214,8 @@ func (s Sums) Load(rs io.ReadSeeker, start, amount int64) error {
 		amount = maxAmount
 	}
 	for ; start < amount; start++ {
-		var sum Hash20
-		if n, err := io.ReadFull(rs, sum[:]); n != 20 {
+		var sum Hash32
+		if n, err := io.ReadFull(rs, sum[:]); n != lenSum {
 			return err
 		}
 		s.list[start*s.Span] = sum
@@ -267,19 +264,19 @@ func (s *Sums) Offsets() []int64 {
 //
 // Rests 剩余分片哈希集。
 // 存储结构：
-// 	[8+20][8+20]...
-// 分片偏移值（8字节）存储在每一段20字节哈希之前。
+// 	[8+32][8+32]...
+// 分片偏移值（8字节）存储在每一段32字节哈希之前。
 //
 // 仅用于下载过程中的状态存储，下载完毕即无用。
 // 如果存在一个文件对应的剩余分片定义，则表示未下载完毕。
 //
-type Rests map[int64]Hash20
+type Rests map[int64]Hash32
 
 //
 // Size 分片集存储需要的字节数。
 //
 func (r Rests) Size() int {
-	return len(r) * 28
+	return len(r) * (8 + 32)
 }
 
 //
@@ -294,7 +291,7 @@ func (r Rests) Empty() bool {
 // off参数为源数据分片的起始下标位置。
 // 如果不存在目标位置的哈希存储，返回nil。
 //
-func (r Rests) Item(off int64) *Hash20 {
+func (r Rests) Item(off int64) *Hash32 {
 	if sum, ok := r[off]; ok {
 		return &sum
 	}
@@ -319,7 +316,7 @@ func (r Rests) Load(rs io.ReadSeeker, start, amount int) error {
 		if n, err := io.ReadFull(rs, buf[:]); n != lenRest {
 			return err
 		}
-		var sum Hash20
+		var sum Hash32
 		copy(sum[:], buf[8:])
 
 		r[int64(binary.BigEndian.Uint64(buf[:8]))] = sum
@@ -404,11 +401,11 @@ func Divide(fsize, span int64, stop *goes.Stop) <-chan Piece {
 
 //
 // 偏移&校验和值对。
-// 用于 map[int64]Hash20 并发数据的传递。
+// 用于 map[int64]Hash32 并发数据的传递。
 //
 type offSum struct {
 	Off int64
-	Sum Hash20
+	Sum Hash32
 }
 
 //
@@ -417,7 +414,7 @@ type offSum struct {
 //
 type Sumor struct {
 	ra   io.ReaderAt
-	list map[int64]Hash20
+	list map[int64]Hash32
 	ch   <-chan Piece
 	vch  chan offSum
 	end  *goes.Stop // 取值锁
@@ -435,7 +432,7 @@ func NewSumor(ra io.ReaderAt, fsize, span int64) *Sumor {
 	stop := goes.NewStop()
 	sm := Sumor{
 		ra:   ra,
-		list: make(map[int64]Hash20),
+		list: make(map[int64]Hash32),
 		end:  stop,
 		ch:   Divide(fsize, span, stop), // 一个分片服务
 		vch:  make(chan offSum),
@@ -455,7 +452,7 @@ func NewSumor(ra io.ReaderAt, fsize, span int64) *Sumor {
 // List 返回校验和清单。
 // 需要在 Do 成功构建之后调用，否则阻塞。
 //
-func (s *Sumor) List() map[int64]Hash20 {
+func (s *Sumor) List() map[int64]Hash32 {
 	<-s.end.C
 	return s.list
 }
@@ -490,7 +487,7 @@ func (s *Sumor) Work(k interface{}, over func() bool) error {
 	}
 	s.vch <- offSum{
 		p.Begin,
-		sha1x.Sum256(data),
+		sha256.Sum256(data),
 	}
 	return nil
 }
@@ -527,7 +524,7 @@ func (s *Sumor) Do(limit int) error {
 type SumChecker struct {
 	RA   io.ReaderAt
 	Span int64
-	List map[int64]Hash20
+	List map[int64]Hash32
 	ch   <-chan offSum
 	end  *goes.Stop
 }
@@ -536,7 +533,7 @@ type SumChecker struct {
 // NewSumChecker 创建一个校验和检查器。
 // 返回的检测器仅可执行一次Check或CheckAll，再次执行之前需Reset。
 //
-func NewSumChecker(ra io.ReaderAt, span int64, list map[int64]Hash20) *SumChecker {
+func NewSumChecker(ra io.ReaderAt, span int64, list map[int64]Hash32) *SumChecker {
 	sc := SumChecker{
 		RA:   ra,
 		Span: span,
@@ -597,7 +594,7 @@ func (sc *SumChecker) Work(k interface{}, over func() bool) error {
 	if over() {
 		return errExit
 	}
-	if sha1x.Sum256(data) != os.Sum {
+	if sha256.Sum256(data) != os.Sum {
 		return Error{os.Off, errChkSum}
 	}
 	return nil
@@ -645,7 +642,7 @@ func (sc *SumChecker) CheckAll(limit int) []int64 {
 // 内部即为对SumChecker的使用，并发工作（并发量采用默认值）。
 // span 为分块大小（bytes）。
 //
-func ChkSum(ra io.ReaderAt, span int64, list map[int64]Hash20) bool {
+func ChkSum(ra io.ReaderAt, span int64, list map[int64]Hash32) bool {
 	return NewSumChecker(ra, span, list).Check(0) == nil
 }
 
@@ -656,8 +653,8 @@ func ChkSum(ra io.ReaderAt, span int64, list map[int64]Hash20) bool {
 // list需为完整的清单，如果下标偏移超出范围，返回nil。
 // 主要用于哈希树根的计算。
 //
-func Ordered(span int64, list map[int64]Hash20) []Hash20 {
-	buf := make([]Hash20, len(list))
+func Ordered(span int64, list map[int64]Hash32) []Hash32 {
+	buf := make([]Hash32, len(list))
 
 	for off, sum := range list {
 		i := int(off / span)
