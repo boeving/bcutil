@@ -207,6 +207,21 @@
 	由确认距离和己方的发送速度可评估网络状况。
 
 
+ACK滞速
+-------
+	
+
+
+参数
+====
+	baseLine: 0		时间基线，最低RTT值
+	baseRate: 5ms		基础速率，初始默认发包间隔
+	minRate: 100μs 		极限速率，万次/秒
+	rateUpdate: 500ms 	速率更新间隔
+	aliveTime: 120s		保活时间界限
+	aliveIntvl: 10s		保活报文间隔时间
+	aliveProbes: 6		保活探测次数上限
+
 
 
 API支持
