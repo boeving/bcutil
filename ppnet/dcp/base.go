@@ -27,19 +27,21 @@
 //
 package dcp
 
-import "io"
+import (
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+)
 
-//
-// Client 客户端应用。
-//
-type Client struct {
-}
+const (
+	headBase = 16
+	mtuExtra = 4
+)
 
-//
-// Server 服务器。
-//
-type Server struct {
-}
+var (
+	errExt2 = errors.New("value overflow, must be between 0-15")
+)
 
 //
 // 头部标记。
@@ -53,7 +55,7 @@ const (
 	END flag = 1 << iota // 分组结束
 	BEG                  // 分组开始
 	RTP                  // 请求重发
-	BYE                  // 中断连系
+	BYE                  // 断开连系
 	RST                  // 发送/会话重置
 	SES                  // 会话申请/更新
 	MTU                  // MTU通告/确认
@@ -131,7 +133,7 @@ type header struct {
 }
 
 // MTU 定制大小。
-func (h *header) mtuSize() uint32 {
+func (h *header) MTUSize() uint32 {
 	if h.Ext2&0xf == 0xf {
 		return h.mtuSz
 	}
@@ -139,25 +141,169 @@ func (h *header) mtuSize() uint32 {
 }
 
 // RPZ 扩展大小。
-func (h *header) rpzSize() int {
+func (h *header) RPZSize() int {
 	return int(h.Ext2 >> 4)
 }
 
-// 解码头部数据。
-func (h *header) Decode(r io.Reader) {
+// 扩展区MTU设置。
+func (h *header) SetMTU(i int, cst uint32) error {
+	if i > 0xf || i < 0 {
+		return errExt2
+	}
+	h.Ext2 = h.Ext2&0xf0 | byte(i)
+	if i == 0xf {
+		h.mtuSz = cst
+	}
+	return nil
+}
 
+// 扩展区RPZ值设置。
+func (h *header) SetRPZ(v int) error {
+	if v > 0xf || v < 0 {
+		return errExt2
+	}
+	h.Ext2 = h.Ext2&0xf | byte(v)<<4
+	return nil
+}
+
+// 解码头部数据。
+func (h *header) Decode(r io.Reader) error {
+	var buf [headBase]byte
+	n, err := io.ReadFull(r, buf[:])
+	if n != headBase {
+		return err
+	}
+	h.SID = binary.BigEndian.Uint16(buf[0:2])
+	h.Seq = binary.BigEndian.Uint16(buf[2:4])
+	h.RID = binary.BigEndian.Uint16(buf[4:6])
+	h.Ack = binary.BigEndian.Uint16(buf[6:8])
+	h.Ext2 = buf[8]
+	h.Flag = flag(buf[9])
+	h.AckDst = buf[10]
+	h.SndDst = buf[11]
+	h.Sess = binary.BigEndian.Uint32(buf[12:16])
+
+	// MTU置位才有效！
+	if h.Flag.MTU() && h.Ext2&0xf == 0xf {
+		err = h.mtuCustom(r)
+	}
+	return err
+}
+
+// 读取自定义MTU配置。
+func (h *header) mtuCustom(r io.Reader) error {
+	var buf [mtuExtra]byte
+	if n, err := io.ReadFull(r, buf[:]); n != mtuExtra {
+		return err
+	}
+	h.mtuSz = binary.BigEndian.Uint32(buf[:])
+	return nil
 }
 
 // 编码头部数据。
-func (h *header) Encode(w io.Writer) {
+func (h *header) Encode() []byte {
+	var buf [headBase + mtuExtra]byte
 
+	binary.BigEndian.PutUint16(buf[0:2], h.SID)
+	binary.BigEndian.PutUint16(buf[2:4], h.Seq)
+	binary.BigEndian.PutUint16(buf[4:6], h.RID)
+	binary.BigEndian.PutUint16(buf[6:8], h.Ack)
+	buf[8] = h.Ext2
+	buf[9] = byte(h.Flag)
+	buf[10] = h.AckDst
+	buf[11] = h.SndDst
+	binary.BigEndian.PutUint32(buf[12:16], h.Sess)
+
+	// MTU置位才有效！
+	if h.Flag.MTU() && h.Ext2&0xf == 0xf {
+		binary.BigEndian.PutUint32(buf[16:20], h.mtuSz)
+		return buf[:]
+	}
+	return buf[:headBase]
 }
 
 //
 // 数据报。
-// 头部和有效载荷。
 //
 type packet struct {
-	h    header
-	data []byte
+	Header  header
+	Payload []byte
+}
+
+//
+// 获取资源请求的数据ID。
+// 返回值实际上是一个16位大小的整数，用于数据体标识。
+// 这主要由客户端的实现调用。
+//
+// res 为资源标识，可能是一个哈希序列，或一个URI定位。
+//
+func dataID(res []byte) int {
+	//
+}
+
+type DCPAddr struct {
+	addr net.UDPAddr
+}
+
+func (a *DCPAddr) Network() string {
+	return a.addr.Network()
+}
+
+func (a *DCPAddr) String() string {
+	return a.addr.String()
+}
+
+//
+// ResolveDCPAddr 解析生成地址。
+// network兼容 "dcp", "dcp4", "dcp6" 和 "udp", "udp4", "udp6"。
+//
+// 目前返回的实际上是一个UDP地址。
+//
+func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
+	switch network {
+	case "dcp":
+		network = "udp"
+	case "dcp4":
+		network = "udp4"
+	case "dcp6":
+		network = "udp6"
+	}
+	addr, err := net.ResolveUDPAddr(network, address)
+
+	return &DCPAddr{addr}, err
+}
+
+//
+// Options DCP服务选项。
+//
+type Options struct {
+}
+
+//
+// Thread 处理进程。
+// 负责一对端点连系的处理，接收客户端/服务器实例的注册。
+//
+type Thread struct {
+	//
+}
+
+//
+// RegisterClient 注册客户端应用。
+//
+func (th *Thread) RegisterClient(c Client) {
+	//
+}
+
+//
+// RegisterServer 注册服务端应用。
+//
+func (th *Thread) RegisterServer(s Server) {
+	//
+}
+
+//
+// Serve 启动服务。
+//
+func (th *Thread) Serve(opt *Options) {
+	//
 }
