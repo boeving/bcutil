@@ -25,10 +25,10 @@ type Encoding struct {
 }
 
 // EncodeStd 标准字符序列。
-// 便于外观和读音区分（视觉/听觉）。
-// 6s9l9zf4r5s4jfxiu8boleum7cx5x4m9wpsyzoxfrcdo9pei7ctyn4fhrex8lefm7ctyt576rhrybaq
-// [a-z4-9]
-const EncodeStd = "abcdefjhijklmnopqrstuvwxyz456789"
+// 外观整齐，读音区分（视觉/听觉）。
+// 6WSJN4FHQLTJLNHJXWIO9PEM7CX5X4M9WPSYZOXFRCDO9PEI7CTYN4FHREX8LEFM7CTYT576RHRYBAQ
+// [A-Z4-9]
+const EncodeStd = "ABCDEFJHIJKLMNOPQRSTUVWXYZ456789"
 
 // 纯字母序列。
 // 选取原则：
