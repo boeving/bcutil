@@ -231,18 +231,10 @@ type packet struct {
 }
 
 //
-// 获取资源请求的数据ID。
-// 返回值实际上是一个16位大小的整数，用于数据体标识。
-// 这主要由客户端的实现调用。
+// DCPAddr 地址封装。
 //
-// res 为资源标识，可能是一个哈希序列，或一个URI定位。
-//
-func dataID(res []byte) int {
-	//
-}
-
 type DCPAddr struct {
-	addr net.UDPAddr
+	addr *net.UDPAddr
 }
 
 func (a *DCPAddr) Network() string {
@@ -274,36 +266,89 @@ func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
 }
 
 //
-// Options DCP服务选项。
-//
-type Options struct {
-}
-
-//
-// Thread 处理进程。
+// Contact 端点连系。
 // 负责一对端点连系的处理，接收客户端/服务器实例的注册。
 //
-type Thread struct {
+type Contact struct {
+}
+
+//
+// Request 请求目标资源。
+// 通常必须传递一个接收器用于处理对端返回的数据。
+//
+func (c *Contact) Request(res []byte, r Receiver) error {
 	//
 }
 
 //
-// RegisterClient 注册客户端应用。
+// Bye 断开连系。
+// 无论数据是否传递完毕，都会结发送或接收。
+// 未完成数据传输的中途结束会返回一个错误，记录了一些基本信息。
 //
-func (th *Thread) RegisterClient(c Client) {
+func (c *Contact) Bye() error {
 	//
 }
 
 //
-// RegisterServer 注册服务端应用。
+// Receiver 接收器接口。
+// 它由发出请求的客户端应用实现。获取数据并处理。
 //
-func (th *Thread) RegisterServer(s Server) {
+type Receiver interface {
+	io.Writer
+}
+
+//
+// Dial 拨号目标地址。
+// 可以传入一个指定的本地接收地址，否则系统自动配置。
+// snd 参数可选。如果本地同时需要提供对端请求的数据，则可传递一个发送器。
+//
+func Dial(network string, laddr, raddr *DCPAddr, snd Sender) (*Contact, error) {
 	//
 }
 
 //
-// Serve 启动服务。
+// Sender 发送器接口。
+// 由提供数据服务的应用实现，
+// 返回的读取器读取完毕时表示数据体结束。
 //
-func (th *Thread) Serve(opt *Options) {
+type Sender interface {
+	// 参数为客户端请求的资源ID
+	// 可能是一个哈希序列，或一个特定格式的资源标识。
+	NewReader(res []byte) (io.Reader, error)
+}
+
+//
+// Listener 外部连系监听器。
+//
+type Listener struct {
+	//
+}
+
+//
+// Accept 接收外部连系请求。
+//
+func (l *Listener) Accept(snd Sender) (*Contact, error) {
+
+}
+
+//
+// Close 关闭本地监听。
+//
+func (l *Listener) Close() error {
+	//
+}
+
+//
+// Addr 返回本地监听地址。
+//
+func (l *Listener) Addr() net.Addr {
+	//
+}
+
+//
+// Listen 本地连系监听。
+// 返回的连系对象仅可用于断开连系。
+//
+func Listen(network string, laddr *DCPAddr) (*Listener, error) {
 	//
 }
