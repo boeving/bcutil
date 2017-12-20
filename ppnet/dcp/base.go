@@ -298,15 +298,6 @@ type Receiver interface {
 }
 
 //
-// Dial 拨号目标地址。
-// 可以传入一个指定的本地接收地址，否则系统自动配置。
-// snd 参数可选。如果本地同时需要提供对端请求的数据，则可传递一个发送器。
-//
-func Dial(network string, laddr, raddr *DCPAddr, snd Sender) (*Contact, error) {
-	//
-}
-
-//
 // Sender 发送器接口。
 // 由提供数据服务的应用实现，
 // 返回的读取器读取完毕时表示数据体结束。
@@ -315,6 +306,15 @@ type Sender interface {
 	// 参数为客户端请求的资源ID
 	// 可能是一个哈希序列，或一个特定格式的资源标识。
 	NewReader(res []byte) (io.Reader, error)
+}
+
+//
+// Dial 拨号目标地址。
+// 可以传入一个指定的本地接收地址，否则系统自动配置。
+// snd 参数可选。如果本地同时需要提供对端请求的数据，则可传递一个发送器。
+//
+func Dial(network string, laddr, raddr *DCPAddr, snd Sender) (*Contact, error) {
+	//
 }
 
 //

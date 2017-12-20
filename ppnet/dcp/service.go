@@ -22,6 +22,7 @@ type service struct {
 
 //
 // 把对端发送来的数据写入外部应用。
+// 通常是一个服务端响应客户端请求的返回数据。
 //
 func (s *service) WriteTo(w io.Writer) (int64, error) {
 	//
