@@ -10,9 +10,9 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #RCV         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
-//	| RPZ-  | MTU-  |R|M|S|R|B|R|B|E|               |               |
-//	| Extra | ANN/  |P|T|E|S|Y|T|E|N|  ACK distance | Send distance |
-//	| Size  | ACK   |Z|U|S|T|E|P|G|D|               |               |
+//	| RPZ-  | MTU-  |A|R|S|R|B|R|B|E|               |               |
+//	| Extra | ANN/  |S|S|E|S|Y|T|E|N|  ACK distance | Send distance |
+//	| Size  | ACK   |K|P|S|T|E|P|G|D|               |               |
 //	+-------------------------------+-------------------------------+
 //	|                      Session verify code                      |
 //	+---------------------------------------------------------------+
@@ -40,7 +40,8 @@ const (
 )
 
 var (
-	errExt2 = errors.New("value overflow, must be between 0-15")
+	errExt2    = errors.New("value overflow, must be between 0-15")
+	errNetwork = errors.New("bad network name between two DCPAddr")
 )
 
 //
@@ -231,65 +232,6 @@ type packet struct {
 }
 
 //
-// DCPAddr 地址封装。
-//
-type DCPAddr struct {
-	addr *net.UDPAddr
-}
-
-func (a *DCPAddr) Network() string {
-	return a.addr.Network()
-}
-
-func (a *DCPAddr) String() string {
-	return a.addr.String()
-}
-
-//
-// ResolveDCPAddr 解析生成地址。
-// network兼容 "dcp", "dcp4", "dcp6" 和 "udp", "udp4", "udp6"。
-//
-// 目前返回的实际上是一个UDP地址。
-//
-func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
-	switch network {
-	case "dcp":
-		network = "udp"
-	case "dcp4":
-		network = "udp4"
-	case "dcp6":
-		network = "udp6"
-	}
-	addr, err := net.ResolveUDPAddr(network, address)
-
-	return &DCPAddr{addr}, err
-}
-
-//
-// Contact 端点连系。
-// 负责一对端点连系的处理，接收客户端/服务器实例的注册。
-//
-type Contact struct {
-}
-
-//
-// Request 请求目标资源。
-// 通常必须传递一个接收器用于处理对端返回的数据。
-//
-func (c *Contact) Request(res []byte, r Receiver) error {
-	//
-}
-
-//
-// Bye 断开连系。
-// 无论数据是否传递完毕，都会结发送或接收。
-// 未完成数据传输的中途结束会返回一个错误，记录了一些基本信息。
-//
-func (c *Contact) Bye() error {
-	//
-}
-
-//
 // Receiver 接收器接口。
 // 它由发出请求的客户端应用实现。获取数据并处理。
 //
@@ -309,46 +251,37 @@ type Sender interface {
 }
 
 //
-// Dial 拨号目标地址。
-// 可以传入一个指定的本地接收地址，否则系统自动配置。
-// snd 参数可选。如果本地同时需要提供对端请求的数据，则可传递一个发送器。
+// DCPAddr 地址封装。
 //
-func Dial(network string, laddr, raddr *DCPAddr, snd Sender) (*Contact, error) {
-	//
+type DCPAddr struct {
+	net  string
+	addr *net.UDPAddr
+}
+
+func (d *DCPAddr) Network() string {
+	return d.addr.Network()
+}
+
+func (d *DCPAddr) String() string {
+	return d.addr.String()
 }
 
 //
-// Listener 外部连系监听器。
+// ResolveDCPAddr 解析生成地址。
+// network兼容 "dcp", "dcp4", "dcp6" 和 "udp", "udp4", "udp6"。
 //
-type Listener struct {
-	//
-}
+// 目前返回的实际上是一个UDP地址。
+//
+func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
+	switch network {
+	case "dcp":
+		network = "udp"
+	case "dcp4":
+		network = "udp4"
+	case "dcp6":
+		network = "udp6"
+	}
+	addr, err := net.ResolveUDPAddr(network, address)
 
-//
-// Accept 接收外部连系请求。
-//
-func (l *Listener) Accept(snd Sender) (*Contact, error) {
-
-}
-
-//
-// Close 关闭本地监听。
-//
-func (l *Listener) Close() error {
-	//
-}
-
-//
-// Addr 返回本地监听地址。
-//
-func (l *Listener) Addr() net.Addr {
-	//
-}
-
-//
-// Listen 本地连系监听。
-// 返回的连系对象仅可用于断开连系。
-//
-func Listen(network string, laddr *DCPAddr) (*Listener, error) {
-	//
+	return &DCPAddr{network, addr}, err
 }
