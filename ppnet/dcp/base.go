@@ -10,9 +10,9 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #RCV         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
-//	| RPZ-  | MTU-  |A|R|S|R|B|R|B|E|               |               |
-//	| Extra | ANN/  |S|S|E|S|Y|T|E|N|  ACK distance | Send distance |
-//	| Size  | ACK   |K|P|S|T|E|P|G|D|               |               |
+//	| RPZ-  | MTU-  |R|R|S|R|B|R|B|E|               |               |
+//	| Extra | ANN/  |E|S|E|S|Y|T|E|N|  ACK distance | Send distance |
+//	| Size  | ACK   |Q|P|S|T|E|P|G|D|               |               |
 //	+-------------------------------+-------------------------------+
 //	|                      Session verify code                      |
 //	+---------------------------------------------------------------+
@@ -59,8 +59,8 @@ const (
 	BYE                  // 断开连系
 	RST                  // 发送/会话重置
 	SES                  // 会话申请/更新
-	MTU                  // MTU通告/确认
-	RPZ                  // 重新组包
+	RSP                  // 响应（response）
+	REQ                  // 请求（request）
 )
 
 func (f flag) END() bool {
@@ -87,12 +87,12 @@ func (f flag) SES() bool {
 	return f&SES != 0
 }
 
-func (f flag) MTU() bool {
-	return f&MTU != 0
+func (f flag) RSP() bool {
+	return f&RSP != 0
 }
 
-func (f flag) RPZ() bool {
-	return f&RPZ != 0
+func (f flag) REQ() bool {
+	return f&REQ != 0
 }
 
 func (f flag) BEGEND() bool {
@@ -184,8 +184,7 @@ func (h *header) Decode(r io.Reader) error {
 	h.SndDst = buf[11]
 	h.Sess = binary.BigEndian.Uint32(buf[12:16])
 
-	// MTU置位才有效！
-	if h.Flag.MTU() && h.Ext2&0xf == 0xf {
+	if h.Ext2&0xf == 0xf {
 		err = h.mtuCustom(r)
 	}
 	return err
@@ -215,8 +214,7 @@ func (h *header) Encode() []byte {
 	buf[11] = h.SndDst
 	binary.BigEndian.PutUint32(buf[12:16], h.Sess)
 
-	// MTU置位才有效！
-	if h.Flag.MTU() && h.Ext2&0xf == 0xf {
+	if h.Ext2&0xf == 0xf {
 		binary.BigEndian.PutUint32(buf[16:20], h.mtuSz)
 		return buf[:]
 	}
@@ -227,8 +225,16 @@ func (h *header) Encode() []byte {
 // 数据报。
 //
 type packet struct {
-	Header  header
+	Header  *header
 	Payload []byte
+}
+
+func getPacket(conn *net.UDPConn) (*packet, net.Addr, error) {
+
+}
+
+func (p *packet) Bytes() []byte {
+	//
 }
 
 //
@@ -245,9 +251,9 @@ type Receiver interface {
 // 返回的读取器读取完毕时表示数据体结束。
 //
 type Sender interface {
-	// 参数为客户端请求的资源ID
-	// 可能是一个哈希序列，或一个特定格式的资源标识。
-	NewReader(res []byte) (io.Reader, error)
+	// res 为客户端请求资源的标识。
+	// addr 为远端地址。
+	NewReader(res []byte, addr net.Addr) (io.Reader, error)
 }
 
 //

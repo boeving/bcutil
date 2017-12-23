@@ -9,8 +9,13 @@ package dcp
 ///////////////////////////////////////////////////////////////////////////////
 
 import (
+	"errors"
 	"net"
 	"time"
+)
+
+var (
+	errOverflow = errors.New("exceeded the number of resource queries")
 )
 
 //
@@ -18,8 +23,9 @@ import (
 //
 type Client struct {
 	conn     *net.UDPConn
-	snd      Sender
 	lastTime time.Time
+	pool     map[uint16]Receiver
+	snd      Sender // 可选
 }
 
 //
@@ -37,7 +43,12 @@ func Dial(laddr, raddr *DCPAddr) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{udpc, nil, time.Now()}, nil
+	c := Client{
+		conn:     udpc,
+		lastTime: time.Now(),
+		pool:     make(map[uint16]Receiver),
+	}
+	return &c, nil
 }
 
 //
@@ -68,18 +79,28 @@ func (c *Client) RemoteAddr() net.Addr {
 
 //
 // Query 向服务端查询数据。
-// res 参数为目标数据的标识（哈希或格式化序列）。
+// 最多同时处理64k的目标查询，如果超出会返回errOverflow错误。
 //
-func (c *Client) Query(res []byte) error {
+//  res 为目标数据的标识（哈希或格式化序列）。
+//  rec 为外部接收器接口的实现。
+//
+func (c *Client) Query(res []byte, rec Receiver) error {
 	//
 }
 
 //
-// Receive 接收服务端发送来的数据。
+// 接收服务端发送来的数据。
 // 数据会写入到客户端应用（Reveiver实现者）。
 //
-func (c *Client) Receive(rec Receiver) (int64, error) {
+func (c *Client) receive(id uint16, data []byte) (int64, error) {
 	//
+}
+
+//
+// 清除处理完毕的接收器。
+//
+func (c *Client) remove(k uint16) {
+	delete(c.pool, k)
 }
 
 //
