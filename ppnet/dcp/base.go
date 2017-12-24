@@ -237,6 +237,10 @@ func (p *packet) Bytes() []byte {
 	//
 }
 
+func (p *packet) SendTo(conn *net.UDPConn) error {
+	//
+}
+
 //
 // Receiver 接收器接口。
 // 它由发出请求的客户端应用实现。获取数据并处理。
