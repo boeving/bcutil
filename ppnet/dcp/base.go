@@ -222,11 +222,22 @@ func (h *header) Encode() []byte {
 }
 
 //
+// 数据片。
+// 一个数据片即是一个已经分组好了的数据，
+// 它的大小受到MTU值的约束。
+//
+type piece []byte
+
+func (p piece) Size() int {
+	return len(p)
+}
+
+//
 // 数据报。
 //
 type packet struct {
 	Header  *header
-	Payload []byte
+	Payload piece
 }
 
 func getPacket(conn *net.UDPConn) (*packet, net.Addr, error) {
