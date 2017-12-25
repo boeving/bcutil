@@ -14,7 +14,7 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-
+/*
 	go func() {
 		//laddr, _ := net.ResolveUDPAddr("udp", ":7799")
 		//raddr, _ := net.ResolveUDPAddr("udp", "192.168.31.154:17799")
@@ -30,7 +30,7 @@ func main() {
 		var buf [10]byte
 		fmt.Println(conn.ReadFromUDP(buf[:]))
 	}()
-
+*/
 	listen(saddr)
 
 	fmt.Println("UDP Server Done!")
@@ -44,7 +44,12 @@ func listen(laddr *net.UDPAddr) {
 		log.Fatalln(err)
 	}
 
-	buf := make([]byte, 512)
+	raddr, _ := net.ResolveUDPAddr("udp", "192.168.31.24:17799")
+	if _, err := conn.WriteTo([]byte("Hai, I'm in Listening...\n\n"), raddr); err != nil {
+		log.Println(err)
+	}
+
+	buf := make([]byte, 128)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil || n == 0 {
