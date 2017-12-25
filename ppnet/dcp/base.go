@@ -8,7 +8,7 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #SND         |        Sequence number        |
 //	+-------------------------------+-------------------------------+
-//	|          Data ID #RCV         |     Acknowledgment number     |
+//	|          Data ID #ACk         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
 //	| RPZ-  | MTU-  |R|R|S|R|B|R|B|E|               |               |
 //	| Extra | ANN/  |E|S|E|S|Y|T|E|N|  ACK distance | Send distance |
@@ -106,6 +106,14 @@ func (f flag) RSTSES() bool {
 func (f *flag) Set(v flag) {
 	*f |= v
 }
+
+// MTU 基本值设置。
+const (
+	MTUBase     = 1 // 基础值
+	MTUBaseIPv6 = 2 // IPv6 基础值
+	MTUPPPoE    = 3 // PPPoE 拨号带宽
+	MTUEther    = 4 // 普通网卡
+)
 
 //
 // MTU 常用值定义。

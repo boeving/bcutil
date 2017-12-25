@@ -10,12 +10,14 @@ package dcp
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"time"
 )
 
 var (
 	errOverflow = errors.New("exceeded the number of resource queries")
+	errZero     = errors.New("no data for Query")
 )
 
 //
@@ -81,11 +83,36 @@ func (c *Client) RemoteAddr() net.Addr {
 // Query 向服务端查询数据。
 // 最多同时处理64k的目标查询，如果超出会返回errOverflow错误。
 //
-//  res 为目标数据的标识（哈希或格式化序列）。
-//  rec 为外部接收器接口的实现。
+//  name 数据名称。用于数据ID绑定，空串为有效值。
+//  res  目标数据的标识。
+//  rec  外部接收器接口的实现。
 //
-func (c *Client) Query(res []byte, rec Receiver) error {
+func (c *Client) Query(name string, res []byte, rec Receiver) error {
 	//
+}
+
+//
+// 字节序列名称。
+// 提取最多32字节数据，返回16进制表示串。
+//
+func (c *Client) bytesName(res []byte) string {
+	n := len(res)
+	if n > 32 {
+		n = 32
+	}
+	return fmt.Sprintf("%x", res[:n])
+}
+
+//
+// QueryBytes 数据查询。
+// 类似Query方法，但数据名称取res实参的前最多32字节为绑定。
+// res实参通常为哈希序列。
+//
+func (c *Client) QueryBytes(res []byte, rec Receiver) error {
+	if len(res) == 0 {
+		return errZero
+	}
+	return c.Query(c.bytesName(res), res, rec)
 }
 
 //
