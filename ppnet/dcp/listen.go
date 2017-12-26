@@ -14,88 +14,9 @@ package dcp
 ///////////////////////////////////////////////////////////////////////////////
 
 import (
-	"errors"
-	"io"
 	"net"
 	"time"
 )
-
-var (
-	errNoSender = errors.New("not set Sender handler")
-)
-
-//
-// Server 一个DCP子服务。
-// 处理一对端点（4元组）的数据发送（服务端）。
-// 即：一个对端对应一个服务实例。
-//
-type Server struct {
-	laddr, raddr net.Addr
-	snd          Sender
-	lastTime     time.Time
-}
-
-func newServer(laddr, raddr net.Addr) *Server {
-	return &Server{
-		laddr:    laddr,
-		raddr:    raddr,
-		snd:      nil,
-		lastTime: time.Now(),
-	}
-}
-
-//
-// String 服务器的字符串表示。
-// 格式：本地地址|对端地址（同Client）
-//
-func (s *Server) String() string {
-	return s.laddr.String() +
-		"|" +
-		s.raddr.String()
-}
-
-//
-// LocalAddr 返回本地端地址。
-//
-func (s *Server) LocalAddr() net.Addr {
-	return s.laddr
-}
-
-//
-// RemoteAddr 返回本地端地址。
-//
-func (s *Server) RemoteAddr() net.Addr {
-	return s.raddr
-}
-
-//
-// Register 设置响应服务。
-// 非并发安全，应当在Listener:Accept返回的最初时设置。
-// 注：
-// 如果需要根据不同的情况改变返回的读取器，应当在snd内部实现。
-// 比如针对不同的远端地址分别对待。
-//
-func (s *Server) Register(snd Sender) {
-	s.snd = snd
-}
-
-//
-// 获取响应，包内部使用。
-//
-func (s *Server) response(res []byte) (io.Reader, error) {
-	if s.snd == nil {
-		return nil, errNoSender
-	}
-	return s.snd.NewReader(res, s.raddr)
-}
-
-//
-// Bye 断开连系。
-// 主动通知客户端服务结束。
-//
-func (s *Server) Bye() error {
-	//
-}
 
 //
 // Listener 外部连系监听器。
@@ -134,12 +55,22 @@ func (l *Listener) Accept() (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		srv, old := l.pool.Select(l.laddr, raddr)
+		con, old := l.pool.Select(raddr)
 		if !old {
-			return srv, nil
+			return con, nil
 		}
-		go l.process(srv, pack)
+		go l.process(l.initContact(con), pack)
 	}
+}
+
+//
+// 监听模式下初始赋值。
+//
+func (l *Listener) initContact(cont *Contact) *Contact {
+	cont.conn = l.conn
+	cont.laddr = l.laddr
+	cont.listen = true
+	return cont
 }
 
 //
@@ -177,15 +108,31 @@ type srvPool map[string]*Server
 // 无论缓存中有无目标存在，都会返回一个有效的子服务实例。
 // 如果是新建服务，第二个参数为假。
 //
-func (p srvPool) Select(laddr, raddr net.Addr) (*Server, bool) {
+func (p srvPool) Select(raddr net.Addr) (*Contact, bool) {
 	kr := raddr.String()
 	if s, ok := p[kr]; ok {
 		return s, true
 	}
-	srv := newServer(laddr, raddr)
+	srv := p.newContact(raddr)
 	p[kr] = srv
 
 	return srv, false
+}
+
+//
+// 创建一个连系实例。
+// 注：仅生成部分成员数据，待外部补充完整。
+//
+func (p srvPool) newContact(raddr net.Addr) *Contact {
+	ch := make(chan *packet)
+
+	return &Contact{
+		raddr:    raddr,
+		lastTime: time.Now(),
+		pool:     make(map[uint16]*recvServ),
+		pch:      ch,
+		sendmgr:  newSendManager(ch),
+	}
 }
 
 //

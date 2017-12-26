@@ -30,8 +30,10 @@ package dcp
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"time"
 )
 
 const (
@@ -40,8 +42,11 @@ const (
 )
 
 var (
-	errExt2    = errors.New("value overflow, must be between 0-15")
-	errNetwork = errors.New("bad network name between two DCPAddr")
+	errExt2     = errors.New("value overflow, must be between 0-15")
+	errNetwork  = errors.New("bad network name between two DCPAddr")
+	errOverflow = errors.New("exceeded the number of resource queries")
+	errZero     = errors.New("no data for Query")
+	errNoSender = errors.New("not set Sender handler")
 )
 
 //
@@ -109,21 +114,23 @@ func (f *flag) Set(v flag) {
 
 // MTU 基本值设置。
 const (
-	MTUBase     = 1 // 基础值
-	MTUBaseIPv6 = 2 // IPv6 基础值
-	MTUPPPoE    = 3 // PPPoE 拨号带宽
-	MTUEther    = 4 // 普通网卡
+	MTUBase     = 1  // 基础值
+	MTUBaseIPv6 = 2  // IPv6 基础值
+	MTUPPPoE    = 3  // PPPoE 拨号带宽
+	MTUEther    = 4  // 普通网卡
+	MTUFull64k  = 14 // 本地64k窗口
 )
 
 //
 // MTU 常用值定义。
 //
 var mtuValue = map[uint8]uint32{
-	0: 0,    // 协商保持
-	1: 576,  // 基础值，起始轻启动
-	2: 1280, // 基础值2，IPv6默认包大小
-	3: 1492, // PPPoE链路大小
-	4: 1500, // 以太网络
+	0:  0,     // 协商保持
+	1:  576,   // 基础值，起始轻启动
+	2:  1280,  // 基础值2，IPv6默认包大小
+	3:  1492,  // PPPoE链路大小
+	4:  1500,  // 以太网络
+	14: 65535, // 本地最大窗口
 }
 
 //
@@ -276,7 +283,7 @@ type Receiver interface {
 type Sender interface {
 	// res 为客户端请求资源的标识。
 	// addr 为远端地址。
-	NewReader(res []byte, addr net.Addr) (io.Reader, error)
+	NewReader(res []byte) (io.Reader, error)
 }
 
 //
@@ -313,4 +320,176 @@ func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
 	addr, err := net.ResolveUDPAddr(network, address)
 
 	return &DCPAddr{network, addr}, err
+}
+
+/////////////
+// 实现注记
+// ========
+// 客户端：
+// - 数据ID生成，优先投递数据体首个分组（有序）；
+// - 启动并发的发送服务器servSend（如果还需要）；
+// - 创建并缓存接收服务器recvServ，用于对对端响应的接收；
+// - 视情况添加响应服务（若snd有效）；
+//
+// 服务端：
+// - 不可直接读取conn连接（由Listener代理调度）；
+// - 外部可像使用客户端一样向对端发送资源请求（Query...）；
+// - snd 成员必定存在（而客户端为可选）；
+//
+///////////////////////////////////////////////////////////////////////////////
+
+//
+// Contact 4元组两端连系。
+// DCP/P2P语境下的 Connection。
+//
+type Contact struct {
+	conn         *net.UDPConn         // 网络连接
+	laddr, raddr net.Addr             // 4元组
+	lastTime     time.Time            // 最近活跃
+	pool         map[uint16]*recvServ // 接收服务器池
+	begid        uint16               // 起始数据ID（交互期）
+	sendmgr      *sendManager         // 发送总管
+	snd          Sender               // 响应发送器
+	pch          chan *packet         // 数据报发送信道
+	listen       bool                 // 监听模式（Listener:Accept创建）
+}
+
+//
+// Dial 拨号连系。
+// 可以传入一个指定的本地接收地址，否则系统自动配置。
+// 返回的Contact实例处理一个4元组两端连系。
+// 通常由客户端逻辑调用。
+//
+func Dial(laddr, raddr *DCPAddr) (*Contact, error) {
+	n1 := laddr.net
+	n2 := raddr.net
+	if n1 != n2 {
+		return nil, errNetwork
+	}
+	udpc, err := net.DialUDP(n1, laddr.addr, raddr.addr)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan *packet)
+
+	c := Contact{
+		conn:     udpc,
+		laddr:    laddr.addr,
+		raddr:    raddr.addr,
+		lastTime: time.Now(),
+		pool:     make(map[uint16]*recvServ),
+		pch:      ch,
+		sendmgr:  newSendManager(ch),
+	}
+	return &c, nil
+}
+
+//
+// String 客户端的字符串表示。
+// 格式：本地地址|对端地址
+// 主要用于端点连接池里的索引和管理。
+//
+func (c *Contact) String() string {
+	return c.laddr.String() +
+		"|" +
+		c.raddr.String()
+}
+
+//
+// LocalAddr 返回本地端地址。
+//
+func (c *Contact) LocalAddr() net.Addr {
+	return c.laddr
+}
+
+//
+// RemoteAddr 返回本地端地址。
+//
+func (c *Contact) RemoteAddr() net.Addr {
+	return c.raddr
+}
+
+//
+// Register 设置响应服务。
+// 非并发安全，服务端应当在Listener:Accept返回的最初时设置。
+// 如果客户端（Dial者）也需提供响应服务，则通过此注册。
+//
+// 注记：
+// 它不从Accept上传入，以提供一种灵活性。如不同对端不同对待。
+//
+func (c *Contact) Register(snd Sender) {
+	c.snd = snd
+}
+
+//
+// Query 向服务端查询数据。
+// 最多同时处理64k的目标查询，超出会返回errOverflow错误。
+//
+//  name 数据名称。用于数据ID绑定，空串为有效值。
+//  res  目标数据的标识。
+//  rec  外部接收器接口的实现。
+//
+func (c *Contact) Query(name string, res []byte, rec Receiver) error {
+	//
+}
+
+//
+// 字节序列名称。
+// 提取最多32字节数据，返回16进制表示串。
+//
+func (c *Contact) bytesName(res []byte) string {
+	n := len(res)
+	if n > 32 {
+		n = 32
+	}
+	return fmt.Sprintf("%x", res[:n])
+}
+
+//
+// QueryBytes 数据查询。
+// 类似Query方法，但数据名称取res实参的前最多32字节为绑定。
+// res实参通常为哈希序列。
+//
+func (c *Contact) QueryBytes(res []byte, rec Receiver) error {
+	if len(res) == 0 {
+		return errZero
+	}
+	return c.Query(c.bytesName(res), res, rec)
+}
+
+//
+// StartID 设置起始数据ID。
+// 通常在会话申请或更新后被调用。其值用于下一个交互期。
+//
+func (c *Contact) StartID(rnd uint16) {
+	c.begid = rnd
+}
+
+//
+// 清除完成的接收服务器。
+// 当接收到一个End数据报并交付处理后，即可清除。
+//
+func (c *Contact) remove(k uint16) {
+	delete(c.pool, k)
+}
+
+//
+// 获取响应，包内部使用。
+//
+func (c *Contact) response(res []byte) (io.Reader, error) {
+	if c.snd == nil {
+		return nil, errNoSender
+	}
+	return c.snd.NewReader(res)
+}
+
+//
+// Bye 断开连系。
+// 无论数据是否传递完毕，都会结发送或接收。
+// 未完成数据传输的中途结束会返回一个错误，记录了一些基本信息。
+//
+// 对端可能是一个服务器，也可能是一个普通的客户端。
+//
+func (c *Contact) Bye() error {
+	//
 }

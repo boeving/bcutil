@@ -77,10 +77,23 @@ func (s *service) Checks(h *header) {
 //
 // 发送总管。
 // 通过信道获取各数据体Go程的数据报，按评估速率发送。
+// 各Go程的递送无顺序关系，因此实现并行的效果。
+//
+// 外部保证每个数据体的首个分组优先递送，
+// 因此高数据ID的数据体必然后发送，从而方便接收端判断是否丢包。
+//
+// 一个4元组两端连系对应一个本类实例。
 //
 type sendManager struct {
-	Ev rateEval       // 速率评估器
-	Ch <-chan *packet // 待发送数据报信道
+	Rev *rateEval      // 速率评估器
+	Pch <-chan *packet // 待发送数据报信道
+}
+
+func newSendManager(pch <-chan *packet) *sendManager {
+	return &sendManager{
+		Rev: newRateEval(),
+		Pch: pch,
+	}
 }
 
 //
