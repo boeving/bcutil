@@ -23,9 +23,9 @@ import (
 // 负责不同客户的服务器构造分配和数据传递。
 //
 type Listener struct {
-	conn  *net.UDPConn
-	pool  srvPool
+	conn  *connReader
 	laddr net.Addr
+	pool  map[string]*service
 }
 
 //
@@ -38,9 +38,9 @@ func Listen(laddr *DCPAddr) (*Listener, error) {
 		return nil, err
 	}
 	l := Listener{
-		conn:  udpc,
-		pool:  make(srvPool),
-		laddr: laddr,
+		conn:  &connReader{udpc},
+		laddr: laddr.addr,
+		pool:  make(map[string]*service),
 	}
 	return &l, nil
 }
@@ -49,28 +49,30 @@ func Listen(laddr *DCPAddr) (*Listener, error) {
 // Accept 接收外部连系请求。
 // 如果是一个新的对端，返回一个处理服务器。
 //
-func (l *Listener) Accept() (*Server, error) {
+func (l *Listener) Accept() (*Contact, error) {
 	for {
-		pack, raddr, err := getPacket(l.conn)
+		pack, raddr, err := l.conn.Receive()
 		if err != nil {
 			return nil, err
 		}
-		con, old := l.pool.Select(raddr)
-		if !old {
-			return con, nil
+		kr := raddr.String()
+		if srv, ok := l.pool[kr]; ok {
+			go srv.Post(pack)
+			continue
 		}
-		go l.process(l.initContact(con), pack)
-	}
-}
+		// 来自新的对端，新建连系
+		c := Contact{
+			laddr: l.laddr,
+			raddr: raddr,
+			serv:  newService(&connWriter{raddr, l.conn.Conn}, l.remove),
+			alive: time.Now(),
+			// rdsrv:  nil, // not needed.
+		}
+		l.pool[kr] = c.serv
+		go c.serv.Start().Post(pack)
 
-//
-// 监听模式下初始赋值。
-//
-func (l *Listener) initContact(cont *Contact) *Contact {
-	cont.conn = l.conn
-	cont.laddr = l.laddr
-	cont.listen = true
-	return cont
+		return &c, nil
+	}
 }
 
 //
@@ -88,68 +90,9 @@ func (l *Listener) Addr() net.Addr {
 }
 
 //
-// 数据报服务处理。
-// 管理底层的传输逻辑（service实现）。
-//
-func (l *Listener) process(s *Server, p *packet) {
-	//
-}
-
-//
-// 客户子服务池。
-// 用于Accept，决定是否生成新的子服务实例（否则直接调度）。
-// 它应当在客户初始连系时创建。
-// key: 对端地址
-//
-type srvPool map[string]*Server
-
-//
-// Select 选取远端对应的子服务。
-// 无论缓存中有无目标存在，都会返回一个有效的子服务实例。
-// 如果是新建服务，第二个参数为假。
-//
-func (p srvPool) Select(raddr net.Addr) (*Contact, bool) {
-	kr := raddr.String()
-	if s, ok := p[kr]; ok {
-		return s, true
-	}
-	srv := p.newContact(raddr)
-	p[kr] = srv
-
-	return srv, false
-}
-
-//
-// 创建一个连系实例。
-// 注：仅生成部分成员数据，待外部补充完整。
-//
-func (p srvPool) newContact(raddr net.Addr) *Contact {
-	ch := make(chan *packet)
-
-	return &Contact{
-		raddr:    raddr,
-		lastTime: time.Now(),
-		pool:     make(map[uint16]*recvServ),
-		pch:      ch,
-		sendmgr:  newSendManager(ch),
-	}
-}
-
-//
 // 移除一个远端连系。
 // 这可能在远端主动Bye之后发生，或本地主动清理。
 //
-func (p srvPool) Remove(raddr net.Addr) {
-	delete(p, raddr.String())
-}
-
-//
-// 清理总集中超时的子服务存储。
-// 这不是一个高效的方式，仅适用P2P端点的小连接池场景。
-//
-// 考虑效率，可能间断式执行检查。
-// 返回清理的条目数。
-//
-func (p srvPool) Clean(t time.Time) int {
-	//
+func (l *Listener) remove(raddr net.Addr) {
+	delete(l.pool, raddr.String())
 }

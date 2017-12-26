@@ -37,6 +37,7 @@ package dcp
 import (
 	"bufio"
 	"io"
+	"net"
 	"time"
 )
 
@@ -60,11 +61,40 @@ const (
 )
 
 //
-// service 底层DCP服务。
-// 一个4元组两端连系对应一个本类实例。
+// service DCP底层服务。
 //
 type service struct {
-	LineCaps int // 线路容量（数据报个数）
+	Sndx    *sendManager         // 发送总管
+	Pch     chan *packet         // 数据报发送信道
+	Recs    map[uint16]*recvServ // 接收服务池
+	NetCaps int                  // 线路容量（数据报个数）
+	clean   func(net.Addr)       // 断开清理（Listener）
+}
+
+func newService(w *connWriter, clean func(net.Addr)) *service {
+	ch := make(chan *packet)
+
+	return &service{
+		Sndx:    newSendManager(w, ch),
+		Pch:     ch,
+		Recs:    make(map[uint16]*recvServ),
+		NetCaps: 0,
+		clean:   clean,
+	}
+}
+
+//
+// 开始DCP服务。
+//
+func (s *service) Start() *service {
+	//
+}
+
+//
+// 递送数据报。
+//
+func (s *service) Post(pack *packet) {
+	//
 }
 
 //
@@ -85,14 +115,16 @@ func (s *service) Checks(h *header) {
 // 一个4元组两端连系对应一个本类实例。
 //
 type sendManager struct {
-	Rev *rateEval      // 速率评估器
-	Pch <-chan *packet // 待发送数据报信道
+	Conn *connWriter    // 数据报网络发送器
+	RE   *rateEval      // 速率评估器
+	Pch  <-chan *packet // 待发送数据报信道
 }
 
-func newSendManager(pch <-chan *packet) *sendManager {
+func newSendManager(w *connWriter, pch <-chan *packet) *sendManager {
 	return &sendManager{
-		Rev: newRateEval(),
-		Pch: pch,
+		Conn: w,
+		RE:   newRateEval(),
+		Pch:  pch,
 	}
 }
 
@@ -126,7 +158,9 @@ func (ss *servSend) Response(data []byte) error {
 
 //
 // 接收服务器。
-// 一个数据体对应一个本类实例。接收对端传输来的数据。
+// 接收对端传输来的数据（非直接读取网络接口）。
+// 一个数据体对应一个本类实例。
+//
 // 评估决策后的发送通过信道交由发送服务器执行。
 // - 根据应用的执行程度，确定进度的确认号。
 // - 根据对端发送距离的情况，决定是否重新发送确认。

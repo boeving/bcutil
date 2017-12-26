@@ -1,4 +1,4 @@
-// Package dcp 数据报控制协议（Datagram Control Protocol）。
+// Package dcp 数据报控制协议（datagram Control Protocol）。
 //
 // 基于UDP实现一个「完整数据」传送的逻辑，因此类似于文件，有边界。
 // 主要用于P2P的数据传输。
@@ -34,6 +34,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/qchen-zh/pputil/goes"
 )
 
 const (
@@ -42,11 +44,12 @@ const (
 )
 
 var (
-	errExt2     = errors.New("value overflow, must be between 0-15")
-	errNetwork  = errors.New("bad network name between two DCPAddr")
-	errOverflow = errors.New("exceeded the number of resource queries")
-	errZero     = errors.New("no data for Query")
-	errNoSender = errors.New("not set Sender handler")
+	errExt2      = errors.New("value overflow, must be between 0-15")
+	errNetwork   = errors.New("bad network name between two DCPAddr")
+	errOverflow  = errors.New("exceeded the number of resource queries")
+	errZero      = errors.New("no data for Query")
+	errResponser = errors.New("not set Responser handler")
+	errNoRAddr   = errors.New("no remote address")
 )
 
 //
@@ -237,34 +240,92 @@ func (h *header) Encode() []byte {
 }
 
 //
-// 数据片。
-// 一个数据片即是一个已经分组好了的数据，
-// 它的大小受到MTU值的约束。
-//
-type piece []byte
-
-func (p piece) Size() int {
-	return len(p)
-}
-
-//
 // 数据报。
 //
 type packet struct {
-	Header  *header
-	Payload piece
+	head *header
+	data []byte
 }
 
-func getPacket(conn *net.UDPConn) (*packet, net.Addr, error) {
-
-}
-
+//
+// Bytes 序列号为字节序列。
+//
 func (p *packet) Bytes() []byte {
 	//
 }
 
-func (p *packet) SendTo(conn *net.UDPConn) error {
+//
+// datagram 数据报处理器。
+// 面对网络套接字的简单接收和发送处理。
+//
+type datagram struct {
+	connReader          // 读取器
+	connWriter          // 写入器
+	Laddr      net.Addr // 本地地址
+}
+
+//
+// 网络连接读取器。
+//
+type connReader struct {
+	Conn *net.UDPConn
+}
+
+func (r *connReader) Receive() (*packet, net.Addr, error) {
 	//
+}
+
+func (r *connReader) Close() error {
+	return r.Conn.Close()
+}
+
+//
+// 网络连接写入器。
+//
+type connWriter struct {
+	Raddr net.Addr
+	Conn  *net.UDPConn
+}
+
+func (w *connWriter) Send(data *packet) (int, error) {
+	//
+}
+
+//
+// 简单读取服务。
+// 成功读取后将数据报（packet）发送给DCP服务器。
+// 外部可通过Stop.Exit()结束服务。
+//
+type servReader struct {
+	Read *connReader
+	Serv *service
+	Stop *goes.Stop
+}
+
+func newServReader(conn *net.UDPConn, srv *service) *servReader {
+	return &servReader{
+		Read: &connReader{conn},
+		Serv: srv,
+		Stop: goes.NewStop(),
+	}
+}
+
+//
+// 服务启动。
+// 应当在一个Go程中单独运行。
+//
+func (s *servReader) Serve() {
+	for {
+		pack, _, err := s.Read.Receive()
+		select {
+		case <-s.Stop.C:
+			return
+		default:
+		}
+		if err == nil {
+			go s.Serv.Post(pack)
+		}
+	}
 }
 
 //
@@ -276,14 +337,14 @@ type Receiver interface {
 }
 
 //
-// Sender 发送器接口。
+// Responser 发送器接口。
 // 由提供数据服务的应用实现，
 // 返回的读取器读取完毕时表示数据体结束。
 //
-type Sender interface {
+type Responser interface {
 	// res 为客户端请求资源的标识。
 	// addr 为远端地址。
-	NewReader(res []byte) (io.Reader, error)
+	GetReader(res []byte) (io.Reader, error)
 }
 
 //
@@ -332,9 +393,9 @@ func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
 // - 视情况添加响应服务（若snd有效）；
 //
 // 服务端：
-// - 不可直接读取conn连接（由Listener代理调度）；
+// - 不可直接读取conn连接（由Listener代理调度），仅用于写；
 // - 外部可像使用客户端一样向对端发送资源请求（Query...）；
-// - snd 成员必定存在（而客户端为可选）；
+// - resp 成员必定存在（而客户端为可选）；
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -343,15 +404,12 @@ func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
 // DCP/P2P语境下的 Connection。
 //
 type Contact struct {
-	conn         *net.UDPConn         // 网络连接
-	laddr, raddr net.Addr             // 4元组
-	lastTime     time.Time            // 最近活跃
-	pool         map[uint16]*recvServ // 接收服务器池
-	begid        uint16               // 起始数据ID（交互期）
-	sendmgr      *sendManager         // 发送总管
-	snd          Sender               // 响应发送器
-	pch          chan *packet         // 数据报发送信道
-	listen       bool                 // 监听模式（Listener:Accept创建）
+	laddr, raddr net.Addr    // 4元组
+	serv         *service    // DCP服务器
+	alive        time.Time   // 最近活跃（收/发）
+	begid        uint16      // 起始数据ID（交互期）
+	resp         Responser   // 响应发送器
+	rdsrv        *servReader // 读取服务器，可选
 }
 
 //
@@ -370,17 +428,19 @@ func Dial(laddr, raddr *DCPAddr) (*Contact, error) {
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan *packet)
+	srv := newService(&connWriter{raddr.addr, udpc}, nil)
 
 	c := Contact{
-		conn:     udpc,
-		laddr:    laddr.addr,
-		raddr:    raddr.addr,
-		lastTime: time.Now(),
-		pool:     make(map[uint16]*recvServ),
-		pch:      ch,
-		sendmgr:  newSendManager(ch),
+		laddr: laddr.addr,
+		raddr: raddr.addr,
+		serv:  srv,
+		alive: time.Now(),
+		rdsrv: newServReader(udpc, srv),
 	}
+
+	go c.serv.Start()  // DCP服务启动
+	go c.rdsrv.Serve() // 读取服务启动
+
 	return &c, nil
 }
 
@@ -417,8 +477,8 @@ func (c *Contact) RemoteAddr() net.Addr {
 // 注记：
 // 它不从Accept上传入，以提供一种灵活性。如不同对端不同对待。
 //
-func (c *Contact) Register(snd Sender) {
-	c.snd = snd
+func (c *Contact) Register(resp Responser) {
+	c.resp = resp
 }
 
 //
@@ -466,21 +526,13 @@ func (c *Contact) StartID(rnd uint16) {
 }
 
 //
-// 清除完成的接收服务器。
-// 当接收到一个End数据报并交付处理后，即可清除。
-//
-func (c *Contact) remove(k uint16) {
-	delete(c.pool, k)
-}
-
-//
 // 获取响应，包内部使用。
 //
 func (c *Contact) response(res []byte) (io.Reader, error) {
-	if c.snd == nil {
-		return nil, errNoSender
+	if c.resp == nil {
+		return nil, errResponser
 	}
-	return c.snd.NewReader(res)
+	return c.resp.GetReader(res)
 }
 
 //
@@ -491,5 +543,8 @@ func (c *Contact) response(res []byte) (io.Reader, error) {
 // 对端可能是一个服务器，也可能是一个普通的客户端。
 //
 func (c *Contact) Bye() error {
-	//
+	if c.rdsv != nil {
+		c.rdsv.Stop.Exit()
+	}
+	// ...
 }
