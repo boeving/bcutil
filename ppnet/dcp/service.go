@@ -104,6 +104,10 @@ func (s *service) Checks(h *header) {
 	//
 }
 
+func (s *service) Exit() error {
+	//
+}
+
 //
 // 发送总管。
 // 通过信道获取各数据体Go程的数据报，按评估速率发送。
@@ -327,11 +331,11 @@ type ratioCubic struct {
 // 注：渐近线在下。
 //
 // x 为横坐标变量，值应该在总量（rc.Total）之内。
-// 返回值为[0-1]之间的曲线纵坐标比率。
+// k 为一个缩放因子，值取1.0上下浮动。
 //
-func (rc *ratioCubic) UpIn(x float64) float64 {
+func (rc *ratioCubic) UpIn(x, k float64) float64 {
 	x /= rc.Total
-	return x * x * x
+	return x * x * x * k
 }
 
 //
@@ -339,9 +343,9 @@ func (rc *ratioCubic) UpIn(x float64) float64 {
 // 先快后慢，增量越来越少。渐进抵达上线。
 // 注：渐近线在上。
 //
-func (rc *ratioCubic) UpOUt(x float64) float64 {
+func (rc *ratioCubic) UpOUt(x, k float64) float64 {
 	x = x/rc.Total - 1
-	return x*x*x + 1
+	return (x*x*x + 1) * k
 }
 
 //
@@ -351,8 +355,8 @@ func (rc *ratioCubic) UpOUt(x float64) float64 {
 //
 // 返回值是一个负数（Y坐标原点以下）。
 //
-func (rc *ratioCubic) DownIn(x float64) float64 {
-	return -rc.UpIn(x)
+func (rc *ratioCubic) DownIn(x, k float64) float64 {
+	return -rc.UpIn(x, k)
 }
 
 //
@@ -360,42 +364,71 @@ func (rc *ratioCubic) DownIn(x float64) float64 {
 // 先快后慢，减量越来越少。向下渐进抵达基线。
 // UpOut的垂直镜像。
 //
-func (rc *ratioCubic) DownOut(x float64) float64 {
-	return -rc.UpOUt(x)
+func (rc *ratioCubic) DownOut(x, k float64) float64 {
+	return -rc.UpOUt(x, k)
 }
 
 //
-// 平滑速率。
-// 算法：Y(x) = C * (x) + Base
-// 参考：C: 0.4
+// 缓动速率。
+// 算法：Y(x) = Extent * Fn(x) + Base
 //
 // X：横坐标为预发送数据报个数。
 // Y：纵坐标为发包间隔时间（越长则越慢）。
 //
-type smoothRate struct {
-	Base      float64     // 基础值（接近线）
-	High, Low float64     // 上下限值
-	C         float64     // 算法常量
-	cubic     *ratioCubic // 曲线比率生成
+// Base 基线在过程中会被定时调整。
+//
+type easeRate struct {
+	Base time.Duration // 基础值（起点）
+
+	extent time.Duration // 变化幅容
+	cubic  *ratioCubic   // 比率曲线
 }
 
-func newSmoothRate() *smoothRate {
-	//
+func newEaseRate(total int, extent time.Duration) *easeRate {
+	return &easeRate{
+		extent: extent,
+		cubic:  ratioCubic{float64(total)},
+	}
 }
 
-func (s *smoothRate) Value(x int) float64 {
+//
+// 减速方向（时间增加）。
+// zoom 为缩放因子，即速率曲线方法中的 k 参数。
+// 慢减：先缓慢减速，越到后面减速越快。
+//
+// 适用于随发送距离增大而减速越快（指数退避）。
+//
+func (s *easeRate) SlowIn(x int, zoom float64) time.Duration {
 	//
 }
 
 //
-// 减速（时间增加）。
-// 算法：Y(x) = C * (x - K)^N + Base
+// 减速方向（时间增加）。
+// 快减：很快慢下来，越到后面减速越缓。
 //
-func (s *smoothRate) Down(x int) float64 {
+// 适用于丢包后的速率骤减，可配合较大的缩放因子（zoom）。
+//
+func (s *easeRate) SlowOut(x int, zoom float64) time.Duration {
 	//
 }
 
-func (s *smoothRate) Up(x int) float64 {
+//
+// 加速方向（时间减小）。
+// 慢加：先慢加速，越到后面加速越快。
+//
+// 适用于丢包减速后的速率恢复，前部衔接 SlowOut。
+//
+func (s *easeRate) FastIn(x int, zoom float64) time.Duration {
+	//
+}
+
+//
+// 加速方向（时间减小）。
+// 快加：先很快加速，越到后面加速越缓。
+//
+// 适用于发送距离减小快速恢复速率，渐进式靠拢基线。
+//
+func (s *easeRate) FastOut(x int, zoom float64) time.Duration {
 	//
 }
 

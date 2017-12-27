@@ -543,8 +543,8 @@ func (c *Contact) response(res []byte) (io.Reader, error) {
 // 对端可能是一个服务器，也可能是一个普通的客户端。
 //
 func (c *Contact) Bye() error {
-	if c.rdsv != nil {
-		c.rdsv.Stop.Exit()
+	if c.rdsrv != nil {
+		c.rdsrv.Stop.Exit()
 	}
-	// ...
+	return c.serv.Exit()
 }
