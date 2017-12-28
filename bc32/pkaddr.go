@@ -1,4 +1,4 @@
-package auth
+package bc32
 
 /////////////////
 // 公钥地址操作

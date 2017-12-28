@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package base32 专用于区块链地址的Base32编码。
-// 引用标准库encoding/base32源码，删除了其中Padding相关的代码（即不支持填充字符）。
-package base32
+// Package bc32 专用于区块链地址的base32编码。
+// 引用标准库encoding/base32源码，删除了其中Padding相关的代码（填充字符）。
+package bc32
 
 import (
 	"bytes"
