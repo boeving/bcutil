@@ -38,6 +38,7 @@ import (
 	"bufio"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -55,9 +56,8 @@ const (
 
 // 基本参数常量
 const (
-	dataFull   int64 = 256 * 1500           // 满载数据量，概略值
-	lostPacket       = 5 * baseRate         // 丢包减速量
-	baseLine         = 5 * time.Millisecond // 速率基准线。减速基底
+	lostPacket       = 4 * baseRate // 丢包减速量
+	dataFull   int64 = 256 * 1500   // 满载数据量（概略值）
 )
 
 //
@@ -213,17 +213,15 @@ type session struct {
 // 数据量：
 //  - 数据量越小，基准速率向慢（稳）。降低丢包评估重要性。
 //  - 数据量越大，基准速率趋快（急）。丢包评估越准确。
-// 因子变量：
+// 变量因子：
 //  1. 基线。即基准速率的自动调优值。
-//  2. 斜率。速率增幅，越接近基线则越慢。
-//  3. 跌幅。丢包之后的减速量（快减），拥塞响应。
+//  2. 跌幅。丢包之后的减速量（快减），拥塞响应。
 //
 type rateEval struct {
-	Rate     time.Duration // 动态速率
-	decline  time.Duration // 跌幅。丢包减速量
-	slope    int           // 斜率。速率增幅[100-0]%
-	dataSize int64         // 数据量
-	smth     *smoothRate   // 速率生成器
+	base     float64   // 动态速率
+	decline  float64   // 跌幅。丢包减速量
+	dataSize int64     // 数据量
+	smth     *easeRate // 速率生成器
 }
 
 //
@@ -233,9 +231,8 @@ type rateEval struct {
 //
 func newRateEval() *rateEval {
 	return &rateEval{
-		Rate:    baseLine,
-		decline: lostPacket,
-		slope:   100,
+		base:    float64(baseRate),
+		decline: float64(lostPacket),
 	}
 }
 
@@ -254,47 +251,16 @@ func (r *rateEval) Flow(size int64) {
 	if r.dataSize > dataFull {
 		r.dataSize = dataFull
 	}
-	r.Rate = r.flowRate(r.dataSize)
+	r.base *= r.ratioFlow(r.dataSize)
 }
 
 //
-// 数据量影响的最低基准速率。
-// 算法：基础速率 + 基准线的2倍
+// 数据量速率评估。
+// 分100个等级，按数据量不同返回不同的比率，影响基准速率。
+// 数据量越大，比率越小（时间间隔越小）。
 //
-const baseLong = baseRate + baseLine*2
-
-//
-// 数据量评估速率。
-// 按目标数据量与满载数据限度的千分比反比计算。
-// 数据量越大，则延长的时间越小。
-//
-// 值在全局基准线（baseLine）和最低基准速率（baseLong）之间变化。
-// 注：
-// 此处速率用间隔时间表示，值越高速率越慢。
-//
-func (r *rateEval) flowRate(amount int64) time.Duration {
-	pro := dataFull/amount - 1
-	var inc int64
-	if pro > 1000 {
-		inc = 1000
-	} else {
-		inc = pro % 1000
-	}
-	if inc == 0 {
-		if r.Rate < baseLine {
-			return baseLine
-		}
-		// 满载数据快速恢复
-		// 与基准线差量折半递减。
-		return r.Rate + (r.Rate-baseLine)/2
-	}
-	// 4个连续的小包交互降低一个基础值。
-	rate := r.Rate + baseRate*time.Duration(inc)/4000
-
-	if rate > baseLong {
-		return baseLong
-	}
-	return rate
+func (r *rateEval) ratioFlow(amount int64) float64 {
+	return float64(100+amount*100/dataFull) / 100
 }
 
 //
@@ -327,7 +293,7 @@ type ratioCubic struct {
 
 //
 // 递升-右下弧。
-// 从下线渐进向上，先慢后快，增量越来越多。
+// 从下渐进向上，先慢后快，增量越来越多。
 // 注：渐近线在下。
 //
 // x 为横坐标变量，值应该在总量（rc.Total）之内。
@@ -340,17 +306,17 @@ func (rc *ratioCubic) UpIn(x, k float64) float64 {
 
 //
 // 递升-左上弧。
-// 先快后慢，增量越来越少。渐进抵达上线。
+// 先快后慢，增量越来越少。向上抵达渐进抵。
 // 注：渐近线在上。
 //
-func (rc *ratioCubic) UpOUt(x, k float64) float64 {
+func (rc *ratioCubic) UpOut(x, k float64) float64 {
 	x = x/rc.Total - 1
 	return (x*x*x + 1) * k
 }
 
 //
 // 递减-右上弧。
-// 从上线渐进向下，先慢后快，减量越来越多。
+// 从上渐进向下，先慢后快，减量越来越多。
 // 注：UpIn的垂直镜像，渐近线在上。
 //
 // 返回值是一个负数（Y坐标原点以下）。
@@ -361,45 +327,67 @@ func (rc *ratioCubic) DownIn(x, k float64) float64 {
 
 //
 // 递减-左下弧。
-// 先快后慢，减量越来越少。向下渐进抵达基线。
+// 先快后慢，减量越来越少。向下抵达渐近线。
 // UpOut的垂直镜像。
 //
 func (rc *ratioCubic) DownOut(x, k float64) float64 {
-	return -rc.UpOUt(x, k)
+	return -rc.UpOut(x, k)
 }
 
 //
 // 缓动速率。
-// 算法：Y(x) = Extent * Fn(x) + Base
+// 算法：Y(x) = Extent * Fn(x) + base
+// 基准值会在整个发送进程中自适应调适，因此并发安全。
 //
 // X：横坐标为预发送数据报个数。
 // Y：纵坐标为发包间隔时间（越长则越慢）。
 //
-// Base 基线在过程中会被定时调整。
-//
 type easeRate struct {
-	Base time.Duration // 基础值（起点）
-
-	extent time.Duration // 变化幅容
-	cubic  *ratioCubic   // 比率曲线
+	base   float64     // 基准值，会被自适应微调。
+	extent float64     // 变化幅容
+	cubic  *ratioCubic // 比率曲线
+	mu     sync.Mutex  // 并发安全
 }
 
 func newEaseRate(total int, extent time.Duration) *easeRate {
 	return &easeRate{
-		extent: extent,
-		cubic:  ratioCubic{float64(total)},
+		extent: float64(extent),
+		cubic:  &ratioCubic{float64(total)},
 	}
 }
 
 //
+// Move 调整基准值（基线移动）。
+// v 是一个调整比率，应当在1.0附近波动。
+//
+func (s *easeRate) Move(v float64) {
+	s.mu.Lock()
+	s.base *= v
+	s.mu.Unlock()
+}
+
+//
+// Base 获取当前的基准值。
+//
+func (s *easeRate) Base() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Duration(s.base)
+}
+
+//
 // 减速方向（时间增加）。
-// zoom 为缩放因子，即速率曲线方法中的 k 参数。
+// zoom 为缩放因子，即速率曲线方法中的 k 参数，值越大效果越明显。
 // 慢减：先缓慢减速，越到后面减速越快。
 //
 // 适用于随发送距离增大而减速越快（指数退避）。
 //
 func (s *easeRate) SlowIn(x int, zoom float64) time.Duration {
-	//
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := s.cubic.UpIn(float64(x), zoom) * s.extent
+	return time.Duration(s.base + d)
 }
 
 //
@@ -409,7 +397,11 @@ func (s *easeRate) SlowIn(x int, zoom float64) time.Duration {
 // 适用于丢包后的速率骤减，可配合较大的缩放因子（zoom）。
 //
 func (s *easeRate) SlowOut(x int, zoom float64) time.Duration {
-	//
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := s.cubic.UpOut(float64(x), zoom) * s.extent
+	return time.Duration(s.base + d)
 }
 
 //
@@ -419,7 +411,11 @@ func (s *easeRate) SlowOut(x int, zoom float64) time.Duration {
 // 适用于丢包减速后的速率恢复，前部衔接 SlowOut。
 //
 func (s *easeRate) FastIn(x int, zoom float64) time.Duration {
-	//
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := s.cubic.DownIn(float64(x), zoom) * s.extent
+	return time.Duration(s.base + d)
 }
 
 //
@@ -429,17 +425,21 @@ func (s *easeRate) FastIn(x int, zoom float64) time.Duration {
 // 适用于发送距离减小快速恢复速率，渐进式靠拢基线。
 //
 func (s *easeRate) FastOut(x int, zoom float64) time.Duration {
-	//
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := s.cubic.DownOut(float64(x), zoom) * s.extent
+	return time.Duration(s.base + d)
 }
 
 //
-// 数据流控制。
+// 单元数据流。
 // 对应单个的数据体，缓存即将发送的数据。
 // 提供数据量大小用于速率评估。
 // 它同时用于客户端的请求发送和服务端的数据响应发送。
 //
 type flower struct {
-	data *bufio.Reader // 数据源
+	buf  *bufio.Reader // 数据源
 	size int64         // 剩余数据量
 }
 
@@ -452,14 +452,14 @@ func newFlower(r io.Reader, size int64) *flower {
 // 返回的切片大小可能小于目标大小（数据已经读取完）。
 //
 func (f *flower) Piece(size int) ([]byte, error) {
-	buf := make([]byte, size)
-	n, err := f.data.Read(buf)
+	b := make([]byte, size)
+	n, err := f.buf.Read(b)
 	f.size -= int64(n)
 
 	if err != nil {
 		f.size = 0
 	}
-	return buf[:n], err
+	return b[:n], err
 }
 
 //
