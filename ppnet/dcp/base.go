@@ -39,8 +39,8 @@ import (
 )
 
 const (
-	headBase = 16
-	mtuExtra = 4
+	headBase = 16 // 基础长度
+	mtuExtra = 4  // MTU扩展长度
 )
 
 var (

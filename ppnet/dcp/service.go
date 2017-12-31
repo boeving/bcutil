@@ -56,8 +56,11 @@ const (
 
 // 基本参数常量
 const (
-	lostPacket       = 2 * baseRate // 丢包速率跌幅
-	dataFull   int64 = 256 * 1500   // 满载数据量（概略值）
+	capRange        = 5 * baseRate // 变幅容度
+	lossFall        = 2 * baseRate // 丢包速率跌幅
+	lossStep        = 4            // 丢包一次的步进计数
+	lossLimit       = 5.0          // 丢包界限（待统计调优）
+	dataFull  int64 = 256 * 1500   // 满载数据量（概略值）
 )
 
 //
@@ -120,14 +123,14 @@ func (s *service) Exit() error {
 //
 type sendManager struct {
 	Conn *connWriter    // 数据报网络发送器
-	RE   *rateEval      // 速率评估器
+	Rate *rateEval      // 速率评估器
 	Pch  <-chan *packet // 待发送数据报信道
 }
 
 func newSendManager(w *connWriter, pch <-chan *packet) *sendManager {
 	return &sendManager{
 		Conn: w,
-		RE:   newRateEval(),
+		Rate: newRateEval(),
 		Pch:  pch,
 	}
 }
@@ -206,10 +209,8 @@ type session struct {
 
 //
 // 总速率评估。
-// 取各数据体实时发送距离、丢包情况和发送数据量综合评估。
-// 丢包：
-// 各数据体发送实例自行处理丢包重发，但会回馈一个信号。
-// 用以评估总体的速率决策。
+// 取各数据体实时发送距离和发送数据量评估基准速率。
+// 为全局发送总管提供发送速率依据。
 //
 // 距离：
 // 各数据体的发送距离回馈汇总，越小说明整体效率越好，
@@ -220,21 +221,64 @@ type session struct {
 // - 数据量越大，基准速率趋快（急）。丢包评估越准确。
 //
 type rateEval struct {
-	base     time.Duration   // 基准速率
-	mu       sync.Mutex      // base并发安全
-	dataSize int64           // 数据量
-	ease     *easeRate       // 速率生成器
-	dist     <-chan int      // 发送距离通知
-	loss     <-chan struct{} // 丢包信号
+	rate     time.Duration // 当前速率
+	base     float64       // 基准速率
+	mu       sync.Mutex    // base并发安全
+	dataSize int64         // 数据量
+	ease     easeRate      // 速率生成器
+	dist     <-chan int    // 发送距离通知
 }
 
 //
 // 新建一个评估器。
 // 其生命期通常与一个对端连系相关联，连系断开才结束。
-// er 为一个全局共享的速率生成器实例。
 //
-func newRateEval(er *easeRate) *rateEval {
-	return &rateEval{ease: er}
+// total 可能取3倍个体上限（255），以平缓曲线陡峭度。
+//
+func newRateEval(total float64, dch <-chan int) *rateEval {
+	return &rateEval{
+		rate: baseRate,
+		base: float64(baseRate),
+		ease: newEaseRate(total),
+		dist: dch,
+	}
+}
+
+//
+// 获取基准速率值。
+// 主要供各数据体的发送进程参考。
+//
+func (r *rateEval) Base() float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.base
+}
+
+//
+// 启动评估服务。
+// 评估是一个持续的过程，参考各数据体发送来的发送距离评估当前的基准速率。
+// 注：数据量对基准速率的影响由外部调用产生。
+//
+func (r *rateEval) Serve(zoom float64) {
+	var d float64
+	for {
+		d += float64(<-r.dist)
+		d /= 2 // 平均
+		r.mu.Lock()
+		r.rate += r.ease.Send(d, r.base, float64(capRange), zoom)
+		r.rate /= 2 // 平均
+		r.mu.Unlock()
+		//
+	}
+}
+
+//
+// 获取当前的发送速率。
+//
+func (r *rateEval) Rate() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rate
 }
 
 //
@@ -243,6 +287,7 @@ func newRateEval(er *easeRate) *rateEval {
 // 数据量因子表达的是起始传输的持续性，故无减小逻辑。
 //
 // 通常，每发送一个数据报就会调用一次。size应当非负。
+// 并发安全。
 //
 func (r *rateEval) Flow(size int64) {
 	if r.dataSize >= dataFull {
@@ -252,33 +297,25 @@ func (r *rateEval) Flow(size int64) {
 	if r.dataSize > dataFull {
 		r.dataSize = dataFull
 	}
-	r.ease.Move(r.ratioFlow(r.dataSize))
+	r.mu.Lock()
+	r.base += r.ratioFlow(r.dataSize)
+	r.mu.Unlock()
 }
 
 //
 // 数据量速率评估。
-// 分100个等级，按数据量不同返回不同的比率，影响基准速率。
-// 数据量越大，比率越小（时间间隔越小）。
+// 返回一个基础速率的增减量（-0.4 ~ 0.6倍）。
+// 共分100个等级，数据量越大，返回值越小。
+// 注：
+// [-0.4~0.6] 是一个直觉估值，待测试调优。
+// 大概情形为：如果初始数据就较大，则趋快（先减），否则趋慢。
 //
 func (r *rateEval) ratioFlow(amount int64) float64 {
-	return float64(100+amount*100/dataFull) / 100
-}
-
-//
-// 确认距离影响。
-// 每收到一个确认调用一次。
-//
-func (r *rateEval) DistAck(uint8) {
-	//
-}
-
-//
-// 发送距离影响。
-// 距离越大越慢，反之则越快，影响斜率成员。
-// 每发送一个数据报调用一次。
-//
-func (r *rateEval) DistSend(uint8) {
-	//
+	v := -0.4
+	if amount < dataFull {
+		v = 0.6 - float64(amount*100/dataFull)/100
+	}
+	return v * float64(baseRate)
 }
 
 //
@@ -325,40 +362,110 @@ func (f *flower) Size() int64 {
 //
 // 评估速率。
 // 注：不含初始段的匀速（无评估参考）。
-// 每一个数据体发送实例包含一个本类实例，自我管理发送和休眠。
+// 参考全局基准速率计算自身的发送速率和休眠。
+// 每一个数据体发送实例包含一个本类实例。
 //
 // 距离：
 // - 发送距离越大，是因为对方确认慢，故减速。
 // - 确认距离越大，丢包概率越大，故减速。
 //
 // 参考：
-// 1. 基线。即基准速率的自动调优值。
+// 1. 基线。即全局的基准速率。
 // 2. 跌幅。丢包之后的减速量（快减），拥塞响应。
 //
 type evalRate struct {
-	fall float64         // 丢包减速量
-	ease *easeRate       // 速率生成器
-	base *rateEval       // 基准评估（全局）
-	dist chan<- int      // 发送距离通知
-	loss chan<- struct{} // 丢包通知（确认距离相关）
+	*lossRate            // 丢包速率评估器
+	Zoom      float64    // 发送曲线缩放因子
+	Ease      easeRate   // 曲线速率生成
+	Dist      chan<- int // 发送距离通知
 }
 
 //
-// 确认距离影响。
-// 距离越大，丢包概率越大。减速。
-// 每收到一个确认调用一次。
+// 计算发送速率。
+// 对外传递当前发送距离，评估即时速率。
+// d 为发送距离（0-255，已去除初始网络容量段）。
 //
-func (e *evalRate) DistAck(d uint8) {
-	//
-}
-
-//
-// 发送距离影响。
-// 距离变大是因为对方确认变慢。减速。
 // 每发送一个数据报调用一次。
 //
-func (e *evalRate) DistSend(d uint8) {
-	//
+func (e *evalRate) Rate(d, base float64) time.Duration {
+	e.Dist <- int(d) // 阻塞，受评估服务影响。
+
+	if e.Lost() {
+		return e.lossRate.Rate(d, base)
+	}
+	return e.Ease.Send(d, base, e.Zoom, float64(capRange))
+}
+
+//
+// 丢包速率评估器。
+//
+type lossRate struct {
+	Zoom float64    // 丢包曲线缩放因子
+	Ease easeRate   // 曲线速率生成
+	fall float64    // 丢包跌幅累加
+	loss int        // 丢包计步累加
+	mu   sync.Mutex // 丢包评估分离
+}
+
+//
+// 新建一个实例。
+// 丢包跌幅累计初始化为基础变幅容度。
+//
+func newLossRate(ease easeRate, zoom float64) *lossRate {
+	return &lossRate{
+		Ease: ease,
+		Zoom: zoom,
+		fall: float64(capRange),
+	}
+}
+
+//
+// 是否为丢包模式。
+//
+func (l *lossRate) Lost() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.loss > 0
+}
+
+//
+// 丢包评估。
+// 确认距离越大，丢包概率越大。
+// 速率越低，容忍的确认距离越小，反之越大。
+// d 为确认距离。
+//
+// 每收到一个确认调用一次。
+// 返回true表示一次丢包发生。
+//
+func (l *lossRate) Eval(d, base float64) bool {
+	// 速率关系
+	v := base / float64(baseRate)
+	// 距离关系
+	if d*v < lossLimit {
+		return false
+	}
+	l.mu.Lock()
+	l.loss += lossStep
+	l.fall += float64(lossFall)
+	l.mu.Unlock()
+
+	return true
+}
+
+//
+// 丢包阶段速率。
+// 丢包之后的速率为快减方式：先快后缓。
+// d 为发送距离。
+//
+func (l *lossRate) Rate(d, base float64) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.loss--
+	if l.loss <= 0 {
+		l.fall = float64(capRange)
+	}
+	return l.Ease.Loss(d, base, l.fall, l.Zoom)
 }
 
 //
@@ -369,72 +476,39 @@ func (e *evalRate) DistSend(d uint8) {
 // Y：纵坐标为发包间隔时间（越长则越慢）。
 //
 type easeRate struct {
-	hext  float64     // 变幅容量（慢速区）
-	lext  float64     // 变幅容量（高速区）
-	zoom  float64     // 缩放因子（k）
-	cubic *ratioCubic // 比率曲线
+	ratioCubic
 }
 
 //
 // 新建一个速率生成器。
 // total 为总距离，是速率曲线的基础值。
-// zoom 为缩放因子，通常为1.0。
-// hext 和 lext 分别为上下速率变化幅度容量。
 //
-func newEaseRate(total int, hext, lext time.Duration, zoom float64) *easeRate {
-	return &easeRate{
-		hext:  float64(hext),
-		lext:  float64(lext),
-		zoom:  zoom,
-		cubic: &ratioCubic{float64(total)},
-	}
+func newEaseRate(total float64) easeRate {
+	return easeRate{ratioCubic{total}}
 }
 
 //
-// 减速方向（时间增加）。
-// 慢减：先缓慢减速，越到后面减速越快。
+// 正常发送速率。
+// 慢减：先缓慢减速，越到后面减速越快（指数退避）。
 //
-// 适用于随发送距离增大而减速越快（指数退避）。
+// x 为发送距离，直接对应发送速率。
+// base 为基准速率（间隔时长）。
+// cap 为速率降低的幅度容量。
+// zoom 为缩放因子（比率曲线中的 k）。
 //
-func (s *easeRate) SlowIn(x int, base float64) time.Duration {
+func (s easeRate) Send(x, base, cap, zoom float64) time.Duration {
 	return time.Duration(
-		base + s.cubic.UpIn(float64(x), s.zoom)*s.hext,
+		base + s.UpIn(x, zoom)*cap,
 	)
 }
 
 //
-// 减速方向（时间增加）。
+// 丢包后发送速率。
 // 快减：很快慢下来，越到后面减速越缓。
 //
-// 适用于丢包后的速率骤减，可配合较大的缩放因子（zoom）。
-//
-func (s *easeRate) SlowOut(x int, base float64) time.Duration {
+func (s easeRate) Loss(x, base, cap, zoom float64) time.Duration {
 	return time.Duration(
-		base + s.cubic.UpOut(float64(x), s.zoom)*s.hext,
-	)
-}
-
-//
-// 加速方向（时间减小）。
-// 慢加：先慢加速，越到后面加速越快。
-//
-// 适用于丢包减速后的速率恢复，前部衔接 SlowOut。
-//
-func (s *easeRate) FastIn(x int, base float64) time.Duration {
-	return time.Duration(
-		base + s.cubic.DownIn(float64(x), s.zoom)*s.lext,
-	)
-}
-
-//
-// 加速方向（时间减小）。
-// 快加：先很快加速，越到后面加速越缓。
-//
-// 适用于发送距离减小快速恢复速率，渐进式靠拢基线。
-//
-func (s *easeRate) FastOut(x int, base float64) time.Duration {
-	return time.Duration(
-		base + s.cubic.DownOut(float64(x), s.zoom)*s.lext,
+		base + s.UpOut(x, zoom)*cap,
 	)
 }
 
@@ -450,44 +524,24 @@ type ratioCubic struct {
 }
 
 //
-// 递升-右下弧。
+// 慢升-右下弧。
 // 从下渐进向上，先慢后快，增量越来越多。
 // 注：渐近线在下。
 //
 // x 为横坐标变量，值应该在总量（rc.Total）之内。
 // k 为一个缩放因子，值取1.0上下浮动。
 //
-func (rc *ratioCubic) UpIn(x, k float64) float64 {
+func (rc ratioCubic) UpIn(x, k float64) float64 {
 	x /= rc.Total
 	return x * x * x * k
 }
 
 //
-// 递升-左上弧。
-// 先快后慢，增量越来越少。向上抵达渐进抵。
+// 快升-左上弧。
+// 先快后慢，增量越来越少。向上抵达渐进线。
 // 注：渐近线在上。
 //
-func (rc *ratioCubic) UpOut(x, k float64) float64 {
+func (rc ratioCubic) UpOut(x, k float64) float64 {
 	x = x/rc.Total - 1
 	return (x*x*x + 1) * k
-}
-
-//
-// 递减-右上弧。
-// 从上渐进向下，先慢后快，减量越来越多。
-// 注：UpIn的垂直镜像，渐近线在上。
-//
-// 返回值是一个负数（Y坐标原点以下）。
-//
-func (rc *ratioCubic) DownIn(x, k float64) float64 {
-	return -rc.UpIn(x, k)
-}
-
-//
-// 递减-左下弧。
-// 先快后慢，减量越来越少。向下抵达渐近线。
-// UpOut的垂直镜像。
-//
-func (rc *ratioCubic) DownOut(x, k float64) float64 {
-	return -rc.UpOut(x, k)
 }
