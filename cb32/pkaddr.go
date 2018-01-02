@@ -1,4 +1,4 @@
-package bc32
+package cb32
 
 /////////////////
 // 公钥地址操作
@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/qchen-zh/pputil/base58"
+	"github.com/qchen-zh/pputil/cmd/base58gen/base58"
 )
 
 // ErrChecksum 地址校验和验证不合格。

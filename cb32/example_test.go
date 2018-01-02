@@ -4,7 +4,7 @@
 
 // Keep in sync with ../base64/example_test.go.
 
-package bc32_test
+package cb32_test
 
 import (
 	"encoding/base32"

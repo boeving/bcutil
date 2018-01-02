@@ -1,4 +1,4 @@
-package bc32_test
+package cb32_test
 
 import (
 	"testing"
