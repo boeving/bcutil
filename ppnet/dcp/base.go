@@ -10,9 +10,9 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #ACk         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
-//	| RPZ-  | MTU-  |R|R|S|R|B|R|B|E|               |               |
-//	| Extra | ANN/  |E|S|E|S|Y|T|E|N|  ACK distance | Send distance |
-//	| Size  | ACK   |Q|P|S|T|E|P|G|D|               |               |
+//	| RPZ-  | MTU-  |.|R|S|R|B|R|B|E|               |               |
+//	| Extra | ANN/  |.|E|E|S|Y|T|E|N|  ACK distance | Send distance |
+//	| Size  | ACK   |.|Q|S|T|E|P|G|D|               |               |
 //	+-------------------------------+-------------------------------+
 //	|                      Session verify code                      |
 //	+---------------------------------------------------------------+
@@ -67,7 +67,6 @@ const (
 	BYE                  // 断开连系
 	RST                  // 发送/会话重置
 	SES                  // 会话申请/更新
-	RSP                  // 响应（response）
 	REQ                  // 请求（request）
 )
 
@@ -93,10 +92,6 @@ func (f flag) RST() bool {
 
 func (f flag) SES() bool {
 	return f&SES != 0
-}
-
-func (f flag) RSP() bool {
-	return f&RSP != 0
 }
 
 func (f flag) REQ() bool {

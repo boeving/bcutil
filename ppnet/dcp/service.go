@@ -37,9 +37,12 @@ package dcp
 import (
 	"bufio"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/qchen-zh/pputil/goes"
 )
 
 // 基础常量设置。
@@ -56,11 +59,12 @@ const (
 
 // 基本参数常量
 const (
-	capRange        = 5 * baseRate // 变幅容度
-	lossFall        = 2 * baseRate // 丢包速率跌幅
-	lossStep        = 4            // 丢包一次的步进计数
-	lossLimit       = 5.0          // 丢包界限（待统计调优）
-	dataFull  int64 = 256 * 1500   // 满载数据量（概略值）
+	capRange          = 5 * baseRate // 变幅容度
+	lossFall          = 2 * baseRate // 丢包速率跌幅
+	lossStep          = 4            // 丢包一次的步进计数
+	lossLimit         = 5.0          // 丢包界限（待统计调优）
+	lossRecover       = 12           // 丢包恢复滴答数（d值）
+	dataFull    int64 = 256 * 1500   // 满载数据量（概略值）
 )
 
 //
@@ -209,38 +213,52 @@ type session struct {
 
 //
 // 总速率评估。
-// 取各数据体实时发送距离和发送数据量评估基准速率。
 // 为全局发送总管提供发送速率依据。
+// 发送数据量影响基准速率，各数据体发送距离的增减量影响当前速率。
 //
 // 距离：
-// 各数据体的发送距离回馈汇总，越小说明整体效率越好，
-// 此距离作为总速率的评估因子。
+// 各数据体的发送距离增减量累计，越小说明整体效率越好。
+// 但距离增减量累计不能体现初始的发送距离。
+//
+// 丢包：
+// 各数据体评估丢包后会发送一个通知，用于发送总管评估调整基准速率。
+// 这通常是由于初始发送的速率就偏高。
+// 注：距离增减量因子无法体现初始发送速率影响，由此弥补。
 //
 // 数据量：
-// - 数据量越小，基准速率向慢（稳）。降低丢包评估重要性。
-// - 数据量越大，基准速率趋快（急）。丢包评估越准确。
+// - 数据量越小，基准速率向慢趋稳。降低丢包评估重要性。
+// - 数据量越大，基准速率趋快愈急。丢包评估更准确。
 //
 type rateEval struct {
-	rate     time.Duration // 当前速率
-	base     float64       // 基准速率
-	mu       sync.Mutex    // base并发安全
-	dataSize int64         // 数据量
-	ease     easeRate      // 速率生成器
-	dist     <-chan int    // 发送距离通知
+	rate      time.Duration   // 当前速率
+	base      float64         // 基准速率
+	downRatio float64         // 丢包下降比率
+	mu        sync.Mutex      // base并发安全
+	dataSize  int64           // 数据量
+	ease      easeRate        // 速率生成器
+	dist      <-chan int      // 发送距离增减量（负为减）
+	loss      <-chan struct{} // 丢包通知
 }
 
 //
 // 新建一个评估器。
 // 其生命期通常与一个对端连系相关联，连系断开才结束。
 //
-// total 可能取3倍个体上限（255），以平缓曲线陡峭度。
+// total 是一个待调优的估计值，可能取1.5倍个体上限（255）。
+// 该值越大，随着距离增大的速率曲线越平缓。
 //
-func newRateEval(total float64, dch <-chan int) *rateEval {
+// down 为每一次丢包基准速率线性下降的比率，可能取 0.06-0.1。
+//
+// dch 与所有数据体发送实例共享（一对连系），收集相关信息。
+// 通常为一个有缓存大小的信道。
+//
+func newRateEval(total, down float64, dch <-chan int) *rateEval {
 	return &rateEval{
-		rate: baseRate,
-		base: float64(baseRate),
-		ease: newEaseRate(total),
-		dist: dch,
+		rate:      baseRate,
+		base:      float64(baseRate),
+		ease:      newEaseRate(total),
+		downRatio: down,
+		dist:      dch,
 	}
 }
 
@@ -256,19 +274,67 @@ func (r *rateEval) Base() float64 {
 
 //
 // 启动评估服务。
-// 评估是一个持续的过程，参考各数据体发送来的发送距离评估当前的基准速率。
-// 注：数据量对基准速率的影响由外部调用产生。
+// 包含距离增减量因子和丢包信息。
+// 评估是一个持续的过程，由外部读取当前评估结果。
 //
-func (r *rateEval) Serve(zoom float64) {
+// 可通过返回的stop中途中断评估服务（然后以不同的zoom重启）。
+// 注意最好只有一个服务在运行。
+//
+// 数据量对基准速率的影响由外部调用产生。
+//
+func (r *rateEval) Serve(zoom float64) *goes.Stop {
+	stop := goes.NewStop()
+
+	go r.lossEval(stop)
+	go r.distEval(zoom, stop)
+
+	return stop
+}
+
+//
+// 评估丢包影响。
+// 随着丢包次数越多，基准速率线性下降。
+// 但随着时间移动，基准速率会慢慢恢复。
+//
+// 下降为缓线性，恢复为缓正弦曲线（渐近式）。
+// 最终恢复到的基准值是一个自适应的值：低丢包率同时尽量快。
+// 即：频率最高的折返点。
+// 注：统计值采用100μs精度。
+//
+func (r *rateEval) lossEval(stop *goes.Stop) {
+	//
+}
+
+//
+// 恢复：正弦曲线。
+// x 值为当前滴答数。
+// d 值为全局设置 lossRecover。
+//
+func (r *rateEval) sineUp(x, d float64) float64 {
+	if x >= d {
+		return 1
+	}
+	return math.Sin(x / d * (math.Pi / 2))
+}
+
+//
+// 评估距离增减量影响（当前速率）。
+// 参考各数据体发送来的发送距离增减量评估当前速率。
+//
+// 各数据体在自我休眠（发送间隔）前应当先传递距离数据。
+//
+func (r *rateEval) distEval(zoom float64, stop *goes.Stop) {
 	var d float64
 	for {
-		d += float64(<-r.dist)
-		d /= 2 // 平均
+		select {
+		case <-stop.C:
+			return
+		case v := <-r.dist:
+			d += float64(v)
+		}
 		r.mu.Lock()
 		r.rate += r.ease.Send(d, r.base, float64(capRange), zoom)
-		r.rate /= 2 // 平均
 		r.mu.Unlock()
-		//
 	}
 }
 
@@ -298,31 +364,29 @@ func (r *rateEval) Flow(size int64) {
 		r.dataSize = dataFull
 	}
 	r.mu.Lock()
-	r.base += r.ratioFlow(r.dataSize)
+	r.base += r.ratioFlow(r.dataSize) * float64(baseRate)
 	r.mu.Unlock()
 }
 
 //
 // 数据量速率评估。
-// 返回一个基础速率的增减量（-0.4 ~ 0.6倍）。
+// 返回一个基础速率的增减比率（-0.4 ~ 0.6）。
 // 共分100个等级，数据量越大，返回值越小。
 // 注：
 // [-0.4~0.6] 是一个直觉估值，待测试调优。
 // 大概情形为：如果初始数据就较大，则趋快（先减），否则趋慢。
 //
 func (r *rateEval) ratioFlow(amount int64) float64 {
-	v := -0.4
-	if amount < dataFull {
-		v = 0.6 - float64(amount*100/dataFull)/100
+	if amount >= dataFull {
+		return -0.4
 	}
-	return v * float64(baseRate)
+	return 0.6 - float64(amount*100/dataFull)/100
 }
 
 //
 // 单元数据流。
 // 对应单个的数据体，缓存即将发送的数据。
 // 提供数据量大小用于速率评估。
-// 它同时用于客户端的请求发送和服务端的数据响应发送。
 //
 type flower struct {
 	buf  *bufio.Reader // 数据源
@@ -378,43 +442,52 @@ type evalRate struct {
 	Zoom      float64    // 发送曲线缩放因子
 	Ease      easeRate   // 曲线速率生成
 	Dist      chan<- int // 发送距离通知
+	prev      int        // 前一个发送距离暂存
 }
 
 //
 // 计算发送速率。
 // 对外传递当前发送距离，评估即时速率。
-// d 为发送距离（0-255，已去除初始网络容量段）。
+// d 为发送距离（1-255）。
 //
 // 每发送一个数据报调用一次。
 //
-func (e *evalRate) Rate(d, base float64) time.Duration {
-	e.Dist <- int(d) // 阻塞，受评估服务影响。
+func (e *evalRate) Rate(d int, base float64) time.Duration {
+	if e.prev == 0 {
+		e.prev = d
+	}
+	// 可能阻塞（很难）
+	// 传递相对增减量更合适。
+	e.Dist <- int(d - e.prev)
+	e.prev = d
 
 	if e.Lost() {
-		return e.lossRate.Rate(d, base)
+		return e.lossRate.Rate(float64(d), base)
 	}
-	return e.Ease.Send(d, base, e.Zoom, float64(capRange))
+	return e.Ease.Send(float64(d), base, e.Zoom, float64(capRange))
 }
 
 //
 // 丢包速率评估器。
 //
 type lossRate struct {
-	Zoom float64    // 丢包曲线缩放因子
-	Ease easeRate   // 曲线速率生成
-	fall float64    // 丢包跌幅累加
-	loss int        // 丢包计步累加
-	mu   sync.Mutex // 丢包评估分离
+	Zoom float64         // 丢包曲线缩放因子
+	Ease easeRate        // 曲线速率生成
+	Loss chan<- struct{} // 丢包通知信道
+	fall float64         // 丢包跌幅累加
+	lost int             // 丢包计步累加
+	mu   sync.Mutex      // 丢包评估分离
 }
 
 //
 // 新建一个实例。
 // 丢包跌幅累计初始化为基础变幅容度。
 //
-func newLossRate(ease easeRate, zoom float64) *lossRate {
+func newLossRate(ease easeRate, zoom float64, loss chan<- struct{}) *lossRate {
 	return &lossRate{
 		Ease: ease,
 		Zoom: zoom,
+		Loss: loss,
 		fall: float64(capRange),
 	}
 }
@@ -425,7 +498,7 @@ func newLossRate(ease easeRate, zoom float64) *lossRate {
 func (l *lossRate) Lost() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.loss > 0
+	return l.lost > 0
 }
 
 //
@@ -444,8 +517,10 @@ func (l *lossRate) Eval(d, base float64) bool {
 	if d*v < lossLimit {
 		return false
 	}
+	l.Loss <- struct{}{}
+
 	l.mu.Lock()
-	l.loss += lossStep
+	l.lost += lossStep
 	l.fall += float64(lossFall)
 	l.mu.Unlock()
 
@@ -461,8 +536,8 @@ func (l *lossRate) Rate(d, base float64) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.loss--
-	if l.loss <= 0 {
+	l.lost--
+	if l.lost <= 0 {
 		l.fall = float64(capRange)
 	}
 	return l.Ease.Loss(d, base, l.fall, l.Zoom)
@@ -491,12 +566,15 @@ func newEaseRate(total float64) easeRate {
 // 正常发送速率。
 // 慢减：先缓慢减速，越到后面减速越快（指数退避）。
 //
-// x 为发送距离，直接对应发送速率。
+// x 为发送距离，正数（负值为0），可能超过底部总值。
 // base 为基准速率（间隔时长）。
 // cap 为速率降低的幅度容量。
 // zoom 为缩放因子（比率曲线中的 k）。
 //
 func (s easeRate) Send(x, base, cap, zoom float64) time.Duration {
+	if x < 0 {
+		x = 0
+	}
 	return time.Duration(
 		base + s.UpIn(x, zoom)*cap,
 	)
@@ -507,6 +585,9 @@ func (s easeRate) Send(x, base, cap, zoom float64) time.Duration {
 // 快减：很快慢下来，越到后面减速越缓。
 //
 func (s easeRate) Loss(x, base, cap, zoom float64) time.Duration {
+	if x < 0 {
+		x = 0
+	}
 	return time.Duration(
 		base + s.UpOut(x, zoom)*cap,
 	)
