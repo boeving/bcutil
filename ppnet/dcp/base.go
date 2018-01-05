@@ -30,7 +30,6 @@ package dcp
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"time"
@@ -44,12 +43,11 @@ const (
 )
 
 var (
-	errExt2      = errors.New("value overflow, must be between 0-15")
-	errNetwork   = errors.New("bad network name between two DCPAddr")
-	errOverflow  = errors.New("exceeded the number of resource queries")
-	errZero      = errors.New("no data for Query")
-	errResponser = errors.New("not set Responser handler")
-	errNoRAddr   = errors.New("no remote address")
+	errExt2     = errors.New("value overflow, must be between 0-15")
+	errNetwork  = errors.New("bad network name between two DCPAddr")
+	errOverflow = errors.New("exceeded the number of resource queries")
+	errZero     = errors.New("no data for Query")
+	errNoRAddr  = errors.New("no remote address")
 )
 
 //
@@ -325,16 +323,16 @@ func (s *servReader) Serve() {
 
 //
 // Receiver 接收器接口。
-// 它由发出请求的客户端应用实现。获取数据并处理。
+// 它由发出请求的客户端应用实现。接收响应数据并处理。
 //
 type Receiver interface {
 	io.Writer
 }
 
 //
-// Responser 发送器接口。
-// 由提供数据服务的应用实现，
-// 返回的读取器读取完毕时表示数据体结束。
+// Responser 响应器接口。
+// 响应对端的资源请求，由提供数据服务的应用实现。
+// 返回的读取器读取完毕表示数据体结束。
 //
 type Responser interface {
 	// res 为客户端请求资源的标识。
@@ -378,20 +376,20 @@ func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
 	return &DCPAddr{network, addr}, err
 }
 
-/////////////
-// 实现注记
-// ========
-// 客户端：
-// - 数据ID生成，优先投递数据体首个分组（有序）；
-// - 启动并发的发送服务器servSend（如果还需要）；
-// - 创建并缓存接收服务器recvServ，用于对对端响应的接收；
-// - 视情况添加响应服务（若snd有效）；
-//
-// 服务端：
-// - 不可直接读取conn连接（由Listener代理调度），仅用于写；
-// - 外部可像使用客户端一样向对端发送资源请求（Query...）；
-// - resp 成员必定存在（而客户端为可选）；
-//
+//////////////
+/// 实现注记
+/// ========
+/// 客户端：
+/// - 数据ID生成，优先投递数据体首个分组（有序）；
+/// - 启动并发的发送服务器servSend（如果还需要）；
+/// - 创建并缓存接收服务器recvServ，用于对对端响应的接收；
+/// - 视情况添加响应服务（若snd有效）；
+///
+/// 服务端：
+/// - 不可直接读取conn连接（由Listener代理调度），仅用于写；
+/// - 外部可像使用客户端一样向对端发送资源请求（Query...）；
+/// - resp 成员必定存在（而客户端为可选）；
+///
 ///////////////////////////////////////////////////////////////////////////////
 
 //
@@ -400,10 +398,9 @@ func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
 //
 type Contact struct {
 	laddr, raddr net.Addr    // 4元组
-	serv         *service    // DCP服务器
+	serv         *service    // DCP内部服务
 	alive        time.Time   // 最近活跃（收/发）
 	begid        uint16      // 起始数据ID（交互期）
-	resp         Responser   // 响应发送器
 	rdsrv        *servReader // 读取服务器，可选
 }
 
@@ -473,25 +470,28 @@ func (c *Contact) RemoteAddr() net.Addr {
 // 它不从Accept上传入，以提供一种灵活性。如不同对端不同对待。
 //
 func (c *Contact) Register(resp Responser) {
-	c.resp = resp
+	c.serv.Resp = resp
 }
 
 //
 // Query 向服务端查询数据。
 // 最多同时处理64k的目标查询，超出会返回errOverflow错误。
 //
-//  name 数据名称。用于数据ID绑定，空串为有效值。
 //  res  目标数据的标识。
 //  rec  外部接收器接口的实现。
 //
-func (c *Contact) Query(name string, res []byte, rec Receiver) error {
-	//
+func (c *Contact) Query(res []byte, rec Receiver) error {
+	if len(res) == 0 {
+		return errZero
+	}
+	// ...
 }
 
 //
 // 字节序列名称。
 // 提取最多32字节数据，返回16进制表示串。
 //
+/*
 func (c *Contact) bytesName(res []byte) string {
 	n := len(res)
 	if n > 32 {
@@ -499,18 +499,7 @@ func (c *Contact) bytesName(res []byte) string {
 	}
 	return fmt.Sprintf("%x", res[:n])
 }
-
-//
-// QueryBytes 数据查询。
-// 类似Query方法，但数据名称取res实参的前最多32字节为绑定。
-// res实参通常为哈希序列。
-//
-func (c *Contact) QueryBytes(res []byte, rec Receiver) error {
-	if len(res) == 0 {
-		return errZero
-	}
-	return c.Query(c.bytesName(res), res, rec)
-}
+*/
 
 //
 // StartID 设置起始数据ID。
@@ -518,16 +507,6 @@ func (c *Contact) QueryBytes(res []byte, rec Receiver) error {
 //
 func (c *Contact) StartID(rnd uint16) {
 	c.begid = rnd
-}
-
-//
-// 获取响应，包内部使用。
-//
-func (c *Contact) response(res []byte) (io.Reader, error) {
-	if c.resp == nil {
-		return nil, errResponser
-	}
-	return c.resp.GetReader(res)
 }
 
 //
