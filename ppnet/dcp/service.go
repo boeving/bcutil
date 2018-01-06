@@ -41,6 +41,14 @@ package dcp
 /// 注：
 /// 各数据体按自身评估的速率并发提供构造好的数据报，由发送总管统一发送。
 ///
+///
+/// 发送方
+/// ------
+/// - 初始按基准速率匀速发送。
+/// - 收到第一个确认后，获得网络基本容量。
+/// - 后续的发送附带有效发送距离（非零。减去进度线序列号和网络容量）。
+///
+///
 ///////////////////////////////////////////////////////////////////////////////
 
 import (
@@ -76,7 +84,7 @@ const (
 	lossBase          = 20               // 丢包总权衡基值（线性减速）
 	baseTick          = 10 * time.Second // 基准速率评估间隔（一个滴答）
 	baseRatio         = 0.1              // 基准速率调整步进比率
-	dataFull    int64 = 256 * 1500       // 满载数据量（概略值）
+	dataFull    int64 = 1024 * 576       // 满载数据量（概略值）
 )
 
 var (
@@ -263,15 +271,28 @@ type recvServ struct {
 // - 评估对端的确认距离，判断是否丢包重发。
 // - 递增序列号传递响应数据。
 //
+// 注：重传也能适应MTU中途变小的情况。
+//
 type respServ struct {
-	R     io.Reader       // 响应服务实例
-	Dch   chan<- resPiece // 负载传递信道
-	Seq   int             // 初始序列号
-	cache []*resPiece     // 已传递缓存（丢包重发备用）
-	back  []*resPiece     // 返还的前置分片集
-	size  int             // 数据片大小（可变）
-	pause bool            // 构造暂停（等待返还）
-	mu    sync.Mutex      // size同步锁
+	R     io.Reader            // 响应服务实例
+	Dch   chan<- resPiece      // 负载传递信道
+	Seq   uint16               // 初始序列号
+	cache map[uint16]*resPiece // 已传递缓存（丢包重发备用）
+	back  []resPiece           // 返还的前置分片集
+	size  int                  // 数据片大小（可变）
+	seqx  uint16               // 当前序列号
+	pause bool                 // 构造暂停（等待返还）
+	mu    sync.Mutex           // size同步锁
+}
+
+func newRespServ(r io.Reader, ch chan<- resPiece, seq uint16) *respServ {
+	return &respServ{
+		R:     r,
+		Dch:   ch,
+		Seq:   seq,
+		cache: make(map[uint16]*resPiece),
+		back:  nil,
+	}
 }
 
 func (r *respServ) Run() {
@@ -301,22 +322,100 @@ func (r *respServ) Size(sz int) {
 // 注记：
 // 这是因应并发的处理，否则每次现读取则无并发的优势了。
 //
-func (r *respServ) Shift(data []byte) {
-	//
+func (r *respServ) Shift(p resPiece) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.pause = false
+	r.back = p.Pieces(r.size)
 }
 
 //
-// 响应分片数据。
-// Pos 有3个值，表达 Data 所处的位置：
-// > 0  起始分片（BEG）
-// > 1  中间段分片
+// 响应分片。
+// pos 有4个值，表达 Data 所处的位置：
+// > 1  起始分片（BEG）
+// > 0  中间段分片
 // > -1 末尾分片（END）
+// > 2  独立分片（BEG & END）
 //
 type resPiece struct {
 	Seq  int    // 序列号
-	Pos  int    // 分片位置
 	Data []byte // 分片数据
+	pos  int    // 分片位置
+}
+
+func (r *resPiece) Size() int {
+	return len(r.Data)
+}
+
+//
+// 将自身切分为指定大小的多个响应分片实例。
+// 需要处理序列号的顺序递增和各分片的位置标记。
+//
+func (r *resPiece) Pieces(size int) []resPiece {
+	if size <= r.Size() {
+		return []resPiece{*r}
+	}
+	bs := r.pieces(r.Data, size)
+	buf := make([]resPiece, 0, len(bs))
+
+	// 数据与序列号
+	for i := 0; i < len(bs); i++ {
+		buf = append(buf, resPiece{Data: bs[i], Seq: r.Seq + i})
+	}
+	// 位置标记
+	switch {
+	case r.Beg():
+		buf[0].SetBeg()
+	case r.End():
+		buf[len(buf)-1].SetEnd()
+	case r.Alone():
+		buf[0].SetBeg()
+		buf[len(buf)-1].SetEnd()
+	}
+
+	return buf
+}
+
+//
+// 切分数据片为指定大小的子分片。
+//
+func (r *resPiece) pieces(data []byte, size int) [][]byte {
+	var buf [][]byte
+	n, m := len(data)/size, len(data)%size
+
+	for i := 0; i < n; i++ {
+		x := i * size
+		buf = append(buf, data[x:x+size])
+	}
+	if m > 0 {
+		buf = append(buf, data[n*size:])
+	}
+	return buf
+}
+
+func (r *resPiece) Beg() bool {
+	return r.pos == 1
+}
+
+func (r *resPiece) End() bool {
+	return r.pos == -1
+}
+
+func (r *resPiece) Alone() bool {
+	return r.pos == 2
+}
+
+func (r *resPiece) SetBeg() {
+	r.pos = 1
+}
+
+func (r *resPiece) SetEnd() {
+	r.pos = -1
+}
+
+func (r *resPiece) SetAlone() {
+	r.pos = 2
 }
 
 //
@@ -645,11 +744,14 @@ func (e *evalRate) Rate(d int, base float64) time.Duration {
 	if e.Lost() {
 		return e.lossRate.Rate(float64(d), base)
 	}
-	return e.Ease.Send(float64(d), base, e.Zoom, float64(capRange))
+	return time.Duration(
+		e.Ease.Send(float64(d), base, e.Zoom, float64(capRange)),
+	)
 }
 
 //
 // 丢包速率评估器。
+// （发送方）
 //
 type lossRate struct {
 	Zoom float64         // 丢包曲线缩放因子
@@ -723,7 +825,7 @@ func (l *lossRate) Rate(d, base float64) time.Duration {
 	if l.lost <= 0 {
 		l.fall = float64(capRange)
 	}
-	return l.Ease.Loss(d, base, l.fall, l.Zoom)
+	return time.Duration(l.Ease.Loss(d, base, l.fall, l.Zoom))
 }
 
 //

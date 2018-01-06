@@ -10,9 +10,9 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #ACk         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
-//	| RPZ-  | MTU-  |.|R|S|R|B|R|B|E|               |               |
-//	| Extra | ANN/  |.|E|E|S|Y|T|E|N|  ACK distance | Send distance |
-//	| Size  | ACK   |.|Q|S|T|E|P|G|D|               |               |
+//	| RPZ-  | MTU-  |.|R|S|R|B|R|B|E|              |                |
+//	| Extra | ANN/  |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
+//	| Size  | ACK   |.|Q|S|T|E|P|G|D|      (6)     |     (10)       |
 //	+-------------------------------+-------------------------------+
 //	|                      Session verify code                      |
 //	+---------------------------------------------------------------+
@@ -48,6 +48,7 @@ var (
 	errOverflow = errors.New("exceeded the number of resource queries")
 	errZero     = errors.New("no data for Query")
 	errNoRAddr  = errors.New("no remote address")
+	errRange    = errors.New("the distance value is out of range")
 )
 
 //
@@ -127,6 +128,7 @@ var mtuValue = map[uint8]uint32{
 	3:  1492,  // PPPoE链路大小
 	4:  1500,  // 以太网络
 	14: 65535, // 本地最大窗口
+	15: 0,     // 扩展
 }
 
 //
@@ -138,8 +140,8 @@ type header struct {
 	RID, Ack uint16 // 接受数据ID，确认号
 	Ext2     byte   // 扩展区（4+4）
 	Flag     flag   // 标志区（8）
-	AckDst   uint8  // ACK distance，确认距离
-	SndDst   uint8  // Send distance，发送距离
+	AckDst   uint   // ACK distance，确认距离
+	SndDst   uint   // Send distance，发送距离
 	Sess     uint32 // Session verify code
 	mtuSz    uint32 // MTU Custom size
 }
@@ -191,8 +193,8 @@ func (h *header) Decode(r io.Reader) error {
 	h.Ack = binary.BigEndian.Uint16(buf[6:8])
 	h.Ext2 = buf[8]
 	h.Flag = flag(buf[9])
-	h.AckDst = buf[10]
-	h.SndDst = buf[11]
+	h.AckDst = uint(buf[10]) >> 2
+	h.SndDst = uint(buf[11]) | uint(buf[10]&3)<<8
 	h.Sess = binary.BigEndian.Uint32(buf[12:16])
 
 	if h.Ext2&0xf == 0xf {
@@ -212,7 +214,10 @@ func (h *header) mtuCustom(r io.Reader) error {
 }
 
 // 编码头部数据。
-func (h *header) Encode() []byte {
+func (h *header) Encode() ([]byte, error) {
+	if h.AckDst > 0x3f || h.SndDst > 0x3ff {
+		return nil, errRange
+	}
 	var buf [headBase + mtuExtra]byte
 
 	binary.BigEndian.PutUint16(buf[0:2], h.SID)
@@ -221,15 +226,15 @@ func (h *header) Encode() []byte {
 	binary.BigEndian.PutUint16(buf[6:8], h.Ack)
 	buf[8] = h.Ext2
 	buf[9] = byte(h.Flag)
-	buf[10] = h.AckDst
-	buf[11] = h.SndDst
+	buf[10] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
+	buf[11] = byte(h.SndDst & 0xff)
 	binary.BigEndian.PutUint32(buf[12:16], h.Sess)
 
 	if h.Ext2&0xf == 0xf {
 		binary.BigEndian.PutUint32(buf[16:20], h.mtuSz)
-		return buf[:]
+		return buf[:], nil
 	}
-	return buf[:headBase]
+	return buf[:headBase], nil
 }
 
 //
