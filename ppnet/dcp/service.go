@@ -6,6 +6,23 @@ package dcp
 /// 		客户端：应用请求 >> [发送]； [接收] >> 写入应用。
 /// 		服务端：[接收] >> 询问应用，获取io.Reader，读取 >> [发送]。
 ///
+/// 发送方
+/// ------
+/// - 根据对方的请求，从注册的响应服务应用获取响应数据。
+/// - 一个交互期的初始阶段按基准速率匀速发送。收到第一个确认后，获得网络基本容量。
+/// - 后续的发送附带有效的发送距离（非零。减去进度线序列号和网络容量）。
+/// - 由对方发来的数据报的确认距离评估丢包情况，决定重发。
+///
+/// 接收端
+/// ------
+/// - 发送客户应用的请求，向对端索取目标资源数据。
+/// - 接收对端的响应数据，写入请求时附带的接收器接口（Receiver）。
+/// - 根据接收器写入的进度，决定ACK的发送，间接抑制对端响应数据的发送速率。
+/// - 根据响应里携带的对端的发送距离，评估本端发送的ACK丢失情况，重新确认或更新确认。
+/// - 根据接收到的序列号顺序，评估中间缺失号是否丢失，决定请求重发。
+///   注：当收到END数据报时，中间缺失数据报的请求重发更优先。
+///
+///
 /// 顺序并发
 /// - 数据ID按应用请求的顺序编号，并顺序发送其首个分组。之后各数据体Go程自行发送。
 /// - 数据体Go程以自身动态评估的即时速率发送，不等待确认，获得并行效果。
@@ -13,7 +30,7 @@ package dcp
 /// - 一个交互期内起始的数据体的数据ID随机产生，数据体内初始分组的序列号也随机。
 ///   注：
 ///   首个分组按顺序发送可以使得接收端有所凭借，而不是纯粹的无序。
-///   这样，极小数据体（仅有单个分组）在接收端的丢包判断就很容易了（否则很难）。
+///   这样，极小数据体（仅有单个分组）在接收端的丢包判断就容易了（否则很难）。
 ///
 /// 有序重发
 /// - 每个数据体权衡确认距离因子计算重发。
@@ -39,15 +56,7 @@ package dcp
 /// - 总速率评估器的基准速率被定时评估调优，同时它也作为各数据体的基准速率。
 /// - 每个交互期的数据量也用于基准速率调优参照。
 /// 注：
-/// 各数据体按自身评估的速率并发提供构造好的数据报，由发送总管统一发送。
-///
-///
-/// 发送方
-/// ------
-/// - 初始按基准速率匀速发送。
-/// - 收到第一个确认后，获得网络基本容量。
-/// - 后续的发送附带有效发送距离（非零。减去进度线序列号和网络容量）。
-///
+/// 各数据体按自身评估的速率并发提供构造好的数据报，由总发送器统一发送。
 ///
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -97,19 +106,19 @@ var (
 //
 type service struct {
 	Resp    Responser            // 请求响应器
-	Sndx    *sendManager         // 发送总管
-	Pch     chan *packet         // 数据报发送信道备存
-	ResPool map[uint16]*respServ // 响应服务器池
-	RecPool map[uint16]*recvServ // 接收服务器池
+	Sndx    *xSender             // 总发送器
+	Pch     chan packet          // 数据报发送信道备存
+	ResPool map[uint16]*respServ // 响应服务器池（key:数据ID#RCV）
+	RecPool map[uint16]*recvServ // 接收服务器池（key:数据ID#SND）
 	NetCaps int                  // 线路容量（数据报个数）
 	clean   func(net.Addr)       // 断开清理（Listener）
 }
 
 func newService(w *connWriter, clean func(net.Addr)) *service {
-	ch := make(chan *packet)
+	ch := make(chan packet)
 
 	return &service{
-		Sndx:    newSendManager(w, ch),
+		Sndx:    newXSender(w, ch),
 		Pch:     ch,
 		RecPool: make(map[uint16]*recvServ),
 		NetCaps: 0,
@@ -133,7 +142,7 @@ func (s *service) Start() *service {
 //   请求交由响应器接口，响应交由接收器接口。
 // - 向响应器传递确认距离（对本端响应的确认）。
 //
-func (s *service) Post(pack *packet) {
+func (s *service) Post(pack packet) {
 	//
 }
 
@@ -191,8 +200,11 @@ type session struct {
 }
 
 //
-// 发送总管。
-// 通过信道获取各数据体Go程的数据报，按评估速率发送。
+// 总发送器（发送总管）。
+// 按自身评估的速率执行实际的网络发送。
+//
+// 通过缓存信道获取各数据体Go程的数据包。
+// 根据接收服务器的要求发送ACK确认，尽量携带数据发送。
 // 各Go程的递送无顺序关系，因此实现并行的效果。
 //
 // 外部保证每个数据体的首个分组优先递送，
@@ -200,14 +212,19 @@ type session struct {
 //
 // 一个4元组两端连系对应一个本类实例。
 //
-type sendManager struct {
-	Conn *connWriter    // 数据报网络发送器
-	Rate *rateEval      // 速率评估器
-	Pch  <-chan *packet // 待发送数据报信道
+// 注记：
+// 用单向链表存储确认信息申请，以保持先到先用的顺序。
+//
+type xSender struct {
+	Conn *connWriter   // 数据报网络发送器
+	Rate *rateEval     // 速率评估器
+	Pch  <-chan packet // 待发送数据包通道（有缓存）
+	head *ackInfo      // 确认信息链头
+	foot *ackInfo      // 确认信息链尾
 }
 
-func newSendManager(w *connWriter, pch <-chan *packet) *sendManager {
-	return &sendManager{
+func newXSender(w *connWriter, pch <-chan packet) *xSender {
+	return &xSender{
 		Conn: w,
 		Rate: newRateEval(),
 		Pch:  pch,
@@ -215,31 +232,106 @@ func newSendManager(w *connWriter, pch <-chan *packet) *sendManager {
 }
 
 //
-// 发送服务器。
-// 一个响应服务对应一个本类实例。
-// - 从接收服务获取信息发送ACK确认，如果有待发送数据则携带发送。
-// - 构造数据报通过信道传递到发送总管。
-// - 缓存并管理待发送的数据（受制于发送总管）。
+// 发送请求。
+// 由外部客户请求调用，有更高的优先级。
 //
-type servSend struct {
-	ID  uint16         // 数据ID#SND
-	Seq uint16         // 序列号记忆
-	Ack uint16         // 确认号（进度）
-	Pch chan<- *packet // 数据报递送通道
-}
-
-//
-// 发送客户请求。
-// 比普通的响应服务有更高的优先级。
-//
-func (ss *servSend) Request(res []byte) error {
+func (x *xSender) Request(res []byte) error {
 	//
 }
 
 //
-// 对对端请求的响应。
+// 申请确认发送。
+// 仅由接收服务器调用，用于正常的确认和重发申请。
 //
-func (ss *servSend) Response(data []byte) error {
+// sid 为接收到的发送数据ID#SND（将变成#RCV）。
+// seq 为确认的序列号或申请重发的序列号，将作为确认字段里的数据。
+// rtp 为申请重发标识。
+//
+// 注：
+// 正常的确认与重发申请不同仅在于重发标记和确认距离（为零）。
+//
+func (x *xSender) Ack(sid, seq uint16, rtp bool) {
+	//
+}
+
+//
+// 确认信息。
+//
+type ackInfo struct {
+	next *ackInfo
+	//
+}
+
+//
+// 数据报发送器。
+// 一个响应服务对应一个本类实例。
+// - 从响应器接收数据负载，构造数据报递送到总发送器。
+// - 受制于总发送器的发送速率。
+//
+type sender struct {
+	ID   uint16          // 数据ID#SND
+	Dch  <-chan resPiece // 响应数据片接收通道
+	Pch  chan<- packet   // 数据报递送通道
+	resp *respServ       // 响应器
+	stop *goes.Stop      // 停止接收响应
+}
+
+func newSender(id uint16, dch <-chan resPiece, pch chan<- packet) *sender {
+	s := sender{
+		ID:  id,
+		Dch: dch,
+		Pch: pch,
+	}
+	// 启动服务
+	s.stop = s.pieceServe()
+
+	return &s
+}
+
+//
+// 接收数据片服务。
+// 用于响应数据片的阻塞接收，应对MTU中途减小时的内部环回。
+// 否则可采用方法直接调用的设计。
+//
+func (s *sender) pieceServe() *goes.Stop {
+	stop := goes.NewStop()
+
+	go func() {
+		for {
+			select {
+			case <-stop.C:
+				return
+			case rp := <-s.Dch:
+				if rp.Size() <= s.maxSize() {
+					s.Send(rp)
+				} else {
+					s.resp.Shift(rp)
+				}
+			}
+		}
+	}()
+
+	return stop
+}
+
+//
+// 数据片限定大小。
+//
+func (s *sender) maxSize() uint32 {
+	return s.resp.Size()
+}
+
+//
+// 结束响应分片的接收。
+//
+func (s *sender) Close() {
+	s.stop.Exit()
+}
+
+//
+// 发送响应数据片。
+//
+func (s *sender) Send(rp resPiece) {
 	//
 }
 
@@ -254,19 +346,28 @@ func (ss *servSend) Response(data []byte) error {
 // - 评估对端的发送距离，决定是否再次确认。
 //
 // 注：
-// - 只有头部信息的申请配置，没有负载数据传递。
-// - 此处的ID为确认字段信息，与servSend:ID无关。
+// 只有头部信息的申请配置，没有负载数据传递。
 //
 type recvServ struct {
-	ID     uint16    // 对端数据ID#SND（传递到servSend变成#ACK）
-	Seq    uint16    // 数据包序列号
-	Ack    uint16    // 当前确认号，发送制约
-	AckEnd uint16    // 实际确认号，接收进度
-	Snds   *servSend // 发送服务器
+	Recv   Receiver // 接收器实例，响应写入
+	Acked  uint16   // 实际确认号，接收进度
+	CurAck uint16   // 当前确认号，发送抑制
+	Sndx   *xSender // 总发送器，头信息申请
+}
+
+//
+// 接收响应数据。
+// seq  为响应数据包的序列号。
+// dist 为数据包携带的对端的发送距离。
+//
+func (r *recvServ) Receive(data []byte, seq, dist uint16) {
+	//
 }
 
 //
 // 请求响应器。
+// 响应对端请求获取响应数据。一个数据体对应一个本类实例。
+// 内容：
 // - 读取适当大小的响应数据传递到发送服务器。
 // - 评估对端的确认距离，判断是否丢包重发。
 // - 递增序列号传递响应数据。
@@ -279,7 +380,7 @@ type respServ struct {
 	Seq   uint16               // 初始序列号
 	cache map[uint16]*resPiece // 已传递缓存（丢包重发备用）
 	back  []resPiece           // 返还的前置分片集
-	size  int                  // 数据片大小（可变）
+	size  uint32               // 数据片大小（可变）
 	seqx  uint16               // 当前序列号
 	pause bool                 // 构造暂停（等待返还）
 	mu    sync.Mutex           // size同步锁
@@ -292,6 +393,7 @@ func newRespServ(r io.Reader, ch chan<- resPiece, seq uint16) *respServ {
 		Seq:   seq,
 		cache: make(map[uint16]*resPiece),
 		back:  nil,
+		size:  mtuValue[MTUBase],
 	}
 }
 
@@ -300,16 +402,27 @@ func (r *respServ) Run() {
 }
 
 //
-// 设置/修改数据片大小。
-// 如果网络MTU变化，此方法需要优先调用。
+// 获取数据片限定大小。
+//
+func (r *respServ) Size() uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.size
+}
+
+//
+// 限定数据片大小。
+// 在网络MTU变化时，被接收分片数据的sender调用。
 // 即：在构造下一个分组前先改变，之后读取端读取并返还数据（Shift）。
 //
-func (r *respServ) Size(sz int) {
+func (r *respServ) Limit(sz uint32) {
 	if sz == r.size {
 		return
 	}
 	r.mu.Lock()
-	r.pause = true
+	if sz < r.size {
+		r.pause = true
+	}
 	r.size = sz
 	r.mu.Unlock()
 }
@@ -326,8 +439,14 @@ func (r *respServ) Shift(p resPiece) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	ps := p.Pieces(r.size)
+
+	if len(r.back) == 0 {
+		r.back = ps
+	} else {
+		r.back = append(ps, r.back...)
+	}
 	r.pause = false
-	r.back = p.Pieces(r.size)
 }
 
 //
@@ -344,16 +463,16 @@ type resPiece struct {
 	pos  int    // 分片位置
 }
 
-func (r *resPiece) Size() int {
-	return len(r.Data)
+func (r *resPiece) Size() uint32 {
+	return uint32(len(r.Data))
 }
 
 //
 // 将自身切分为指定大小的多个响应分片实例。
 // 需要处理序列号的顺序递增和各分片的位置标记。
 //
-func (r *resPiece) Pieces(size int) []resPiece {
-	if size <= r.Size() {
+func (r *resPiece) Pieces(size uint32) []resPiece {
+	if r.Size() <= size {
 		return []resPiece{*r}
 	}
 	bs := r.pieces(r.Data, size)
@@ -380,11 +499,12 @@ func (r *resPiece) Pieces(size int) []resPiece {
 //
 // 切分数据片为指定大小的子分片。
 //
-func (r *resPiece) pieces(data []byte, size int) [][]byte {
+func (r *resPiece) pieces(data []byte, size uint32) [][]byte {
 	var buf [][]byte
-	n, m := len(data)/size, len(data)%size
+	sz := uint32(len(data))
+	n, m := sz/size, sz%size
 
-	for i := 0; i < n; i++ {
+	for i := uint32(0); i < n; i++ {
 		x := i * size
 		buf = append(buf, data[x:x+size])
 	}
@@ -424,7 +544,7 @@ func (r *resPiece) SetAlone() {
 
 //
 // 总速率评估。
-// 为全局发送总管提供发送速率依据。
+// 为全局总发送器提供发送速率依据。
 // 发送数据量影响基准速率，各数据体发送距离的增减量影响当前速率。
 //
 // 距离：
@@ -432,7 +552,7 @@ func (r *resPiece) SetAlone() {
 // 但距离增减量累计不能体现初始的发送距离。
 //
 // 丢包：
-// 各数据体评估丢包后会发送一个通知，用于发送总管评估调整当前速率。
+// 各数据体评估丢包后会发送一个通知，用于总发送器评估调整当前速率。
 // 这通常是由于初始发送的速率就偏高。
 //
 // 数据量：

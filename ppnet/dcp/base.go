@@ -187,10 +187,12 @@ func (h *header) Decode(r io.Reader) error {
 	if n != headBase {
 		return err
 	}
-	h.SID = binary.BigEndian.Uint16(buf[0:2])
-	h.Seq = binary.BigEndian.Uint16(buf[2:4])
-	h.RID = binary.BigEndian.Uint16(buf[4:6])
-	h.Ack = binary.BigEndian.Uint16(buf[6:8])
+	// binary.BigEndian.Uint16(buf[x:x+2])
+	h.SID = uint16(buf[0])<<8 | uint16(buf[1])
+	h.Seq = uint16(buf[2])<<8 | uint16(buf[3])
+	h.RID = uint16(buf[4])<<8 | uint16(buf[5])
+	h.Ack = uint16(buf[6])<<8 | uint16(buf[7])
+
 	h.Ext2 = buf[8]
 	h.Flag = flag(buf[9])
 	h.AckDst = uint(buf[10]) >> 2
@@ -224,6 +226,7 @@ func (h *header) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint16(buf[2:4], h.Seq)
 	binary.BigEndian.PutUint16(buf[4:6], h.RID)
 	binary.BigEndian.PutUint16(buf[6:8], h.Ack)
+
 	buf[8] = h.Ext2
 	buf[9] = byte(h.Flag)
 	buf[10] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
@@ -239,16 +242,17 @@ func (h *header) Encode() ([]byte, error) {
 
 //
 // 数据报。
+// 合并报头的方法便于使用。
 //
 type packet struct {
-	head *header
+	*header
 	data []byte
 }
 
 //
 // Bytes 序列号为字节序列。
 //
-func (p *packet) Bytes() []byte {
+func (p packet) Bytes() []byte {
 	//
 }
 
@@ -269,7 +273,7 @@ type connReader struct {
 	Conn *net.UDPConn
 }
 
-func (r *connReader) Receive() (*packet, net.Addr, error) {
+func (r *connReader) Receive() (packet, net.Addr, error) {
 	//
 }
 
@@ -285,7 +289,7 @@ type connWriter struct {
 	Conn  *net.UDPConn
 }
 
-func (w *connWriter) Send(data *packet) (int, error) {
+func (w *connWriter) Send(data packet) (int, error) {
 	//
 }
 
@@ -469,10 +473,10 @@ func (c *Contact) RemoteAddr() net.Addr {
 //
 // Register 设置响应服务。
 // 非并发安全，服务端应当在Listener:Accept返回的最初时设置。
-// 如果客户端（Dial者）也需提供响应服务，则通过此注册。
+// 如果客户端（Dial者）也需提供响应服务，此注册也有效。
 //
 // 注记：
-// 它不从Accept上传入，以提供一种灵活性。如不同对端不同对待。
+// 单独的注册接口提供一种灵活性。如不同对端不同对待。
 //
 func (c *Contact) Register(resp Responser) {
 	c.serv.Resp = resp
