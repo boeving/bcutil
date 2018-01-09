@@ -38,12 +38,15 @@ import (
 )
 
 const (
-	headBase = 16 // 基础长度
-	mtuExtra = 4  // MTU扩展长度
+	headUDP  = 8         // UDP报文头部长
+	headBase = 16        // 基础长度
+	mtuExtra = 4         // MTU扩展长度
+	mtuLimit = 1<<32 - 1 // MTU定制最大长度
 )
 
 var (
 	errExt2     = errors.New("value overflow, must be between 0-15")
+	errMTULimit = errors.New("value overflow, must be 32 bits")
 	errNetwork  = errors.New("bad network name between two DCPAddr")
 	errOverflow = errors.New("exceeded the number of resource queries")
 	errZero     = errors.New("no data for Query")
@@ -119,7 +122,7 @@ const (
 )
 
 //
-// MTU 常用值定义。
+// MTU 等级值定义。
 //
 var mtuValue = map[byte]int{
 	0:  0,     // 协商保持
@@ -129,6 +132,19 @@ var mtuValue = map[byte]int{
 	4:  1500,  // 以太网络
 	14: 65535, // 本地最大窗口
 	15: -1,    // 扩展
+}
+
+//
+// MTU 等级索引。
+// mtuValue 的键值反转。用于探测值对应。
+//
+var mtuIndex = map[int]byte{
+	0:     0,  // 保持不变
+	576:   1,  // 基础值
+	1280:  2,  // 基础值2
+	1492:  3,  // PPPoE链路大小
+	1500:  4,  // 以太网络
+	65535: 14, // 本地最大窗口
 }
 
 //
@@ -146,10 +162,10 @@ type header struct {
 	mtuSz    uint32 // MTU Custom size
 }
 
-// MTU 定制大小。
-func (h *header) MTUSize() uint32 {
+// MTU 大小。
+func (h *header) MTUSize() int {
 	if h.Ext2&0xf == 0xf {
-		return h.mtuSz
+		return int(h.mtuSz)
 	}
 	return mtuValue[h.Ext2&0xf]
 }
@@ -159,15 +175,29 @@ func (h *header) RPZSize() int {
 	return int(h.Ext2 >> 4)
 }
 
-// 扩展区MTU设置。
-func (h *header) SetMTU(i int, cst uint32) error {
-	if i > 0xf || i < 0 {
-		return errExt2
+//
+// 返回可携带的有效负载大小。
+// 注：减去头部固定长度和可变的长度部分。
+//
+func (h *header) DataSize() int {
+	hd := headUDP + headBase
+	if h.Ext2&0xf == 0xf {
+		hd += mtuExtra
 	}
-	h.Ext2 = h.Ext2&0xf0 | byte(i)
-	if i == 0xf {
-		h.mtuSz = cst
+	return h.MTUSize() - hd
+}
+
+// 设置MTU大小。
+func (h *header) SetMTU(sz int) error {
+	if sz > mtuLimit {
+		return errMTULimit
 	}
+	i, ok := mtuIndex[sz]
+	if !ok {
+		h.mtuSz = uint32(sz)
+		i = 0xf
+	}
+	h.Ext2 = h.Ext2&0xf0 | i
 	return nil
 }
 

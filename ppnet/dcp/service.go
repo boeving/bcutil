@@ -62,6 +62,7 @@ package dcp
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"io"
 	"log"
@@ -113,7 +114,7 @@ type service struct {
 	Pch     chan packet          // 数据报发送信道备存
 	ResPool map[uint16]*servSend // 发送服务器池（key:数据ID#RCV）
 	RecPool map[uint16]*recvServ // 接收服务器池（key:数据ID#SND）
-	NetCaps int                  // 线路容量（数据报个数）
+	NetCap  int                  // 线路容量（数据报个数）
 	clean   func(net.Addr)       // 断开清理（Listener）
 }
 
@@ -124,7 +125,7 @@ func newService(w *connWriter, clean func(net.Addr)) *service {
 		Sndx:    newXSender(w, ch),
 		Pch:     ch,
 		RecPool: make(map[uint16]*recvServ),
-		NetCaps: 0,
+		NetCap:  0,
 		clean:   clean,
 	}
 }
@@ -266,6 +267,35 @@ type ackInfo struct {
 }
 
 //
+// 接收服务器。
+// 处理对端传输来的响应数据，一个数据体对应一个本类实例。
+//
+// 调用发送服务接口，拥有高优先级。
+// - 根据应用的执行情况确定进度确认号，制约对端发送速率。
+// - 评估中间空缺的序号，决定是否申请重发。
+// - 当接收到END包时，申请中间缺失包的重发。
+// - 评估对端的发送距离，决定是否再次确认。
+//
+// 注：
+// 只有头部信息的申请配置，没有负载数据传递。
+//
+type recvServ struct {
+	Recv   Receiver // 接收器实例，响应写入
+	Acked  uint16   // 实际确认号，接收进度
+	CurAck uint16   // 当前确认号，发送抑制
+	Sndx   *xSender // 总发送器，头信息申请
+}
+
+//
+// 接收响应数据。
+// seq  为响应数据包的序列号。
+// dist 为数据包携带的对端的发送距离。
+//
+func (r *recvServ) Receive(data []byte, seq, dist uint16) {
+	//
+}
+
+//
 // 数据报发送器。
 // 一个响应服务对应一个本类实例。
 // - 从响应器接收数据负载，构造数据报递送到总发送器。
@@ -276,63 +306,46 @@ type ackInfo struct {
 // 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离会导致发送停止。
 //
 type servSend struct {
-	ID    uint16         // 数据ID#SND
-	Seq   int            // 初始序列号
-	Pch   chan<- packet  // 数据报递送通道
-	Dch   <-chan piece   // 响应数据片接收通道
-	resp  *response      // 响应器
-	stop  *goes.Stop     // 停止接收响应
-	cache map[int][]byte // 已用备存（丢包重发用）
-	seqx  int            // 当前序列号
-	size  int            // 数据片大小（可变）
-	mu    sync.Mutex     // size同步锁
+	ID     uint16         // 数据ID#SND
+	Seq    int            // 初始序列号
+	Ack    int            // 最新的响应确认
+	Netcap int            // 网络容量
+	Pch    chan<- *packet // 数据报递送通道
+	resp   *response      // 响应器
+	stop   *goes.Stop     // 停止接收响应
+	hist   map[int][]byte // 已用备存（丢包重发用）
+	seqx   int            // 当前序列号
+	pmtu   int            // 路径MTU大小（可变）
+	mu     sync.Mutex     // pmtu/ack同步锁
 }
 
-func newSender(id uint16, seq int, dch <-chan piece, pch chan<- packet) *servSend {
+func newSender(r io.Reader, id uint16, seq int, pch chan<- *packet) *servSend {
 	s := servSend{
-		ID:  id,
-		Seq: seq,
-		Dch: dch,
-		Pch: pch,
+		ID:   id,
+		Seq:  seq,
+		seqx: seq,
+		Pch:  pch,
+		pmtu: mtuValue[MTUBase],
+		resp: newResponse(r),
 	}
 	// 启动服务
-	s.stop = s.pieceServe()
-	s.resp.Run(s.stop)
+	s.stop = s.Serve()
 
 	return &s
 }
 
 //
-// 接收数据片服务。
-// 用于响应数据片的阻塞接收，应对MTU中途减小时的内部环回。
-// 否则可采用方法直接调用的设计。
+// 启动发送服务。
 //
-func (s *servSend) pieceServe() *goes.Stop {
+func (s *servSend) Serve() *goes.Stop {
 	stop := goes.NewStop()
 
 	go func() {
 		for {
-			max := s.Size()
-			if s.resp.Next() > max {
-				s.resp.SetPause(true)
-			}
 			select {
 			case <-stop.C:
 				return
-			case b := <-s.Dch:
-				if b.Err != nil {
-					if b.Err != io.EOF {
-						log.Printf("read [%d] error: %s", s.ID, b.Err)
-					}
-					s.Close()
-					return
-				}
-				if len(b.Data) <= max {
-					s.Send(b.Data)
-					continue
-				}
-				s.resp.Shift(s.Pieces(b.Data, max))
-				s.resp.SetPause(false)
+			case s.Pch <- s.Build():
 			}
 		}
 	}()
@@ -341,22 +354,12 @@ func (s *servSend) pieceServe() *goes.Stop {
 }
 
 //
-// 返回当前分片限定大小。
+// 修改路径MTU大小设定。
 //
-func (s *servSend) Size() int {
+func (s *servSend) SetMTU(size int) {
 	s.mu.Lock()
-	defer s.mu.Lock()
-	return s.size
-}
-
-//
-// 设定数据片大小。
-//
-func (s *servSend) Limit(sz int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.size = sz
-	s.resp.Limit(sz)
+	s.pmtu = size
+	s.mu.Unlock()
 }
 
 //
@@ -367,9 +370,40 @@ func (s *servSend) Close() {
 }
 
 //
-// 发送响应数据片。
+// 构建数据报。
+// 返回nil表示读取出错，上层应当通知对端。
 //
-func (s *servSend) Send(b []byte) {
+func (s *servSend) Build() *packet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	h := s.header()
+	b, err := s.resp.Get(h.DataSize())
+
+	if err != nil && err != io.EOF {
+		log.Printf("read [%d] error: %s", s.ID, err)
+		return nil
+	}
+	return s.packet(h, b, err == io.EOF)
+}
+
+//
+// 创建一个报头。
+//
+func (s *servSend) header() *header {
+	return &header{
+		SID:    s.ID,
+		Seq:    uint16(s.seqx % seqLimit),
+		SndDst: uint(s.seqx - s.Ack),
+		// ...
+	}
+}
+
+//
+// 创建一个数据报。
+// end 表示数据已经读取完毕（或出错）。
+//
+func (s *servSend) packet(h *header, b []byte, end bool) *packet {
 	//
 }
 
@@ -404,11 +438,11 @@ func (s *servSend) Rebuild(seq, size int) []*resPiece {
 }
 
 //
-// 切分数据片为指定大小的子分片。
+// 切分数据片为指定大小的子片。
 //
-func (s *servSend) Pieces(data []byte, size int) [][]byte {
-	var buf [][]byte
+func pieces(data []byte, size int) [][]byte {
 	n := len(data) / size
+	buf := make([][]byte, 0, n+1)
 
 	for i := 0; i < n; i++ {
 		x := i * size
@@ -421,156 +455,77 @@ func (s *servSend) Pieces(data []byte, size int) [][]byte {
 }
 
 //
-// 接收服务器。
-// 处理对端传输来的响应数据，一个数据体对应一个本类实例。
-//
-// 调用发送服务接口，拥有高优先级。
-// - 根据应用的执行情况确定进度确认号，制约对端发送速率。
-// - 评估中间空缺的序号，决定是否申请重发。
-// - 当接收到END包时，申请中间缺失包的重发。
-// - 评估对端的发送距离，决定是否再次确认。
-//
-// 注：
-// 只有头部信息的申请配置，没有负载数据传递。
-//
-type recvServ struct {
-	Recv   Receiver // 接收器实例，响应写入
-	Acked  uint16   // 实际确认号，接收进度
-	CurAck uint16   // 当前确认号，发送抑制
-	Sndx   *xSender // 总发送器，头信息申请
-}
-
-//
-// 接收响应数据。
-// seq  为响应数据包的序列号。
-// dist 为数据包携带的对端的发送距离。
-//
-func (r *recvServ) Receive(data []byte, seq, dist uint16) {
-	//
-}
-
-//
-// 请求响应器。
-// 响应对端请求获取响应数据传递到发送服务器。
-// 一个数据体对应一个本类实例。
-// 注：
-// - 需处理MTU中途变小时对分片大小的影响。
-// - 需处理上层丢包重构的数据返回存储（back）。
-//
-type response struct {
-	Src   io.Reader    // 响应服务实例
-	Dch   chan<- piece // 负载传递信道
-	curp  piece        // 当前待发送分片（环回间隙）
-	back  [][]byte     // 返还的前置分片集
-	size  int          // 数据片大小（可变）
-	pause bool         // 递送暂停（等待返还）
-	mu    sync.Mutex   // size同步锁
-}
-
-func newRespServ(r io.Reader, ch chan<- piece) *response {
-	return &response{
-		Src:  r,
-		Dch:  ch,
-		size: mtuValue[MTUBase],
-	}
-}
-
-//
-// 运行响应服务。
-// （阻塞）
-//
-func (r *response) Run(stop *goes.Stop) {
-	for {
-		if r.Pause() {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		select {
-		case <-stop.C:
-			return
-		case r.Dch <- r.curp:
-		}
-	}
-}
-
-//
-// 限定数据片大小。
-// 在网络MTU变化时，被接收分片数据的sender调用。
-// 即：在构造下一个分组前先改变，之后读取端读取并返还数据（Shift）。
-//
-func (r *response) Limit(sz int) {
-	r.mu.Lock()
-	r.size = sz
-	r.mu.Unlock()
-}
-
-//
-// 准备下一个分片递送。
-// 返回欲递送分片的大小。
-//
-func (r *response) Next() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.curp = r.Piece()
-	return len(r.curp.Data)
-}
-
-//
-// 获取下一个分片。
-// 优先获取back内的存储。
-//
-func (r *response) Piece() piece {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if len(r.back) > 0 {
-		b := r.back[0]
-		r.back = r.back[1:]
-		return piece{b, nil}
-	}
-	buf := make([]byte, r.size)
-	_, err := r.Src.Read(buf)
-
-	return piece{buf, err}
-}
-
-//
-// 返还前置插入。
-// 用于MTU突然变小后，已读取的数据返还重新分组。
-// 它由读取端读取信道数据后返还，可能比回退读取流更有效。
-//
-// 注记：
-// 这是因应并发的处理，否则每次现读取则无并发的优势了。
-//
-func (r *response) Shift(bs [][]byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	// 分片前插
-	r.back = append(bs, r.back...)
-}
-
-//
-// 设置传递暂停状态。
-//
-func (r *response) SetPause(v bool) {
-	r.mu.Lock()
-	r.pause = v
-	r.mu.Unlock()
-}
-
-func (r *response) Pause() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.pause
-}
-
-//
-// 响应分片。
+// 读取数据片封装。
+// 便于数据片与可能的错误或io.EOF同时传递。
 //
 type piece struct {
 	Data []byte
 	Err  error
+}
+
+//
+// 请求响应器。
+// 提供对端请求需要的响应数据。一个数据体对应一个本类实例。
+//
+type response struct {
+	rb   *bufio.Reader // 响应读取器
+	back [][]byte      // 环回的前置分片集
+}
+
+func newResponse(r io.Reader) *response {
+	return &response{
+		rb: bufio.NewReader(r),
+	}
+}
+
+//
+// 获取下一个分片。
+// 优先从back的存储从提取，不能大于指定的大小。
+// back中的大数据片会被重构为指定的大小。
+//
+// 作为io.EOF的error保证与最后一片数据一起返回。
+//
+func (r *response) Get(size int) ([]byte, error) {
+	if len(r.back) == 0 {
+		return r.Read(size)
+	}
+	if len(r.back[0]) > size {
+		// 重构
+		r.back = pieces(bytes.Join(r.back, nil), size)
+	}
+	b := r.back[0]
+	r.back = r.back[1:]
+
+	return b, nil
+}
+
+//
+// 从原始的流读取数据。
+// 如果读取到数据尾部，io.EOF保证与最后一片数据同时返回。
+// 这便于上级标注该片数据为最后一片。
+//
+// 如果一开始就没有可读的数据，返回的数据片为nil。
+//
+func (r *response) Read(size int) ([]byte, error) {
+	buf := make([]byte, size)
+	n, err := r.rb.Read(buf)
+
+	if n == 0 {
+		return nil, err
+	}
+	if err == nil {
+		// 末尾探测
+		_, err = r.rb.Peek(1)
+	}
+	return buf[:n], err
+}
+
+//
+// 环回前置插入。
+// 用于MTU突然变小后，已读取的数据返还重新分组。
+//
+func (r *response) Shift(bs [][]byte) {
+	r.back = append(bs, r.back...)
 }
 
 //
