@@ -48,7 +48,7 @@ var (
 	errOverflow = errors.New("exceeded the number of resource queries")
 	errZero     = errors.New("no data for Query")
 	errNoRAddr  = errors.New("no remote address")
-	errRange    = errors.New("the distance value is out of range")
+	errDistance = errors.New("the distance value is out of range")
 )
 
 //
@@ -121,14 +121,14 @@ const (
 //
 // MTU 常用值定义。
 //
-var mtuValue = map[uint8]uint32{
+var mtuValue = map[byte]int{
 	0:  0,     // 协商保持
 	1:  576,   // 基础值，起始轻启动
 	2:  1280,  // 基础值2，IPv6默认包大小
 	3:  1492,  // PPPoE链路大小
 	4:  1500,  // 以太网络
 	14: 65535, // 本地最大窗口
-	15: 0,     // 扩展
+	15: -1,    // 扩展
 }
 
 //
@@ -218,7 +218,7 @@ func (h *header) mtuCustom(r io.Reader) error {
 // 编码头部数据。
 func (h *header) Encode() ([]byte, error) {
 	if h.AckDst > 0x3f || h.SndDst > 0x3ff {
-		return nil, errRange
+		return nil, errDistance
 	}
 	var buf [headBase + mtuExtra]byte
 

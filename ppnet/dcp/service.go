@@ -64,6 +64,7 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -94,10 +95,12 @@ const (
 	baseTick          = 10 * time.Second // 基准速率评估间隔（一个滴答）
 	baseRatio         = 0.1              // 基准速率调整步进比率
 	dataFull    int64 = 1024 * 576       // 满载数据量（概略值）
+	seqLimit          = 0xffff           // 序列号上限（不含）
 )
 
 var (
 	errResponser = errors.New("not set Responser handler")
+	errPieces    = errors.New("the pieces amount is overflow")
 )
 
 //
@@ -108,7 +111,7 @@ type service struct {
 	Resp    Responser            // 请求响应器
 	Sndx    *xSender             // 总发送器
 	Pch     chan packet          // 数据报发送信道备存
-	ResPool map[uint16]*respServ // 响应服务器池（key:数据ID#RCV）
+	ResPool map[uint16]*servSend // 发送服务器池（key:数据ID#RCV）
 	RecPool map[uint16]*recvServ // 接收服务器池（key:数据ID#SND）
 	NetCaps int                  // 线路容量（数据报个数）
 	clean   func(net.Addr)       // 断开清理（Listener）
@@ -266,24 +269,35 @@ type ackInfo struct {
 // 数据报发送器。
 // 一个响应服务对应一个本类实例。
 // - 从响应器接收数据负载，构造数据报递送到总发送器。
-// - 受制于总发送器的发送速率。
+// - 评估对端的确认距离，判断是否丢包重发。
+// - 管理递增的序列号，重构丢失包之后已发送的数据报。。
 //
-type sender struct {
-	ID   uint16          // 数据ID#SND
-	Dch  <-chan resPiece // 响应数据片接收通道
-	Pch  chan<- packet   // 数据报递送通道
-	resp *respServ       // 响应器
-	stop *goes.Stop      // 停止接收响应
+// 注记：
+// 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离会导致发送停止。
+//
+type servSend struct {
+	ID    uint16         // 数据ID#SND
+	Seq   int            // 初始序列号
+	Pch   chan<- packet  // 数据报递送通道
+	Dch   <-chan piece   // 响应数据片接收通道
+	resp  *response      // 响应器
+	stop  *goes.Stop     // 停止接收响应
+	cache map[int][]byte // 已用备存（丢包重发用）
+	seqx  int            // 当前序列号
+	size  int            // 数据片大小（可变）
+	mu    sync.Mutex     // size同步锁
 }
 
-func newSender(id uint16, dch <-chan resPiece, pch chan<- packet) *sender {
-	s := sender{
+func newSender(id uint16, seq int, dch <-chan piece, pch chan<- packet) *servSend {
+	s := servSend{
 		ID:  id,
+		Seq: seq,
 		Dch: dch,
 		Pch: pch,
 	}
 	// 启动服务
 	s.stop = s.pieceServe()
+	s.resp.Run(s.stop)
 
 	return &s
 }
@@ -293,20 +307,32 @@ func newSender(id uint16, dch <-chan resPiece, pch chan<- packet) *sender {
 // 用于响应数据片的阻塞接收，应对MTU中途减小时的内部环回。
 // 否则可采用方法直接调用的设计。
 //
-func (s *sender) pieceServe() *goes.Stop {
+func (s *servSend) pieceServe() *goes.Stop {
 	stop := goes.NewStop()
 
 	go func() {
 		for {
+			max := s.Size()
+			if s.resp.Next() > max {
+				s.resp.SetPause(true)
+			}
 			select {
 			case <-stop.C:
 				return
-			case rp := <-s.Dch:
-				if rp.Size() <= s.maxSize() {
-					s.Send(rp)
-				} else {
-					s.resp.Shift(rp)
+			case b := <-s.Dch:
+				if b.Err != nil {
+					if b.Err != io.EOF {
+						log.Printf("read [%d] error: %s", s.ID, b.Err)
+					}
+					s.Close()
+					return
 				}
+				if len(b.Data) <= max {
+					s.Send(b.Data)
+					continue
+				}
+				s.resp.Shift(s.Pieces(b.Data, max))
+				s.resp.SetPause(false)
 			}
 		}
 	}()
@@ -315,24 +341,83 @@ func (s *sender) pieceServe() *goes.Stop {
 }
 
 //
-// 数据片限定大小。
+// 返回当前分片限定大小。
 //
-func (s *sender) maxSize() uint32 {
-	return s.resp.Size()
+func (s *servSend) Size() int {
+	s.mu.Lock()
+	defer s.mu.Lock()
+	return s.size
+}
+
+//
+// 设定数据片大小。
+//
+func (s *servSend) Limit(sz int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.size = sz
+	s.resp.Limit(sz)
 }
 
 //
 // 结束响应分片的接收。
 //
-func (s *sender) Close() {
+func (s *servSend) Close() {
 	s.stop.Exit()
 }
 
 //
 // 发送响应数据片。
 //
-func (s *sender) Send(rp resPiece) {
+func (s *servSend) Send(b []byte) {
 	//
+}
+
+//
+// 重建为更小的数据片集。
+// 应对MTU中途变小且丢包的情形，seq为丢失的包序号（进度线后首个丢失）。
+// 首个分组（seq）需设置重置标记。
+// 注记：
+// 仅需处理cache内的成员，back内成员交给环回机制。
+//
+func (s *servSend) Rebuild(seq, size int) []*resPiece {
+	r.mu.Lock()
+	r.loss = true // 无条件暂停
+	r.mu.Unlock()
+
+	n := r.seqx - seq
+	if n < 0 {
+		n = seqLimit - n
+	}
+	buf := make([]*resPiece, 0, n)
+
+	for i := seq; ; i++ {
+		p := r.cache[i]
+		if p == nil {
+			break
+		}
+		buf = append(buf, p)
+	}
+	buf = append(buf, r.back...)
+
+	return r.Pieces(buf, seq, size)
+}
+
+//
+// 切分数据片为指定大小的子分片。
+//
+func (s *servSend) Pieces(data []byte, size int) [][]byte {
+	var buf [][]byte
+	n := len(data) / size
+
+	for i := 0; i < n; i++ {
+		x := i * size
+		buf = append(buf, data[x:x+size])
+	}
+	if len(data)%size > 0 {
+		buf = append(buf, data[n*size:])
+	}
+	return buf
 }
 
 //
@@ -366,48 +451,46 @@ func (r *recvServ) Receive(data []byte, seq, dist uint16) {
 
 //
 // 请求响应器。
-// 响应对端请求获取响应数据。一个数据体对应一个本类实例。
-// 内容：
-// - 读取适当大小的响应数据传递到发送服务器。
-// - 评估对端的确认距离，判断是否丢包重发。
-// - 递增序列号传递响应数据。
+// 响应对端请求获取响应数据传递到发送服务器。
+// 一个数据体对应一个本类实例。
+// 注：
+// - 需处理MTU中途变小时对分片大小的影响。
+// - 需处理上层丢包重构的数据返回存储（back）。
 //
-// 注：重传也能适应MTU中途变小的情况。
-//
-type respServ struct {
-	R     io.Reader            // 响应服务实例
-	Dch   chan<- resPiece      // 负载传递信道
-	Seq   uint16               // 初始序列号
-	cache map[uint16]*resPiece // 已传递缓存（丢包重发备用）
-	back  []resPiece           // 返还的前置分片集
-	size  uint32               // 数据片大小（可变）
-	seqx  uint16               // 当前序列号
-	pause bool                 // 构造暂停（等待返还）
-	mu    sync.Mutex           // size同步锁
+type response struct {
+	Src   io.Reader    // 响应服务实例
+	Dch   chan<- piece // 负载传递信道
+	curp  piece        // 当前待发送分片（环回间隙）
+	back  [][]byte     // 返还的前置分片集
+	size  int          // 数据片大小（可变）
+	pause bool         // 递送暂停（等待返还）
+	mu    sync.Mutex   // size同步锁
 }
 
-func newRespServ(r io.Reader, ch chan<- resPiece, seq uint16) *respServ {
-	return &respServ{
-		R:     r,
-		Dch:   ch,
-		Seq:   seq,
-		cache: make(map[uint16]*resPiece),
-		back:  nil,
-		size:  mtuValue[MTUBase],
+func newRespServ(r io.Reader, ch chan<- piece) *response {
+	return &response{
+		Src:  r,
+		Dch:  ch,
+		size: mtuValue[MTUBase],
 	}
 }
 
-func (r *respServ) Run() {
-	//
-}
-
 //
-// 获取数据片限定大小。
+// 运行响应服务。
+// （阻塞）
 //
-func (r *respServ) Size() uint32 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.size
+func (r *response) Run(stop *goes.Stop) {
+	for {
+		if r.Pause() {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		select {
+		case <-stop.C:
+			return
+		case r.Dch <- r.curp:
+		}
+	}
 }
 
 //
@@ -415,16 +498,41 @@ func (r *respServ) Size() uint32 {
 // 在网络MTU变化时，被接收分片数据的sender调用。
 // 即：在构造下一个分组前先改变，之后读取端读取并返还数据（Shift）。
 //
-func (r *respServ) Limit(sz uint32) {
-	if sz == r.size {
-		return
-	}
+func (r *response) Limit(sz int) {
 	r.mu.Lock()
-	if sz < r.size {
-		r.pause = true
-	}
 	r.size = sz
 	r.mu.Unlock()
+}
+
+//
+// 准备下一个分片递送。
+// 返回欲递送分片的大小。
+//
+func (r *response) Next() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.curp = r.Piece()
+	return len(r.curp.Data)
+}
+
+//
+// 获取下一个分片。
+// 优先获取back内的存储。
+//
+func (r *response) Piece() piece {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.back) > 0 {
+		b := r.back[0]
+		r.back = r.back[1:]
+		return piece{b, nil}
+	}
+	buf := make([]byte, r.size)
+	_, err := r.Src.Read(buf)
+
+	return piece{buf, err}
 }
 
 //
@@ -435,18 +543,34 @@ func (r *respServ) Limit(sz uint32) {
 // 注记：
 // 这是因应并发的处理，否则每次现读取则无并发的优势了。
 //
-func (r *respServ) Shift(p resPiece) {
+func (r *response) Shift(bs [][]byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 分片前插
+	r.back = append(bs, r.back...)
+}
 
-	ps := p.Pieces(r.size)
+//
+// 设置传递暂停状态。
+//
+func (r *response) SetPause(v bool) {
+	r.mu.Lock()
+	r.pause = v
+	r.mu.Unlock()
+}
 
-	if len(r.back) == 0 {
-		r.back = ps
-	} else {
-		r.back = append(ps, r.back...)
-	}
-	r.pause = false
+func (r *response) Pause() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pause
+}
+
+//
+// 响应分片。
+//
+type piece struct {
+	Data []byte
+	Err  error
 }
 
 //
@@ -463,24 +587,28 @@ type resPiece struct {
 	pos  int    // 分片位置
 }
 
-func (r *resPiece) Size() uint32 {
-	return uint32(len(r.Data))
+func (r *resPiece) Size() int {
+	return len(r.Data)
 }
 
 //
 // 将自身切分为指定大小的多个响应分片实例。
-// 需要处理序列号的顺序递增和各分片的位置标记。
+// 需要处理序列号的顺序递增/回绕和各分片的位置标记。
 //
-func (r *resPiece) Pieces(size uint32) []resPiece {
+// seq 为起始序列号。size 为新的大小限制。
+//
+func (r *resPiece) Pieces(seq, size int) []*resPiece {
 	if r.Size() <= size {
-		return []resPiece{*r}
+		return []*resPiece{r}
 	}
 	bs := r.pieces(r.Data, size)
-	buf := make([]resPiece, 0, len(bs))
+	max := len(bs)
+	buf := make([]*resPiece, 0, max)
 
 	// 数据与序列号
-	for i := 0; i < len(bs); i++ {
-		buf = append(buf, resPiece{Data: bs[i], Seq: r.Seq + i})
+	for i := 0; i < max; i++ {
+		seq = (seq + i) % seqLimit
+		buf = append(buf, &resPiece{Data: bs[i], Seq: seq})
 	}
 	// 位置标记
 	switch {
@@ -499,16 +627,15 @@ func (r *resPiece) Pieces(size uint32) []resPiece {
 //
 // 切分数据片为指定大小的子分片。
 //
-func (r *resPiece) pieces(data []byte, size uint32) [][]byte {
+func (r *resPiece) pieces(data []byte, size int) [][]byte {
 	var buf [][]byte
-	sz := uint32(len(data))
-	n, m := sz/size, sz%size
+	n := len(data) / size
 
-	for i := uint32(0); i < n; i++ {
+	for i := 0; i < n; i++ {
 		x := i * size
 		buf = append(buf, data[x:x+size])
 	}
-	if m > 0 {
+	if len(data)%size > 0 {
 		buf = append(buf, data[n*size:])
 	}
 	return buf
