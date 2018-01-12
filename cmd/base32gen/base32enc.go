@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/qchen-zh/pputil/base32"
+	"github.com/qchen-zh/pputil/cb32"
 )
 
 func main() {
@@ -18,10 +18,10 @@ func main() {
 		}
 	}
 	fmt.Println(len(line), line)
-	ens := base32.StdEncoding.EncodeToString([]byte(line))
+	ens := cb32.StdEncoding.EncodeToString([]byte(line))
 	fmt.Println(len(ens), ens)
 
-	ens = base32.NiceEncoding.EncodeToString([]byte(line))
+	ens = cb32.NiceEncoding.EncodeToString([]byte(line))
 	fmt.Println(len(ens), ens)
 }
 

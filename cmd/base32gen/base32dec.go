@@ -6,7 +6,7 @@ import (
 	"os"
         //"encoding/base32"
 
-	"github.com/qchen-zh/pputil/base32"
+	"github.com/qchen-zh/pputil/cb32"
 )
 
 func main() {
@@ -19,9 +19,11 @@ func main() {
 		}
 	}
 	fmt.Println(len(line), line)
-	dec, _ := base32.StdEncoding.DecodeString(line)
+	dec, _ := cb32.StdEncoding.DecodeString(line)
 	fmt.Println(len(dec), string(dec))
 }
 
 //KRQWWZJANF4CAZDPO7XCA7DPEB4GQZJAMNXXA8JAMNSW67DFOIQGC5TEEBWWC45FEBQXGIDNMFXHSIDDN7YGSZLTEBQXGIDZN74SA75BNZ4A
 //KRQWWZJANF2CAZDPO5XCA5DPEB2GQZJAMNXXA6JAMNSW45DFOIQGC3TEEBWWC23FEBQXGIDNMFXHSIDDN5YGSZLTEBQXGIDZN52SA53BNZ2A====
+// JNJFCV4XLJFECTSJJRBUCWSEKBHTOWCDIE5UIUCFII4EOUK4JJAQ
+// LRLFChtmPLFECebGGaBgCjbENBHeSjCDKEugKgCFKKtESgNtLLAV
