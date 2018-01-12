@@ -25,7 +25,7 @@ type Encoding struct {
 }
 
 // EncodeStd 标准字符序列。
-// 外观整齐，读音区分（视觉/听觉）。
+// 外观整齐但不易视觉定位，读音区分。
 // 6WSJN4FHQLTJLNHJXWIO9PEM7CX5X4M9WPSYZOXFRCDO9PEI7CTYN4FHREX8LEFM7CTYT576RHRYBAQ
 // [A-Z4-9]
 const EncodeStd = "ABCDEFJHIJKLMNOPQRSTUVWXYZ456789"
@@ -37,6 +37,7 @@ const EncodeStd = "ABCDEFJHIJKLMNOPQRSTUVWXYZ456789"
 //
 // 大写字母17个，小写字母15个。未使用数字。
 // wjbNTrQGeHbtuFzGhyGeCRzEmChSzTEQwjqKzrQGeHbtuFzGhyGeCRTEmChSHAECwtSNhrFxmzerLNHGbjqSPPQmwSAKE
+// 9:[^IJMOUWXYZ], 11[^cdfiklnopsv]
 const EncodeNice = "ABCDEFGHKLNPQRSTVabeghjmqrtuwxyz"
 
 // NewEncoding returns a new Encoding defined by the given alphabet,
