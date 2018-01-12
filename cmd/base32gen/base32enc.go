@@ -24,4 +24,3 @@ func main() {
 	ens = cb32.NiceEncoding.EncodeToString([]byte(line))
 	fmt.Println(len(ens), ens)
 }
-

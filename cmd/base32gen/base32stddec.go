@@ -19,7 +19,7 @@ func main() {
 		}
 	}
 	fmt.Println(len(line), line)
-	dec, _ := cb32.NiceEncoding.DecodeString(line)
+	dec, _ := cb32.StdEncoding.DecodeString(line)
 	fmt.Println(len(dec), string(dec))
 }
 
