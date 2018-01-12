@@ -26,19 +26,20 @@ type Encoding struct {
 
 // EncodeStd 标准字符序列。
 // 外观整齐但不易视觉定位，读音区分。
-// 6WSJN4FHQLTJLNHJXWIO9PEM7CX5X4M9WPSYZOXFRCDO9PEI7CTYN4FHREX8LEFM7CTYT576RHRYBAQ
+// 6WSJN4FHQLTJLNHJXWIOJPMG6S6I5ZUYSPUKPBXIU8E8LLU46S8Y5576RTUK9O9JT8Z8LDF46WEINY6AQI
 // [A-Z4-9]
-const EncodeStd = "ABCDEFJHIJKLMNOPQRSTUVWXYZ456789"
+const EncodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZ456789"
 
 // 纯字母序列。
 // 选取原则：
 //  1. 外观差异较大，便于视觉区分；
-//  2. 大小写字符均衡，小写字母向下延展的优先（如gjqy）；
+//  2. 大小写字符均衡，小写字母向下延展者优先（如gjqy）；
+//  3. 包含完整的26个字母（大小写混合）。
 //
-// 大写字母17个，小写字母15个。未使用数字。
-// wjbNTrQGeHbtuFzGhyGeCRzEmChSzTEQwjqKzrQGeHbtuFzGhyGeCRTEmChSHAECwtSNhrFxmzerLNHGbjqSPPQmwSAKE
-// 9:[^IJMOUWXYZ], 11[^cdfiklnopsv]
-const EncodeNice = "ABCDEFGHKLNPQRSTVabeghjmqrtuwxyz"
+// 大写字母16个，小写字母16个。未使用数字。
+// [^HIJMOUWXYZ], [^cbdfklnpsv]
+// wmgPVrRGhKgtuFzGjyGhCSoEoCjTzVERwmqLzrRGhKgtuFzGjyGhCSoEoCjTKAECwtTPjrFxozhrNPKGgmqTQQRowTALE
+const EncodeNice = "ABCDEFGKLNPQRSTVaeghijmoqrtuwxyz"
 
 // NewEncoding returns a new Encoding defined by the given alphabet,
 // which must be a 32-byte string.
