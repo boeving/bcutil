@@ -66,6 +66,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -112,9 +113,9 @@ type service struct {
 	Resp    Responser            // 请求响应器
 	Sndx    *xSender             // 总发送器
 	Pch     chan packet          // 数据报发送信道备存
-	ResPool map[uint16]*servSend // 发送服务器池（key:数据ID#RCV）
-	RecPool map[uint16]*recvServ // 接收服务器池（key:数据ID#SND）
-	NetCap  int                  // 线路容量（数据报个数）
+	Acks    chan<- ackInfo       // 确认信息传递
+	SndPool map[uint16]*servSend // 发送服务器池（key:数据ID#SND）
+	RcvPool map[uint16]*recvServ // 接收服务器池（key:数据ID#RCV）
 	clean   func(net.Addr)       // 断开清理（Listener）
 }
 
@@ -124,8 +125,8 @@ func newService(w *connWriter, clean func(net.Addr)) *service {
 	return &service{
 		Sndx:    newXSender(w, ch),
 		Pch:     ch,
-		RecPool: make(map[uint16]*recvServ),
-		NetCap:  0,
+		SndPool: make(map[uint16]*servSend),
+		RcvPool: make(map[uint16]*recvServ),
 		clean:   clean,
 	}
 }
@@ -223,15 +224,15 @@ type xSender struct {
 	Conn *connWriter   // 数据报网络发送器
 	Rate *rateEval     // 速率评估器
 	Pch  <-chan packet // 待发送数据包通道（有缓存）
-	head *ackInfo      // 确认信息链头
-	foot *ackInfo      // 确认信息链尾
+	head *ackReq       // 确认申请链头
+	foot *ackReq       // 确认申请链尾
 }
 
 func newXSender(w *connWriter, pch <-chan packet) *xSender {
 	return &xSender{
 		Conn: w,
-		Rate: newRateEval(),
-		Pch:  pch,
+		// Rate: newRateEval(),
+		Pch: pch,
 	}
 }
 
@@ -259,10 +260,12 @@ func (x *xSender) Ack(sid, seq uint16, rtp bool) {
 }
 
 //
-// 确认信息。
+// 确认申请。
+// 用于接收器提供确认申请给发送总管。
+// 发送总管将信息嵌入头部携带数据一同发送。
 //
-type ackInfo struct {
-	next *ackInfo
+type ackReq struct {
+	next *ackReq
 	//
 }
 
@@ -274,7 +277,7 @@ type ackInfo struct {
 // - 根据应用的执行情况确定进度确认号，制约对端发送速率。
 // - 评估中间空缺的序号，决定是否申请重发。
 // - 当接收到END包时，申请中间缺失包的重发。
-// - 评估对端的发送距离，决定是否再次确认。
+// - 评估对端的发送距离，决定是否重新确认。
 //
 // 注：
 // 只有头部信息的申请配置，没有负载数据传递。
@@ -296,171 +299,260 @@ func (r *recvServ) Receive(data []byte, seq, dist uint16) {
 }
 
 //
+// 确认信息。
+// 对端对本端响应的确认信息。
+//
+type ackInfo struct {
+	ack  int  // 确认号
+	dist int  // 确认距离
+	end  bool // 是否为最后一个包
+}
+
+//
 // 数据报发送器。
 // 一个响应服务对应一个本类实例。
 // - 从响应器接收数据负载，构造数据报递送到总发送器。
-// - 评估对端的确认距离，判断是否丢包重发。
-// - 管理递增的序列号，重构丢失包之后已发送的数据报。。
+// - 根据对端确认距离评估丢包重发，重构丢失包之后已发送的数据报。
+// - 管理递增的序列号。
 //
 // 注记：
 // 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离会导致发送停止。
 //
 type servSend struct {
-	ID     uint16         // 数据ID#SND
-	Seq    int            // 初始序列号
-	Ack    int            // 最新的响应确认
-	Netcap int            // 网络容量
-	Pch    chan<- *packet // 数据报递送通道
-	resp   *response      // 响应器
-	stop   *goes.Stop     // 停止接收响应
-	hist   map[int][]byte // 已用备存（丢包重发用）
-	seqx   int            // 当前序列号
-	pmtu   int            // 路径MTU大小（可变）
-	mu     sync.Mutex     // pmtu/ack同步锁
+	ID    uint16         // 数据ID#SND
+	Pch   chan<- *packet // 数据报递送通道
+	Lch   <-chan int     // 丢包重发通知
+	Eval  *rateEval      // 总速率评估器
+	Rate  *evalRate      // 速率评估器
+	Resp  *response      // 响应器
+	Recv  *ackRecv       // 确认接收器
+	pmtu  int            // 路径MTU大小（可变）
+	mtuCh bool           // PMTU是否改变
+	mu    sync.Mutex     // pmtu同步锁
 }
 
-func newSender(r io.Reader, id uint16, seq int, pch chan<- *packet) *servSend {
-	s := servSend{
+func newServSend(r io.Reader, id uint16, pch chan<- *packet, re *rateEval, er *evalRate) *servSend {
+	rand.Seed(time.Now().UnixNano())
+
+	return &servSend{
 		ID:   id,
-		Seq:  seq,
-		seqx: seq,
 		Pch:  pch,
+		Eval: re,
+		Rate: er,
+		Resp: newResponse(r),
 		pmtu: mtuValue[MTUBase],
-		resp: newResponse(r),
-	}
-	// 启动服务
-	s.stop = s.Serve()
-
-	return &s
-}
-
-//
-// 启动发送服务。
-//
-func (s *servSend) Serve() *goes.Stop {
-	stop := goes.NewStop()
-
-	go func() {
-		for {
-			select {
-			case <-stop.C:
-				return
-			case s.Pch <- s.Build():
-			}
-		}
-	}()
-
-	return stop
-}
-
-//
-// 修改路径MTU大小设定。
-//
-func (s *servSend) SetMTU(size int) {
-	s.mu.Lock()
-	s.pmtu = size
-	s.mu.Unlock()
-}
-
-//
-// 结束响应分片的接收。
-//
-func (s *servSend) Close() {
-	s.stop.Exit()
-}
-
-//
-// 构建数据报。
-// 返回nil表示读取出错，上层应当通知对端。
-//
-func (s *servSend) Build() *packet {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	h := s.header()
-	b, err := s.resp.Get(h.DataSize())
-
-	if err != nil && err != io.EOF {
-		log.Printf("read [%d] error: %s", s.ID, err)
-		return nil
-	}
-	return s.packet(h, b, err == io.EOF)
-}
-
-//
-// 创建一个报头。
-//
-func (s *servSend) header() *header {
-	return &header{
-		SID:    s.ID,
-		Seq:    uint16(s.seqx % seqLimit),
-		SndDst: uint(s.seqx - s.Ack),
-		// ...
 	}
 }
 
 //
-// 创建一个数据报。
-// end 表示数据已经读取完毕（或出错）。
-//
-func (s *servSend) packet(h *header, b []byte, end bool) *packet {
-	//
-}
-
-//
-// 重建为更小的数据片集。
-// 应对MTU中途变小且丢包的情形，seq为丢失的包序号（进度线后首个丢失）。
-// 首个分组（seq）需设置重置标记。
+// 启动发送服务（阻塞）。
+// 传入的stop用于外部异常终止服务。
 // 注记：
-// 仅需处理cache内的成员，back内成员交给环回机制。
+// 丢包与正常的发送在一个Go程里处理，避免并发问题。
 //
-func (s *servSend) Rebuild(seq, size int) []*resPiece {
-	r.mu.Lock()
-	r.loss = true // 无条件暂停
-	r.mu.Unlock()
+func (s *servSend) Serve(stop *goes.Stop) {
+	// 备存，丢包重发用
+	buf := make(map[int][]byte)
 
-	n := r.seqx - seq
-	if n < 0 {
-		n = seqLimit - n
-	}
-	buf := make([]*resPiece, 0, n)
+	rand.Seed(time.Now().UnixNano())
+	// 序列号初始随机
+	seq := rand.Intn(0xffff) % seqLimit
 
-	for i := seq; ; i++ {
-		p := r.cache[i]
-		if p == nil {
-			break
+	// 重置接收
+	var rst bool
+
+	for {
+		select {
+		case <-stop.C:
+			return
+
+		case i, ok := <-s.Lch:
+			if !ok {
+				return // END 确认
+			}
+			b := buf[i]
+			s.mu.Lock()
+			if len(b) > s.pmtu {
+				s.Reslice(s.Buffer(buf, i, seq), s.pmtu)
+				s.mu.Unlock()
+				rst = true
+				break
+			}
+			s.mu.Unlock()
+			s.Pch <- s.LossBuild(s.Header(s.Recv.Ack(), i, false), b)
+
+		default:
+			p := s.Build(s.Header(s.Recv.Ack(), seq, rst))
+			s.Pch <- p
+			buf[seq] = p.Data
+			seq = (seq + 1) % seqLimit
+			rst = false
 		}
-		buf = append(buf, p)
 	}
-	buf = append(buf, r.back...)
-
-	return r.Pieces(buf, seq, size)
 }
 
 //
-// 切分数据片为指定大小的子片。
+// 提取map集内特定范围的分片集。
+// end可能小于beg，如果end在seqLimit的范围内回绕的话。
+// 注：会同时删除目标值。
 //
-func pieces(data []byte, size int) [][]byte {
-	n := len(data) / size
-	buf := make([][]byte, 0, n+1)
+func (s *servSend) Buffer(mb map[int][]byte, beg, end int) [][]byte {
+	cnt := roundCount(beg, end, seqLimit) + 1
+	buf := make([][]byte, 0, cnt)
 
-	for i := 0; i < n; i++ {
-		x := i * size
-		buf = append(buf, data[x:x+size])
-	}
-	if len(data)%size > 0 {
-		buf = append(buf, data[n*size:])
+	for i := 0; i < cnt; i++ {
+		buf = append(buf, mb[beg%seqLimit])
+		delete(mb, beg)
+		beg++
 	}
 	return buf
 }
 
 //
-// 读取数据片封装。
-// 便于数据片与可能的错误或io.EOF同时传递。
+// 对分片集重新分片。
+// 这在丢包且路径MTU变小的情况下发生。
+// 新的分片集会返还到响应器。
 //
-type piece struct {
-	Data []byte
-	Err  error
+func (s *servSend) Reslice(bs [][]byte, size int) {
+	s.Resp.Shift(pieces(bytes.Join(bs, nil), size))
+}
+
+//
+// 修改路径MTU大小设定。
+// 传递的值超出最大限度会简单忽略（记录日志）。
+//
+func (s *servSend) SetMTU(size int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.pmtu == size {
+		return
+	}
+	if size > mtuLimit {
+		log.Println(errMTULimit)
+		return
+	}
+	s.pmtu = size
+	s.mtuCh = true
+}
+
+//
+// 创建一个报头。
+// end 表示数据已经读取完毕。
+//
+func (s *servSend) Header(ack, seq int, rst bool) *header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	h := header{
+		SID:    s.ID,
+		Seq:    uint16(seq),
+		SndDst: uint(roundCount(ack, seq, seqLimit)),
+	}
+	if rst {
+		h.Flag.Set(RST)
+	}
+	if s.mtuCh {
+		h.SetMTU(s.pmtu) // 已保证无错
+		s.mtuCh = false
+	}
+	return &h
+}
+
+//
+// 构建数据报。
+// 从响应器获取数据片构造数据报。
+// 返回nil表示读取出错，上层应当通知对端。
+//
+func (s *servSend) Build(h *header) *packet {
+	b, err := s.Resp.Get(h.DataSize())
+
+	if err != nil && err != io.EOF {
+		log.Printf("read [%d] error: %s", s.ID, err)
+		return nil
+	}
+	if err == io.EOF {
+		h.Flag.Set(END)
+	}
+	return s.packet(h, b)
+}
+
+//
+// 构建丢失的包。
+// 简单提取目标序列号的历史分片构造。
+//
+func (s *servSend) LossBuild(h *header, b []byte) *packet {
+	if b == nil {
+		// 简单放弃
+		log.Println("bad Acknowledgment number: ", ack)
+		return nil
+	}
+	if size < len(b) {
+		// PMTU 变小了
+		//
+	}
+	return nil
+}
+
+//
+// 创建一个数据报。
+//
+func (s *servSend) packet(h *header, b []byte) *packet {
+	//
+}
+
+//
+// 确认接收器。
+// 接收对端的确认号和确认距离，并评估是否丢包。
+// - 丢包时通过通知信道传递丢失包的序列号。
+// - 如果包含END标记的数据报已确认，则关闭通知信道。
+//
+type ackRecv struct {
+	Sch  chan<- int     // 丢包序列号通知
+	Acks <-chan ackInfo // 确认信息接收信道
+	Loss *lossEval      // 丢包评估器
+	ack  int            // 当前确认号存储
+	mu   sync.Mutex     // ack同步锁
+}
+
+//
+// 启动接收&评估服务。
+// 传入的stop可用于异常终止服务。
+// 当收到END信息时关闭通知信道，发送器据此退出发送服务。
+//
+func (a *ackRecv) Serve(stop *goes.Stop) {
+	for {
+		select {
+		case <-stop.C:
+			return
+		case ai := <-a.Acks:
+			if ai.end {
+				close(a.Sch)
+				return
+			}
+			a.mu.Lock()
+			a.ack = ai.ack
+			a.LossEval(ai.ack, ai.dist)
+			a.mu.Unlock()
+		}
+	}
+}
+
+func (a *ackRecv) Ack() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ack
+}
+
+//
+// 丢包评估处理。
+//
+func (a *ackRecv) LossEval(ack, dist int) {
+	if dist == 1 ||
+		!a.Loss.Eval(float64(dist), a.Rate.Base()) {
+		return
+	}
+	a.Sch <- (roundBegin(ack, dist, seqLimit) + 1) % seqLimit
 }
 
 //
@@ -480,23 +572,15 @@ func newResponse(r io.Reader) *response {
 
 //
 // 获取下一个分片。
-// 优先从back的存储从提取，不能大于指定的大小。
-// back中的大数据片会被重构为指定的大小。
-//
+// 优先从back的存储从提取。
 // 作为io.EOF的error保证与最后一片数据一起返回。
 //
 func (r *response) Get(size int) ([]byte, error) {
 	if len(r.back) == 0 {
 		return r.Read(size)
 	}
-	if len(r.back[0]) > size {
-		// 重构
-		r.back = pieces(bytes.Join(r.back, nil), size)
-	}
-	b := r.back[0]
-	r.back = r.back[1:]
-
-	return b, nil
+	// 外部保证互斥调用
+	return r.Back(size), nil
 }
 
 //
@@ -521,15 +605,32 @@ func (r *response) Read(size int) ([]byte, error) {
 }
 
 //
+// 从环回集中提取首个成员。
+// 外部确认环回集不为空。
+// back中的大数据片会被重构为指定的大小。
+//
+func (r *response) Back(size int) []byte {
+	if len(r.back[0]) > size {
+		// 重构
+		r.back = pieces(bytes.Join(r.back, nil), size)
+	}
+	b := r.back[0]
+	r.back = r.back[1:]
+
+	return b
+}
+
+//
 // 环回前置插入。
 // 用于MTU突然变小后，已读取的数据返还重新分组。
+// 外部保证互斥调用。
 //
 func (r *response) Shift(bs [][]byte) {
 	r.back = append(bs, r.back...)
 }
 
 //
-// 响应分片。
+// 响应分片。？
 // pos 有4个值，表达 Data 所处的位置：
 // > 1  起始分片（BEG）
 // > 0  中间段分片
@@ -621,6 +722,41 @@ func (r *resPiece) SetAlone() {
 }
 
 //
+// 简单工具函数。
+///////////////////////////////////////////////////////////////////////////////
+
+//
+// 支持回绕的间距计算。
+//
+func roundCount(beg, end, wide int) int {
+	return (end - beg + wide) % wide
+}
+
+//
+// 支持回绕的起点计算。
+//
+func roundBegin(end, dist, wide int) int {
+	return roundCount(dist, end, wide)
+}
+
+//
+// 切分数据片为指定大小的子片。
+//
+func pieces(data []byte, size int) [][]byte {
+	n := len(data) / size
+	buf := make([][]byte, 0, n+1)
+
+	for i := 0; i < n; i++ {
+		x := i * size
+		buf = append(buf, data[x:x+size])
+	}
+	if len(data)%size > 0 {
+		buf = append(buf, data[n*size:])
+	}
+	return buf
+}
+
+//
 // 速率评估相关
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -664,12 +800,13 @@ type rateEval struct {
 // dch 与所有数据体发送实例共享（一对连系），收集相关信息。
 // 通常为一个有缓存大小的信道。
 //
-func newRateEval(total float64, dch <-chan int) *rateEval {
+func newRateEval(total float64, dch <-chan int, lch <-chan struct{}) *rateEval {
 	return &rateEval{
 		base: float64(BaseRate),
 		rate: float64(BaseRate),
 		ease: newEaseRate(total),
 		dist: dch,
+		loss: lch,
 	}
 }
 
@@ -770,6 +907,15 @@ Loop:
 		select {
 		case <-stop.C:
 			break Loop // 退出
+		case <-r.loss:
+			if x > 0 {
+				x-- // 恢复累积
+			}
+			// 无限递增
+			y++
+			r.mu.Lock()
+			r.rate += r.base * (float64(y) / lossBase)
+			r.mu.Unlock()
 		case <-tick.C:
 			if y > 0 {
 				y-- // 减速消解
@@ -780,15 +926,6 @@ Loop:
 			x++
 			r.mu.Lock()
 			r.rate = r.recover(float64(x), lossRecover)
-			r.mu.Unlock()
-		case <-r.loss:
-			if x > 0 {
-				x-- // 恢复累积
-			}
-			// 无限递增
-			y++
-			r.mu.Lock()
-			r.rate += r.base * (float64(y) / lossBase)
 			r.mu.Unlock()
 		}
 	}
@@ -810,9 +947,9 @@ func (r *rateEval) recover(x, d float64) float64 {
 //
 // 评估距离增减量影响（当前速率）。
 // 参考各数据体发送来的发送距离增减量评估当前速率。
+// 增减量累积为负时，会提升当前速率。
 //
 // 各数据体在自我休眠（发送间隔）前应当先传递距离数据。
-// 增减量累积为负时，会提升当前速率。
 //
 func (r *rateEval) distEval(zoom float64, stop *goes.Stop) {
 	var d float64
@@ -907,30 +1044,31 @@ func (f *flower) Size() int64 {
 
 //
 // 评估速率。
-// 注：不含初始段的匀速（无评估参考）。
-// 参考全局基准速率计算自身的发送速率和休眠。
+// 参考当前动态基准速率计算发送速率，用于外部发送休眠。
+// 包含普通状态和丢包状态下的速率获取。
 // 每一个数据体发送实例包含一个本类实例。
 //
 // 距离：
 // - 发送距离越大，是因为对方确认慢，故减速。
 // - 确认距离越大，丢包概率越大，故减速。
 //
-// 参考：
-// 1. 基线。即全局的基准速率。
-// 2. 跌幅。丢包之后的减速量（快减），拥塞响应。
+// 注：
+// 对外传递发送距离增减量，用于总速率评估器参考。
+// 不含初始段的匀速（无评估参考）。
 //
 type evalRate struct {
-	*lossRate            // 丢包速率评估器
+	*lossEval            // 丢包评估器
 	Zoom      float64    // 发送曲线缩放因子
 	Ease      easeRate   // 曲线速率生成
-	Dist      chan<- int // 发送距离通知
+	Dist      chan<- int // 发送距离增减量通知
 	prev      int        // 前一个发送距离暂存
 }
 
 //
 // 计算发送速率。
-// 对外传递当前发送距离，评估即时速率。
-// d 为发送距离（1-255）。
+// 对外传递当前发送距离增减量。评估即时速率。
+// d 为发送距离（1-1023）。
+// base 为当前动态基准速率。
 //
 // 每发送一个数据报调用一次。
 //
@@ -944,7 +1082,7 @@ func (e *evalRate) Rate(d int, base float64) time.Duration {
 	e.prev = d
 
 	if e.Lost() {
-		return e.lossRate.Rate(float64(d), base)
+		return e.lossEval.Rate(float64(d), base)
 	}
 	return time.Duration(
 		e.Ease.Send(float64(d), base, e.Zoom, float64(capRange)),
@@ -952,27 +1090,25 @@ func (e *evalRate) Rate(d int, base float64) time.Duration {
 }
 
 //
-// 丢包速率评估器。
-// （发送方）
+// 丢包评估器（发送方）。
+// 根据确认距离评估是否丢包，提供丢包阶段速率。
 //
-type lossRate struct {
-	Zoom float64         // 丢包曲线缩放因子
-	Ease easeRate        // 曲线速率生成
-	Loss chan<- struct{} // 丢包通知信道
-	fall float64         // 丢包跌幅累加
-	lost int             // 丢包计步累加
-	mu   sync.Mutex      // 丢包评估分离
+type lossEval struct {
+	Zoom float64    // 丢包曲线缩放因子
+	Ease easeRate   // 曲线速率生成
+	fall float64    // 丢包跌幅累加
+	lost int        // 丢包计步累加
+	mu   sync.Mutex // 评估&查询分离
 }
 
 //
 // 新建一个实例。
 // 丢包跌幅累计初始化为基础变幅容度。
 //
-func newLossRate(ease easeRate, zoom float64, loss chan<- struct{}) *lossRate {
-	return &lossRate{
+func newLossEval(ease easeRate, zoom float64) *lossEval {
+	return &lossEval{
 		Ease: ease,
 		Zoom: zoom,
-		Loss: loss,
 		fall: float64(capRange),
 	}
 }
@@ -980,7 +1116,7 @@ func newLossRate(ease easeRate, zoom float64, loss chan<- struct{}) *lossRate {
 //
 // 是否为丢包模式。
 //
-func (l *lossRate) Lost() bool {
+func (l *lossEval) Lost() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.lost > 0
@@ -991,19 +1127,18 @@ func (l *lossRate) Lost() bool {
 // 确认距离越大，丢包概率越大。
 // 速率越低，容忍的确认距离越小，反之越大。
 // d 为确认距离。
+// base 为当前动态基准速率。
 //
 // 每收到一个确认调用一次。
 // 返回true表示一次丢包发生。
 //
-func (l *lossRate) Eval(d, base float64) bool {
-	// 速率关系
+func (l *lossEval) Eval(d, base float64) bool {
+	// 速率容忍
 	v := base / float64(BaseRate)
 	// 距离关系
 	if d*v < lossLimit {
 		return false
 	}
-	l.Loss <- struct{}{}
-
 	l.mu.Lock()
 	l.lost += lossStep
 	l.fall += float64(lossFall)
@@ -1017,7 +1152,7 @@ func (l *lossRate) Eval(d, base float64) bool {
 // 丢包之后的速率为快减方式：先快后缓。
 // d 为发送距离。
 //
-func (l *lossRate) Rate(d, base float64) time.Duration {
+func (l *lossEval) Rate(d, base float64) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
