@@ -10,9 +10,9 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #ACk         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
-//	| RPZ-  | MTU-  |.|R|S|R|B|R|B|E|              |                |
-//	| Extra | ANN/  |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
-//	| Size  | ACK   |.|Q|S|T|E|P|G|D|      (6)     |     (10)       |
+//	| MTU-  |  ...  |.|R|S|R|B|R|B|E|              |                |
+//	| ANN/  |  ...  |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
+//	| ACK   |  ...  |.|Q|S|T|E|P|G|D|      (6)     |     (10)       |
 //	+-------------------------------+-------------------------------+
 //	|                      Session verify code                      |
 //	+---------------------------------------------------------------+
@@ -45,7 +45,6 @@ const (
 )
 
 var (
-	errExt2     = errors.New("value overflow, must be between 0-15")
 	errMTULimit = errors.New("value overflow, must be 32 bits")
 	errNetwork  = errors.New("bad network name between two DCPAddr")
 	errOverflow = errors.New("exceeded the number of resource queries")
@@ -164,27 +163,10 @@ type header struct {
 
 // MTU 大小。
 func (h *header) MTUSize() int {
-	if h.Ext2&0xf == 0xf {
+	if h.Ext2>>4 == 0xf {
 		return int(h.mtuSz)
 	}
-	return mtuValue[h.Ext2&0xf]
-}
-
-// RPZ 扩展大小。
-func (h *header) RPZSize() int {
-	return int(h.Ext2 >> 4)
-}
-
-//
-// 返回可携带的有效负载大小。
-// 注：减去头部固定长度和可变的长度部分。
-//
-func (h *header) DataSize() int {
-	hd := headUDP + headBase
-	if h.Ext2&0xf == 0xf {
-		hd += mtuExtra
-	}
-	return h.MTUSize() - hd
+	return mtuValue[h.Ext2>>4]
 }
 
 // 设置MTU大小。
@@ -197,17 +179,20 @@ func (h *header) SetMTU(sz int) error {
 		h.mtuSz = uint32(sz)
 		i = 0xf
 	}
-	h.Ext2 = h.Ext2&0xf0 | i
+	h.Ext2 = h.Ext2&0xf | i<<4
 	return nil
 }
 
-// 扩展区RPZ值设置。
-func (h *header) SetRPZ(v int) error {
-	if v > 0xf || v < 0 {
-		return errExt2
+//
+// 返回可携带的有效负载大小。
+// 注：减去头部固定长度和可变的长度部分。
+//
+func (h *header) DataSize() int {
+	hd := headUDP + headBase
+	if h.Ext2&0xf == 0xf {
+		hd += mtuExtra
 	}
-	h.Ext2 = h.Ext2&0xf | byte(v)<<4
-	return nil
+	return h.MTUSize() - hd
 }
 
 // 解码头部数据。
@@ -280,7 +265,8 @@ type packet struct {
 }
 
 //
-// Bytes 序列号为字节序列。
+// Bytes 编码为字节序列。
+// 如果出错返回nil，同时记录日志。这通常很少发生。
 //
 func (p packet) Bytes() []byte {
 	//
