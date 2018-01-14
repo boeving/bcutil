@@ -10,22 +10,32 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #ACk         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
-//	| MTU-  |  ...  |.|R|S|R|B|R|B|E|              |                |
-//	| ANN/  |  ...  |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
-//	| ACK   |  (4)  |.|Q|S|T|E|P|G|D|      (6)     |     (10)       |
+//	|      ...      |.|R|S|R|B|R|B|E|              |                |
+//	|      ...      |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
+//	|      (8)      |.|Q|S|T|E|P|G|D|      (6)     |     (10)       |
 //	+-------------------------------+-------------------------------+
 //	|                      Session verify code                      |
 //	+---------------------------------------------------------------+
-//	|                   MTU Custom size (optional)                  |
-//	+---------------------------------------------------------------+
 // 	|                       ...... (Payload)                        |
 //
-//	长度：16 + 4 可选
+//	长度：16 字节
 //	端口：UDP报头指定（4）
 //
-// 详见设计说明（design.txt）。
+// 说明详见 header.txt, design.txt。
 //
 package dcp
+
+///////////////
+/// MTU 值参考
+/// 1) 基础值。也为初始轻启动的值。
+///    576 （x-44 = 532/IPv4，x-64 = 512/IPv6）
+/// 2) 基础值IPv6。IPv6默认包大小。
+///    1280（x-64 = 1216/IPv6）
+/// 3) PPPoE链路。
+///    1492（x-44 = 1448/IPv4，x-64 = 1428/IPv6）
+/// 4) 常用以太网通路。
+///    1500（x-44 = 1456/IPv4，x-64 = 1436/IPv6）
+///////////////////////////////////////////////////////////////////////////////
 
 import (
 	"encoding/binary"
@@ -38,14 +48,15 @@ import (
 )
 
 const (
-	headUDP  = 8         // UDP报文头部长
-	headBase = 16        // 基础长度
-	mtuExtra = 4         // MTU扩展长度
-	mtuLimit = 1<<32 - 1 // MTU定制最大长度
+	headIP      = 20                // IP 报头长度
+	headUDP     = 8                 // UDP报文头部长
+	headDCP     = 16                // DCP头部长
+	lenHead     = headUDP + headDCP // 头部总长（除IP报头）
+	mtuBase     = 576               // 基础MTU值
+	mtuBaseIPv6 = 1280              // IPv6 MTU基础值
 )
 
 var (
-	errMTULimit = errors.New("value overflow, must be 32 bits")
 	errNetwork  = errors.New("bad network name between two DCPAddr")
 	errOverflow = errors.New("exceeded the number of resource queries")
 	errZero     = errors.New("no data for Query")
@@ -111,95 +122,25 @@ func (f *flag) Set(v flag) {
 	*f |= v
 }
 
-// MTU 基本值设置。
-const (
-	MTUBase     = 1  // 基础值
-	MTUBaseIPv6 = 2  // IPv6 基础值
-	MTUPPPoE    = 3  // PPPoE 拨号带宽
-	MTUEther    = 4  // 普通网卡
-	MTUFull64k  = 14 // 本地64k窗口
-)
-
-//
-// MTU 等级值定义。
-//
-var mtuValue = map[byte]int{
-	0:  0,     // 协商保持
-	1:  576,   // 基础值，起始轻启动
-	2:  1280,  // 基础值2，IPv6默认包大小
-	3:  1492,  // PPPoE链路大小
-	4:  1500,  // 以太网络
-	14: 65535, // 本地最大窗口
-	15: -1,    // 扩展
-}
-
-//
-// MTU 等级索引。
-// mtuValue 的键值反转。用于探测值对应。
-//
-var mtuIndex = map[int]byte{
-	0:     0,  // 保持不变
-	576:   1,  // 基础值
-	1280:  2,  // 基础值2
-	1492:  3,  // PPPoE链路大小
-	1500:  4,  // 以太网络
-	65535: 14, // 本地最大窗口
-}
-
 //
 // 头部结构。
 // 实现约定的解析和设置。
 //
 type header struct {
+	flag            // 标志区（8）
 	SID, Seq uint16 // 发送数据ID，序列号
 	RID, Ack uint16 // 接受数据ID，确认号
-	Ext2     byte   // 扩展区（4+4）
-	Flag     flag   // 标志区（8）
+	None     byte   // 保留区（8）
 	AckDst   uint   // ACK distance，确认距离
 	SndDst   uint   // Send distance，发送距离
 	Sess     uint32 // Session verify code
-	mtuSz    uint32 // MTU Custom size
-}
-
-// MTU 大小。
-func (h *header) MTUSize() int {
-	if h.Ext2>>4 == 0xf {
-		return int(h.mtuSz)
-	}
-	return mtuValue[h.Ext2>>4]
-}
-
-// 设置MTU大小。
-func (h *header) SetMTU(sz int) error {
-	if sz > mtuLimit {
-		return errMTULimit
-	}
-	i, ok := mtuIndex[sz]
-	if !ok {
-		h.mtuSz = uint32(sz)
-		i = 0xf
-	}
-	h.Ext2 = h.Ext2&0xf | i<<4
-	return nil
-}
-
-//
-// 返回可携带的有效负载大小。
-// 注：减去头部固定长度和可变的长度部分。
-//
-func (h *header) DataSize() int {
-	hd := headUDP + headBase
-	if h.Ext2&0xf == 0xf {
-		hd += mtuExtra
-	}
-	return h.MTUSize() - hd
 }
 
 // 解码头部数据。
 func (h *header) Decode(r io.Reader) error {
-	var buf [headBase]byte
+	var buf [headDCP]byte
 	n, err := io.ReadFull(r, buf[:])
-	if n != headBase {
+	if n != headDCP {
 		return err
 	}
 	// binary.BigEndian.Uint16(buf[x:x+2])
@@ -208,26 +149,13 @@ func (h *header) Decode(r io.Reader) error {
 	h.RID = uint16(buf[4])<<8 | uint16(buf[5])
 	h.Ack = uint16(buf[6])<<8 | uint16(buf[7])
 
-	h.Ext2 = buf[8]
-	h.Flag = flag(buf[9])
+	h.None = buf[8]
+	h.flag = flag(buf[9])
 	h.AckDst = uint(buf[10]) >> 2
 	h.SndDst = uint(buf[11]) | uint(buf[10]&3)<<8
 	h.Sess = binary.BigEndian.Uint32(buf[12:16])
 
-	if h.Ext2&0xf == 0xf {
-		err = h.mtuCustom(r)
-	}
 	return err
-}
-
-// 读取自定义MTU配置。
-func (h *header) mtuCustom(r io.Reader) error {
-	var buf [mtuExtra]byte
-	if n, err := io.ReadFull(r, buf[:]); n != mtuExtra {
-		return err
-	}
-	h.mtuSz = binary.BigEndian.Uint32(buf[:])
-	return nil
 }
 
 // 编码头部数据。
@@ -235,24 +163,20 @@ func (h *header) Encode() ([]byte, error) {
 	if h.AckDst > 0x3f || h.SndDst > 0x3ff {
 		return nil, errDistance
 	}
-	var buf [headBase + mtuExtra]byte
+	var buf [headDCP]byte
 
 	binary.BigEndian.PutUint16(buf[0:2], h.SID)
 	binary.BigEndian.PutUint16(buf[2:4], h.Seq)
 	binary.BigEndian.PutUint16(buf[4:6], h.RID)
 	binary.BigEndian.PutUint16(buf[6:8], h.Ack)
 
-	buf[8] = h.Ext2
-	buf[9] = byte(h.Flag)
+	buf[8] = h.None
+	buf[9] = byte(h.flag)
 	buf[10] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
 	buf[11] = byte(h.SndDst & 0xff)
 	binary.BigEndian.PutUint32(buf[12:16], h.Sess)
 
-	if h.Ext2&0xf == 0xf {
-		binary.BigEndian.PutUint32(buf[16:20], h.mtuSz)
-		return buf[:], nil
-	}
-	return buf[:headBase], nil
+	return buf[:], nil
 }
 
 //
@@ -289,6 +213,9 @@ type connReader struct {
 	Conn *net.UDPConn
 }
 
+//
+// 读取构造数据报实例。
+//
 func (r *connReader) Receive() (packet, net.Addr, error) {
 	//
 }
@@ -305,7 +232,10 @@ type connWriter struct {
 	Conn  *net.UDPConn
 }
 
-func (w *connWriter) Send(data packet) (int, error) {
+//
+// 写入目标数据报实例。
+//
+func (w *connWriter) Send(p packet) (int, error) {
 	//
 }
 

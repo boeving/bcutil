@@ -340,7 +340,7 @@ func newServSend(r io.Reader, id uint16, pch chan<- *packet, re *rateEval, er *e
 		Eval: re,
 		Rate: er,
 		Resp: newResponse(r),
-		pmtu: mtuValue[MTUBase],
+		pmtu: mtuBase,
 	}
 }
 
