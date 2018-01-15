@@ -10,9 +10,9 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #ACk         |     Acknowledgment number     |
 //	+-------------------------------+-------------------------------+
-//	|      ...      |.|R|S|R|B|R|B|E|              |                |
-//	|      ...      |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
-//	|      (8)      |.|Q|S|T|E|P|G|D|      (6)     |     (10)       |
+//	| RPZ-  |  ...  |.|R|S|R|B|R|B|E|              |                |
+//	| Extra |  ...  |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
+//	| Size  |  (4)  |.|Q|S|T|E|P|G|D|      (6)     |     (10)       |
 //	+-------------------------------+-------------------------------+
 //	|                      Session verify code                      |
 //	+---------------------------------------------------------------+
@@ -48,15 +48,16 @@ import (
 )
 
 const (
-	headIP      = 20                // IP 报头长度
-	headUDP     = 8                 // UDP报文头部长
-	headDCP     = 16                // DCP头部长
-	lenHead     = headUDP + headDCP // 头部总长（除IP报头）
-	mtuBase     = 576               // 基础MTU值
-	mtuBaseIPv6 = 1280              // IPv6 MTU基础值
+	headIP      = 20                         // IP 报头长度
+	headUDP     = 8                          // UDP报文头部长
+	headDCP     = 16                         // DCP头部长
+	headAll     = headDCP + headUDP + headIP // 头部总长（除IP报头）
+	mtuBase     = 576                        // 基础MTU值
+	mtuBaseIPv6 = 1280                       // IPv6 MTU基础值
 )
 
 var (
+	errRpzSize  = errors.New("value overflow, must be between 0-15")
 	errNetwork  = errors.New("bad network name between two DCPAddr")
 	errOverflow = errors.New("exceeded the number of resource queries")
 	errZero     = errors.New("no data for Query")
@@ -130,10 +131,24 @@ type header struct {
 	flag            // 标志区（8）
 	SID, Seq uint16 // 发送数据ID，序列号
 	RID, Ack uint16 // 接受数据ID，确认号
-	None     byte   // 保留区（8）
+	Rpz      byte   // RPZ扩展区（4）
 	AckDst   uint   // ACK distance，确认距离
 	SndDst   uint   // Send distance，发送距离
 	Sess     uint32 // Session verify code
+}
+
+// RPZ 扩展大小。
+func (h *header) RPZSize() int {
+	return int(h.Rpz >> 4)
+}
+
+// 扩展区RPZ值设置。
+func (h *header) SetRPZ(v int) error {
+	if v > 0xf || v < 0 {
+		return errRpzSize
+	}
+	h.Rpz = h.Rpz&0xf | byte(v)<<4
+	return nil
 }
 
 // 解码头部数据。
@@ -149,7 +164,7 @@ func (h *header) Decode(r io.Reader) error {
 	h.RID = uint16(buf[4])<<8 | uint16(buf[5])
 	h.Ack = uint16(buf[6])<<8 | uint16(buf[7])
 
-	h.None = buf[8]
+	h.Rpz = buf[8]
 	h.flag = flag(buf[9])
 	h.AckDst = uint(buf[10]) >> 2
 	h.SndDst = uint(buf[11]) | uint(buf[10]&3)<<8
@@ -170,7 +185,7 @@ func (h *header) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint16(buf[4:6], h.RID)
 	binary.BigEndian.PutUint16(buf[6:8], h.Ack)
 
-	buf[8] = h.None
+	buf[8] = h.Rpz
 	buf[9] = byte(h.flag)
 	buf[10] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
 	buf[11] = byte(h.SndDst & 0xff)
