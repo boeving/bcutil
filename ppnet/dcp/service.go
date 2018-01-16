@@ -98,6 +98,7 @@ const (
 	baseRatio         = 0.1              // 基准速率调整步进比率
 	dataFull    int64 = 1024 * 576       // 满载数据量（概略值）
 	seqLimit          = 0xffff           // 序列号上限（不含）
+	badTries          = 5                // 响应读取出错再尝试次数
 )
 
 var (
@@ -141,11 +142,11 @@ func (s *service) Start() *service {
 //
 // 递送数据报。
 // 由监听器读取网络接口解析后分发。
-//
 // 事项：
 // - 判断数据报是对端的请求还是对端对本地请求的响应。
-//   请求交由响应器接口，响应交由接收器接口。
-// - 向响应器传递确认距离（对本端响应的确认）。
+//   请求交由响应&发送器接口，响应交由接收器接口。
+// - 向响应接口（ackRecv）传递确认号和确认距离（ackInfo）。
+// - 向接收器接口传递数据&序列号和发送距离。
 //
 func (s *service) Post(pack packet) {
 	//
@@ -221,18 +222,20 @@ type session struct {
 // 用单向链表存储确认信息申请，以保持先到先用的顺序。
 //
 type xSender struct {
-	Conn *connWriter   // 数据报网络发送器
-	Rate *rateEval     // 速率评估器
-	Pch  <-chan packet // 待发送数据包通道（有缓存）
-	head *ackReq       // 确认申请链头
-	foot *ackReq       // 确认申请链尾
+	Conn  *connWriter   // 数据报网络发送器
+	Rate  *rateEval     // 速率评估器
+	Post  <-chan packet // 待发送数据包通道（有缓存，一定有序性）
+	head  *ackReq       // 确认申请链头
+	foot  *ackReq       // 确认申请链尾
+	rhead *rtpReq       // 申请重发链头
+	rfoot *rtpReq       // 申请重发链尾
 }
 
 func newXSender(w *connWriter, pch <-chan packet) *xSender {
 	return &xSender{
 		Conn: w,
 		// Rate: newRateEval(),
-		Pch: pch,
+		Post: pch,
 	}
 }
 
@@ -250,12 +253,12 @@ func (x *xSender) Request(res []byte) error {
 //
 // sid 为接收到的发送数据ID#SND（将变成#RCV）。
 // seq 为确认的序列号或申请重发的序列号，将作为确认字段里的数据。
-// rtp 为申请重发标识。
+// rtp 为申请重发，有较高优先性。
 //
 // 注：
 // 正常的确认与重发申请不同仅在于重发标记和确认距离（为零）。
 //
-func (x *xSender) Ack(sid, seq uint16, rtp bool) {
+func (x *xSender) Acked(sid, seq, dist int, rtp bool) {
 	//
 }
 
@@ -270,23 +273,48 @@ type ackReq struct {
 }
 
 //
+// 重发申请。
+// 与确认申请类似，提供给发送总管携带数据一同发送。
+//
+type rtpReq struct {
+	next *rtpReq
+}
+
+//
+// 发送信息。
+// 对端发送过来的响应数据。
+//
+type sndInfo struct {
+	seq  int    // 序列号
+	dist int    // 发送距离（对确认的再回馈）
+	data []byte // 响应数据
+}
+
+//
 // 接收服务器。
-// 处理对端传输来的响应数据，一个数据体对应一个本类实例。
+// 处理对端传输来的响应数据。向发送总管提供确认或重发申请。
+// 一个数据体对应一个本类实例。
 //
-// 调用发送服务接口，拥有高优先级。
-// - 根据应用的执行情况确定进度确认号，制约对端发送速率。
+// - 根据应用接收数据的情况确定进度号，约束对端发送速率。
 // - 评估中间空缺的序号，决定是否申请重发。
-// - 当接收到END包时，申请中间缺失包的重发。
-// - 评估对端的发送距离，决定是否重新确认。
+// - 当接收到END包时，优先申请中间缺失包的重发。
+// - 评估对端的发送距离，决定是否重新确认（进度未变时）。
 //
-// 注：
+// 注记：
 // 只有头部信息的申请配置，没有负载数据传递。
 //
 type recvServ struct {
-	Recv   Receiver // 接收器实例，响应写入
-	Acked  uint16   // 实际确认号，接收进度
-	CurAck uint16   // 当前确认号，发送抑制
-	Sndx   *xSender // 总发送器，头信息申请
+	Recv  Receiver // 接收器实例，响应写入
+	Acked int      // 实际确认号（接收进度）
+	Line  int      // 进度线（发送抑制）
+	Seqx  int      // 当前接收序列号（确认目标和距离）
+}
+
+//
+// 启动接收服务。
+//
+func (r *recvServ) Serve(sx *xSender, stop *goes.Stop) {
+	//
 }
 
 //
@@ -296,6 +324,24 @@ type recvServ struct {
 //
 func (r *recvServ) Receive(data []byte, seq, dist uint16) {
 	//
+}
+
+//
+// 重发申请评估。
+// 因子：
+// - 前包遗失时间长度；
+// - 前段缺失包个数、距离；
+// - END包前段遗失优先弥补；
+//
+type rtpEval struct {
+	//
+}
+
+//
+// 重新确认评估。
+// 注：仅限于进度线停止期间。
+//
+type reAck struct {
 }
 
 //
@@ -309,69 +355,6 @@ type ackInfo struct {
 }
 
 //
-// 路径MTU大小通知器。
-// 用于全局对各数据体发送器的PMTU通知。
-//
-type mtuSizer struct {
-	Chg <-chan int // 修改信道
-	Snd chan<- int // 发送信道
-	val int        // 当前值（初始mtuBase）
-}
-
-func newMTUSize(chg <-chan int, snd chan<- int) *mtuSizer {
-	return &mtuSizer{
-		Chg: chg,
-		Snd: snd,
-		val: mtuBase,
-	}
-}
-
-//
-// 启动服务（阻塞）。
-// 外部通过修改信道传递更新值，通过发送信道取值。
-// stop 用于外部终止服务。
-//
-func (m *mtuSizer) Serve(stop *goes.Stop) {
-	for {
-		select {
-		case <-stop.C:
-			return
-		case m.val = <-m.Chg:
-		case m.Snd <- m.val:
-		}
-	}
-}
-
-//
-// 基准速率通知器。
-//
-type baseRater struct {
-	Eval *rateEval            // 总速率评估器
-	Snd  chan<- time.Duration // 基准速率递送
-}
-
-func newBaseRater(re *rateEval, snd chan<- time.Duration) *baseRater {
-	return &baseRater{
-		Eval: re,
-		Snd:  snd,
-	}
-}
-
-//
-// 启动服务（阻塞）。
-// 逻辑与用法类似mtuSizer:Serve方法。
-//
-func (b *baseRater) Serve(stop *goes.Stop) {
-	for {
-		select {
-		case <-stop.C:
-			return
-		case b.Snd <- time.Duration(b.Eval.Base()):
-		}
-	}
-}
-
-//
 // 数据报发送器。
 // 一个响应服务对应一个本类实例。
 // - 从响应器接收数据负载，构造数据报递送到总发送器。
@@ -379,7 +362,7 @@ func (b *baseRater) Serve(stop *goes.Stop) {
 // - 管理递增的序列号。
 //
 // 注记：
-// 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离会导致发送停止。
+// 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离也会让发送停止。
 //
 type servSend struct {
 	ID   uint16         // 数据ID#SND
@@ -401,16 +384,17 @@ func (s *servSend) DataSize() int {
 //
 // 启动发送服务（阻塞）。
 // 传入的stop用于外部异常终止服务。
+// 丢失的包可能简单重传或重组（小包），不受速率限制立即发送。
 // 注记：
-// 丢包与正常的发送在一个Go程里处理，避免并发问题。
+// 丢包与正常的发送在一个Go程里处理，无并发问题。
 //
 func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 	rst := false
-	buf := make(map[int][]byte)
+	buf := make(map[int]*packet)
 
 	rand.Seed(time.Now().UnixNano())
 	// 随机初始值
-	seq := rand.Intn(0xffff) % seqLimit
+	seq := rand.Intn(0xffff-1) % seqLimit
 
 	for {
 		size := s.DataSize()
@@ -422,32 +406,39 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 			if !ok {
 				return // END 确认
 			}
-			if rst {
-				break // 已重构，忽略
+			p := buf[i]
+			if rst || p == nil {
+				break // 已被重构，忽略
 			}
-			b := buf[i]
 			switch {
-			case len(b) == size:
-				// 简单重传，即时发送
-				s.Post <- s.LossBuild(i, b)
+			case len(p.Data) == size:
+				// 简单重传
+				s.Post <- p
+				log.Printf("lost packet [%d] retransmission.", i)
 
-			case len(b) < size:
-				// 小包重组，即时发送
-				s.Post <- s.Combine(buf, i, size)
+			case len(p.Data) < size:
+				// 小包重组
+				p, n := s.Combine(buf, i, seq, size)
+				s.Post <- p
+				log.Printf("repacketization from %d to %d", i, i+n-1)
 
 			default:
 				// 全部重构
 				s.Reslice(s.Buffer(buf, i, seq), size)
 				rst = true
+				seq = i
+				log.Printf("rebuild all packets from %d", i)
 			}
 		default:
 			p := s.Build(seq, size, rst)
-
+			if p == nil {
+				return
+			}
 			// 速率控制
 			time.Sleep(s.Eval.Rate(int(p.SndDst), re.Base()))
 			s.Post <- p
 
-			buf[seq] = p.Data
+			buf[seq] = p
 			seq = (seq + 1) % seqLimit
 			rst = false
 		}
@@ -459,14 +450,14 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 // end可能小于beg，如果end在seqLimit的范围内回绕的话。
 // 注：会同时删除目标值。
 //
-func (s *servSend) Buffer(mb map[int][]byte, beg, end int) [][]byte {
-	cnt := roundSpacing(beg, end, seqLimit) + 1
+func (s *servSend) Buffer(mp map[int]*packet, beg, end int) [][]byte {
+	cnt := roundSpacing(beg, end, seqLimit)
 	buf := make([][]byte, 0, cnt)
 
 	for i := 0; i < cnt; i++ {
-		buf = append(buf, mb[beg%seqLimit])
-		delete(mb, beg)
-		beg++
+		buf = append(buf, mp[beg].Data)
+		delete(mp, beg)
+		beg = (beg + 1) % seqLimit
 	}
 	return buf
 }
@@ -497,49 +488,79 @@ func (s *servSend) Header(ack, seq int) *header {
 // 会尽量合并后续连续小包（最多15个），但也可能无法合并。
 // 如果成功合并，头部会设置RST标记。
 //
-// buf 为历史栈，被合并的条目会被清除（后续丢包可能定位到）。
-// 历史栈中无数据时，返回nil。
+// hist 为历史栈，被合并的条目会被清除（后续丢包可能定位到）。
+// end 为合法的最后位置（当前序列号）。
+// 返回重组的包或首个包（无法合并时）和重组的包个数。
 //
-func (s *servSend) Combine(buf map[int][]byte, beg, size int) *packet {
-	b := buf[beg]
-	if b == nil {
-		return nil
+// 注：
+// - 重组的首个包外部保证不为nil。
+// - 除首个包外，删除被重组的包存储（后续丢失处理排除）。
+//
+func (s *servSend) Combine(hist map[int]*packet, beg, max, size int) (*packet, int) {
+	seq := (beg + 1) % seqLimit
+	cnt := roundSpacing(beg, max, seqLimit)
+	if cnt > 15 {
+		cnt = 15
 	}
-	//
+	var sum int
+	var end bool
+	buf := make([][]byte, 1, cnt+1)
+	// 首个备用
+	first := hist[beg]
+	buf[0] = first.Data
+
+	for i := 0; i < cnt; i++ {
+		p, ok := hist[seq]
+		if !ok {
+			break
+		}
+		sum += len(p.Data)
+		if sum > size {
+			break
+		}
+		buf = append(buf, p.Data)
+		end = p.END()
+		delete(hist, seq)
+		seq = (seq + 1) % seqLimit
+	}
+	n := len(buf)
+	if n == 1 {
+		return first, 1
+	}
+	return s.build(bytes.Join(buf, nil), beg, n-1, true, end), n
 }
 
 //
 // 构建数据报。
 // 从响应器获取数据片构造数据报。
-// 返回nil表示读取出错，发送总管通常选择忽略（记录日志）。
+// 返回nil表示读取出错（记录日志）。
 //
 func (s *servSend) Build(seq, size int, rst bool) *packet {
 	b, err := s.Resp.Get(size)
-	if err != nil && err != io.EOF {
-		log.Printf("read [%d] error: %s", s.ID, err)
+	if b == nil {
 		return nil
 	}
-	h := s.Header(s.Recv.Ack(), seq)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		log.Printf("read [%d] error: %s.", s.ID, err)
+		return nil
+	}
+	return s.build(b, seq, 0, rst, err != nil)
+}
 
-	if err == io.EOF {
+//
+// 构建数据报。
+//
+func (s *servSend) build(b []byte, seq, rpz int, rst, end bool) *packet {
+	h := s.Header(s.Recv.Ack(), seq)
+	if end {
 		h.Set(END)
 	}
 	if rst {
 		h.Set(RST)
 	}
-	return s.packet(h, b)
-}
-
-//
-// 构建丢失的包。
-// 会忽略没有实际数据的分片。
-//
-func (s *servSend) LossBuild(seq int, b []byte) *packet {
-	if b == nil {
-		log.Println("no data with sequence: ", seq)
-		return nil
+	if rpz != 0 {
+		h.SetRPZ(rpz)
 	}
-	h := s.Header(s.Recv.Ack(), seq)
 	return s.packet(h, b)
 }
 
@@ -547,7 +568,7 @@ func (s *servSend) LossBuild(seq int, b []byte) *packet {
 // 创建一个数据报。
 //
 func (s *servSend) packet(h *header, b []byte) *packet {
-	//
+	return &packet{header: h, Data: b}
 }
 
 //
@@ -607,7 +628,9 @@ func (a *ackRecv) LossEval(ack, dist int, re *rateEval) {
 
 //
 // 请求响应器。
-// 提供对端请求需要的响应数据。一个数据体对应一个本类实例。
+// 提供对端请求需要的响应数据。
+// 非并发安全，外部保证单Go程处理。
+// 一个数据体对应一个本类实例。
 //
 type response struct {
 	rb   *bufio.Reader // 响应读取器
@@ -642,7 +665,7 @@ func (r *response) Get(size int) ([]byte, error) {
 //
 func (r *response) Read(size int) ([]byte, error) {
 	buf := make([]byte, size)
-	n, err := r.rb.Read(buf)
+	n, err := io.ReadFull(r.rb, buf)
 
 	if n == 0 {
 		return nil, err
@@ -680,99 +703,7 @@ func (r *response) Shift(bs [][]byte) {
 }
 
 //
-// 响应分片。？
-// pos 有4个值，表达 Data 所处的位置：
-// > 1  起始分片（BEG）
-// > 0  中间段分片
-// > -1 末尾分片（END）
-// > 2  独立分片（BEG & END）
-//
-type resPiece struct {
-	Seq  int    // 序列号
-	Data []byte // 分片数据
-	pos  int    // 分片位置
-}
-
-func (r *resPiece) Size() int {
-	return len(r.Data)
-}
-
-//
-// 将自身切分为指定大小的多个响应分片实例。
-// 需要处理序列号的顺序递增/回绕和各分片的位置标记。
-//
-// seq 为起始序列号。size 为新的大小限制。
-//
-func (r *resPiece) Pieces(seq, size int) []*resPiece {
-	if r.Size() <= size {
-		return []*resPiece{r}
-	}
-	bs := r.pieces(r.Data, size)
-	max := len(bs)
-	buf := make([]*resPiece, 0, max)
-
-	// 数据与序列号
-	for i := 0; i < max; i++ {
-		seq = (seq + i) % seqLimit
-		buf = append(buf, &resPiece{Data: bs[i], Seq: seq})
-	}
-	// 位置标记
-	switch {
-	case r.Beg():
-		buf[0].SetBeg()
-	case r.End():
-		buf[len(buf)-1].SetEnd()
-	case r.Alone():
-		buf[0].SetBeg()
-		buf[len(buf)-1].SetEnd()
-	}
-
-	return buf
-}
-
-//
-// 切分数据片为指定大小的子分片。
-//
-func (r *resPiece) pieces(data []byte, size int) [][]byte {
-	var buf [][]byte
-	n := len(data) / size
-
-	for i := 0; i < n; i++ {
-		x := i * size
-		buf = append(buf, data[x:x+size])
-	}
-	if len(data)%size > 0 {
-		buf = append(buf, data[n*size:])
-	}
-	return buf
-}
-
-func (r *resPiece) Beg() bool {
-	return r.pos == 1
-}
-
-func (r *resPiece) End() bool {
-	return r.pos == -1
-}
-
-func (r *resPiece) Alone() bool {
-	return r.pos == 2
-}
-
-func (r *resPiece) SetBeg() {
-	r.pos = 1
-}
-
-func (r *resPiece) SetEnd() {
-	r.pos = -1
-}
-
-func (r *resPiece) SetAlone() {
-	r.pos = 2
-}
-
-//
-// 简单工具函数。
+// 简单工具集。
 ///////////////////////////////////////////////////////////////////////////////
 
 //
@@ -790,8 +721,9 @@ func roundBegin(end, dist, wide int) int {
 }
 
 //
-// 限制计数器。
-// 对特定键计数，当到达或超过最大限度时返回真。
+// 限定计数器。
+// 对特定键计数，到达和超过目标限度后返回真。
+// 不含限度值本身（如：3，返回2个true）。
 // 如果目标键改变，计数起始重置为零。
 //
 // max 为计数最大值（应为正值）。
@@ -827,6 +759,40 @@ func pieces(data []byte, size int) [][]byte {
 		buf = append(buf, data[n*size:])
 	}
 	return buf
+}
+
+//
+// 路径MTU大小通知器。
+// 用于全局对各数据体发送器的PMTU通知。
+//
+type mtuSize struct {
+	Chg <-chan int // 修改信道
+	Snd chan<- int // 发送信道
+	val int        // 当前值（初始mtuBase）
+}
+
+func newMTUSize(chg <-chan int, snd chan<- int) *mtuSize {
+	return &mtuSize{
+		Chg: chg,
+		Snd: snd,
+		val: mtuBase,
+	}
+}
+
+//
+// 启动服务（阻塞）。
+// 外部通过修改信道传递更新值，通过发送信道取值。
+// stop 用于外部终止服务。
+//
+func (m *mtuSize) Serve(stop *goes.Stop) {
+	for {
+		select {
+		case <-stop.C:
+			return
+		case m.val = <-m.Chg:
+		case m.Snd <- m.val:
+		}
+	}
 }
 
 //
@@ -923,8 +889,8 @@ func (r *rateEval) Serve(zoom float64) *goes.Stop {
 }
 
 //
-// 基准速率评估。
-// 按一定的节奏评估当前速率，调优基准速率。
+// 基准速率评估（阻塞）。
+// 按一定的节奏用参考前速率调优基准速率。
 //
 func (r *rateEval) baseEval(stop *goes.Stop) {
 	tick := time.NewTicker(baseTick)
@@ -1259,9 +1225,9 @@ func newEaseRate(total float64) easeRate {
 
 //
 // 正常发送速率。
-// 慢减：先缓慢减速，越到后面减速越快（指数退避）。
+// 慢进：先慢后快（指数进度）。
 //
-// x 为发送距离，可能超过底部总值。
+// x 为变化因子（可能为负），不局限在底部总值内。
 // base 为基准速率（间隔时长）。
 // cap 为速率降低的幅度容量。
 // zoom 为缩放因子（比率曲线中的 k）。
