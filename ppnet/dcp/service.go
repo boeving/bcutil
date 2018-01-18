@@ -100,6 +100,7 @@ const (
 	seqLimit           = 0xffff                 // 序列号上限（不含）
 	sendBadTries       = 3                      // 发送出错再尝试次数
 	sendBadSleep       = 100 * time.Millisecond // 发送出错再尝试暂停时间
+	sendPackets        = 40                     // 发送通道缓存（有序性）
 )
 
 var (
@@ -114,15 +115,14 @@ var (
 type service struct {
 	Resp    Responser            // 请求响应器
 	Sndx    *xSender             // 总发送器
-	Pch     chan packet          // 数据报发送信道备存
+	Pch     chan *packet         // 数据报发送信道备存
 	Acks    chan<- ackInfo       // 确认信息传递
 	SndPool map[uint16]*servSend // 发送服务器池（key:数据ID#SND）
-	RcvPool map[uint16]*recvServ // 接收服务器池（key:数据ID#RCV）
 	clean   func(net.Addr)       // 断开清理（Listener）
 }
 
 func newService(w *connWriter, clean func(net.Addr)) *service {
-	ch := make(chan packet)
+	ch := make(chan *packet, sendPackets)
 
 	return &service{
 		Sndx:    newXSender(w, ch),
@@ -230,12 +230,11 @@ type session struct {
 // 用单向链表存储确认信息申请，以保持先到先用的顺序。
 //
 type xSender struct {
-	Conn *connWriter    // 数据报网络发送器
-	Eval *rateEval      // 速率评估器
-	Post <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
-	head *ackReq        // 确认申请链头
-	foot *ackReq        // 确认申请链尾
-	mu   sync.Mutex     // 申请链读写互斥
+	Conn    *connWriter          // 数据报网络发送器
+	Eval    *rateEval            // 速率评估器
+	Post    <-chan *packet       // 待发送数据包通道（有缓存，一定有序性）
+	Acks    <-chan *ackReq       // 待确认信息包通道（同上）
+	RcvPool map[uint16]*recvServ // 接收服务器池（key:数据ID#RCV）
 }
 
 func newXSender(w *connWriter, pch <-chan *packet) *xSender {
@@ -250,35 +249,31 @@ func (x *xSender) Serve(stop *goes.Stop) {
 	for {
 		var p *packet
 		var req *ackReq
-		var pau = x.Eval.Rate()
 
 		select {
 		case <-stop.C:
 			return
+
 		case p = <-x.Post:
-			// 数据体响应出错，忽略
-			// 注：接收端等待超时后可重新请求。
+			// 忽略响应出错
+			// 接收端可等待超时后可重新请求。
 			if p == nil {
 				continue
 			}
-			req = x.FirstAckReq()
-		default:
-			// 无数据时的单独确认
-			req = x.FirstAckReq()
+			req = x.AckReq()
+
+		case req = <-x.Acks:
 			if req == nil {
-				// 轮询
-				time.Sleep(pau)
 				continue
 			}
-			p = x.emptyPacket()
+			p = x.Packet()
 		}
 		// 失败后退出
-		// （内部已多次尝试）。
 		if n, err := x.Send(p, req); err != nil {
 			log.Printf("write to net %d tries, but all failed.", n)
 			return
 		}
-		time.Sleep(pau)
+		time.Sleep(x.Eval.Rate())
 	}
 }
 
@@ -288,6 +283,32 @@ func (x *xSender) Serve(stop *goes.Stop) {
 //
 func (x *xSender) Request(res []byte) error {
 	//
+}
+
+//
+// 从通道提取数据报。
+// 非阻塞，如果通道无数据返回一个空包。
+//
+func (x *xSender) Packet() *packet {
+	select {
+	case p := <-x.Post:
+		return p
+	default:
+		return x.emptyPacket()
+	}
+}
+
+//
+// 从通道提取确认申请信息。
+// 非阻塞，如果通道无数据返回nil。
+//
+func (x *xSender) AckReq() *ackReq {
+	select {
+	case r := <-x.Acks:
+		return r
+	default:
+		return nil
+	}
 }
 
 //
@@ -341,58 +362,26 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 }
 
 //
-// 申请确认或重发请求。
-// 仅由接收服务器调用，用于正常的确认申请。
-//
-func (x *xSender) ReqAck(req *ackReq) {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-
-	if x.head == nil {
-		x.head = req
-		x.foot = req
-		return
-	}
-	x.foot.Next = req
-	x.foot = req
-}
-
-//
-// 提取首个确认或重发申请。
-//
-func (x *xSender) FirstAckReq() *ackReq {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-
-	if x.head == nil {
-		return nil
-	}
-	req := x.head
-	x.head = x.head.Next
-	return req
-}
-
-//
 // 确认或重发请求申请。
 // 用于接收器提供确认申请重发请求给发送总管。
 // 发送总管将信息设置到数据报头后发送（发送器提供）。
 //
 type ackReq struct {
-	ID   int     // 数据ID#RCV
-	Recv int     // 接收号
-	Dist int     // 确认距离（0值用于首个确认）
-	Rtp  bool    // 重发请求
-	Next *ackReq // 申请队列
+	ID   uint16 // 数据ID#RCV
+	Recv uint16 // 接收号
+	Dist int    // 确认距离（0值用于首个确认）
+	Rtp  bool   // 重发请求
 }
 
 //
 // 发送信息。
 // 对端发送过来的响应数据。
+// 将传递给接收服务器（recvServ）使用。
 //
 type sndInfo struct {
-	seq  int    // 序列号
-	dist int    // 发送距离（对确认的再回馈）
-	data []byte // 响应数据
+	Seq  uint16 // 序列号
+	Dist int    // 发送距离（对确认的再回馈）
+	Data []byte // 响应数据
 }
 
 //
@@ -437,6 +426,13 @@ func (r *recvServ) Reset(seq, rpz int) {
 // 接收响应数据。
 //
 func (r *recvServ) Receive(d *sndInfo) {
+	//
+}
+
+//
+// 确认评估。
+//
+type ackEval struct {
 	//
 }
 
