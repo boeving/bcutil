@@ -8,7 +8,7 @@
 //	+-------------------------------+-------------------------------+
 //	|          Data ID #SND         |        Sequence number        |
 //	+-------------------------------+-------------------------------+
-//	|          Data ID #ACk         |     Acknowledgment number     |
+//	|          Data ID #RCV         |        Receival number        |
 //	+-------------------------------+-------------------------------+
 //	| RPZ-  |  ...  |.|R|S|R|B|R|B|E|              |                |
 //	| Extra |  ...  |.|E|E|S|Y|T|E|N| ACK distance |  Send distance |
@@ -130,7 +130,7 @@ func (f *flag) Set(v flag) {
 type header struct {
 	flag            // 标志区（8）
 	SID, Seq uint16 // 发送数据ID，序列号
-	RID, Ack uint16 // 接受数据ID，确认号
+	RID, Rcv uint16 // 接受数据ID，接收号
 	Rpz      byte   // RPZ扩展区（4）
 	AckDst   uint   // ACK distance，确认距离
 	SndDst   uint   // Send distance，发送距离
@@ -162,7 +162,7 @@ func (h *header) Decode(r io.Reader) error {
 	h.SID = uint16(buf[0])<<8 | uint16(buf[1])
 	h.Seq = uint16(buf[2])<<8 | uint16(buf[3])
 	h.RID = uint16(buf[4])<<8 | uint16(buf[5])
-	h.Ack = uint16(buf[6])<<8 | uint16(buf[7])
+	h.Rcv = uint16(buf[6])<<8 | uint16(buf[7])
 
 	h.Rpz = buf[8]
 	h.flag = flag(buf[9])
@@ -183,7 +183,7 @@ func (h *header) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint16(buf[0:2], h.SID)
 	binary.BigEndian.PutUint16(buf[2:4], h.Seq)
 	binary.BigEndian.PutUint16(buf[4:6], h.RID)
-	binary.BigEndian.PutUint16(buf[6:8], h.Ack)
+	binary.BigEndian.PutUint16(buf[6:8], h.Rcv)
 
 	buf[8] = h.Rpz
 	buf[9] = byte(h.flag)
@@ -231,7 +231,7 @@ type connReader struct {
 //
 // 读取构造数据报实例。
 //
-func (r *connReader) Receive() (packet, net.Addr, error) {
+func (r *connReader) Receive() (*packet, net.Addr, error) {
 	//
 }
 
@@ -250,7 +250,7 @@ type connWriter struct {
 //
 // 写入目标数据报实例。
 //
-func (w *connWriter) Send(p packet) (int, error) {
+func (w *connWriter) Send(p *packet) (int, error) {
 	//
 }
 
