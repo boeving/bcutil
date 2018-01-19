@@ -71,6 +71,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Go-zh/tools/container/intsets"
 	"github.com/qchen-zh/pputil/goes"
 )
 
@@ -116,7 +117,7 @@ type service struct {
 	Resp    Responser            // 请求响应器
 	Sndx    *xSender             // 总发送器
 	Pch     chan *packet         // 数据报发送信道备存
-	Acks    chan<- ackInfo       // 确认信息传递
+	Acks    chan<- *ackInfo      // 确认信息传递
 	SndPool map[uint16]*servSend // 发送服务器池（key:数据ID#SND）
 	clean   func(net.Addr)       // 断开清理（Listener）
 }
@@ -237,14 +238,9 @@ type xSender struct {
 	RcvPool map[uint16]*recvServ // 接收服务器池（key:数据ID#RCV）
 }
 
-func newXSender(w *connWriter, pch <-chan *packet) *xSender {
-	return &xSender{
-		Conn: w,
-		// Rate: newRateEval(),
-		Post: pch,
-	}
-}
-
+//
+// 启动发送服务。
+//
 func (x *xSender) Serve(stop *goes.Stop) {
 	for {
 		var p *packet
@@ -374,19 +370,9 @@ type ackReq struct {
 }
 
 //
-// 发送信息。
-// 对端发送过来的响应数据。
-// 将传递给接收服务器（recvServ）使用。
-//
-type sndInfo struct {
-	Seq  uint16 // 序列号
-	Dist int    // 发送距离（对确认的再回馈）
-	Data []byte // 响应数据
-}
-
-//
 // 接收服务器。
 // 处理对端传输来的响应数据。向发送总管提供确认或重发申请。
+// 只有头部信息的申请配置，没有负载数据传递。
 // 一个数据体对应一个本类实例。
 //
 // - 根据应用接收数据的情况确定进度号，约束对端发送速率。
@@ -395,22 +381,39 @@ type sndInfo struct {
 // - 评估对端的发送距离，决定是否重新确认（进度未变时）。
 // - 处理发送方的重置接收指令，重新接收数据。
 //
-// 注记：
-// 只有头部信息的申请配置，没有负载数据传递。
-//
 type recvServ struct {
-	ID    uint16   // 数据ID#RCV（<=ID#SND）
-	Recv  Receiver // 接收器实例，响应写入
-	Acked int      // 实际确认号（接收进度）
-	Line  int      // 进度线（发送抑制）
-	Seqx  int      // 当前接收序列号（确认目标和距离）
+	ID     uint16         // 数据ID#RCV（<=ID#SND）
+	Recv   Receiver       // 接收器实例，响应写入
+	Acks   chan<- *ackReq // 确认申请（-> xSender）
+	Reset  <-chan int     // 重置接收通知
+	Rtp    <-chan int     // 重发请求通知
+	Acked  int            // 实际确认号（接收进度）
+	Line   int            // 进度线（发送抑制）
+	passed int64          // 接收器消化数据量
 }
 
 //
 // 启动接收服务。
 //
-func (r *recvServ) Serve(sx *xSender, stop *goes.Stop) {
-	//
+// 重置接收：
+// 发送方的重置接收点可能处于应用接收器已消化的数据段，
+// 因此需要计算截除该部分的数据。故需记录长度累计历史。
+//
+func (r *recvServ) Serve(xs *xSender, stop *goes.Stop) {
+	// 接收历史栈
+	// 每个分组的数据长度累计值存储。
+	buf := make(map[int]int64)
+
+	for {
+		var rtp, ack int
+
+		select {
+		case <-stop.C:
+			return
+		case rtp = <-r.Rtp:
+		case ack = <-r.AckEval():
+		}
+	}
 }
 
 //
@@ -425,33 +428,75 @@ func (r *recvServ) Reset(seq, rpz int) {
 //
 // 接收响应数据。
 //
-func (r *recvServ) Receive(d *sndInfo) {
-	//
-}
-
-//
-// 确认评估。
-//
-type ackEval struct {
-	//
-}
-
-//
-// 重发申请评估。
-// 因子：
-// - 前包遗失时间长度；
-// - 前段缺失包个数、距离；
-// - END包前段遗失优先弥补；
-//
-type rtpEval struct {
+func (r *recvServ) Receive(seq, rpz int, data []byte) {
 	//
 }
 
 //
 // 重新确认评估。
-// 注：仅限于进度线停止期间。
+// 条件：
+// - 发送距离太大，且进度停滞；
+// - 发送方确认号低于当前进度线；
 //
-type reAck struct {
+func (r *recvServ) ReAck(dist int) bool {
+	//
+}
+
+//
+// 确认评估。
+// 返回
+//
+func (r *recvServ) AckEval() <-chan int {
+	//
+}
+
+//
+// 确认评估器。
+// 应用接收器消化数据，确定当前进度线。
+//
+type ackEval struct {
+	Recv Receiver      // 接收器实例，响应写入
+	Data <-chan []byte // 数据通道
+	line int           // 进度线
+}
+
+//
+// 发送信息。
+// 对端发送过来的响应基本信息。
+//
+type sndInfo struct {
+	Seq int  // 序列号
+	Rpz int  // 重组扩展大小
+	End bool // 传输完成（END）
+}
+
+//
+// 重发申请评估。
+// 接收对端的发送来的基本响应信息，
+// 评估中间缺失的包，决定是否申请重发。
+// 场景：
+// - 超时。前两个包的间隔的2-3倍。
+// - 漏包。与缺失包数量和与进度的距离相关。
+// - END包到达。优先请求中间缺失的包。
+//
+type rtpEval struct {
+	Rtp  chan<- int      // 重发请求通知
+	Snd  <-chan *sndInfo // 基本响应信息通道
+	hist intsets.Sparse  // 收纳栈
+	line int             // 进度指针
+}
+
+func (s *rtpEval) Serve(stop *goes.Stop) {
+	buf := intsets.Sparse
+
+	for {
+		select {
+		case <-stop.C:
+			return
+		case snd := s.Snd:
+			//
+		}
+	}
 }
 
 //
@@ -459,10 +504,10 @@ type reAck struct {
 // 对端对本端响应的确认信息。
 //
 type ackInfo struct {
-	Recv int  // 接收号
+	Rcv  int  // 接收号
 	Dist int  // 确认距离
 	End  bool // 传输完成（END）
-	Rtp  bool // 重传申请
+	Rtp  bool // 重传请求
 }
 
 //
@@ -720,11 +765,11 @@ func (s *servSend) packet(h *header, b []byte) *packet {
 // - 如果包含END标记的数据报已确认，则关闭通知信道。
 //
 type ackRecv struct {
-	Sch   chan<- int     // 丢包序列号通知
-	Acks  <-chan ackInfo // 确认信息接收信道
-	Loss  *lossEval      // 丢包评估器
-	acked int            // 确认号（进度）存储
-	mu    sync.Mutex     // acked同步锁
+	Sch   chan<- int      // 丢包序列号通知
+	Acks  <-chan *ackInfo // 确认信息接收信道
+	Loss  *lossEval       // 丢包评估器
+	acked int             // 确认号（进度）存储
+	mu    sync.Mutex      // acked同步锁
 }
 
 //
@@ -743,11 +788,11 @@ func (a *ackRecv) Serve(re *rateEval, stop *goes.Stop) {
 				return
 			}
 			if ai.Rtp {
-				a.Sch <- ai.Recv
+				a.Sch <- ai.Rcv
 				continue
 			}
 			a.mu.Lock()
-			a.acked = roundBegin(ai.Recv, ai.Dist, seqLimit)
+			a.acked = roundBegin(ai.Rcv, ai.Dist, seqLimit)
 			a.LossEval(ai.Dist, re)
 			a.mu.Unlock()
 		}
