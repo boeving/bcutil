@@ -286,7 +286,7 @@ func (s *servReader) Serve() {
 		default:
 		}
 		if err == nil {
-			go s.Serv.Post(pack)
+			go s.Serv.Post(*pack)
 		}
 	}
 }
@@ -297,6 +297,7 @@ func (s *servReader) Serve() {
 //
 type Receiver interface {
 	io.Writer
+	io.Closer
 }
 
 //

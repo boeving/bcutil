@@ -34,6 +34,7 @@ package dcp
 import (
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -148,6 +149,16 @@ func (s *service) newReceive(res []byte, rec Receiver) {
 }
 
 //
+// 末尾包确认服务。
+// 各数据体末尾END包确认的持续服务，保证发送方的结束。
+//
+// 如果收到BYE包则停止，并可移除其END条目。
+// 如果未收到BYE包，则按评估的速率重发END确认，最多endAcks次。
+//
+type endAcks struct {
+}
+
+//
 // 会话与校验。
 // 用于两个端点的当前连系认证和数据校验。
 // 应用初始申请一个会话时，对端发送一个8字节随机值作为验证前缀。
@@ -209,14 +220,11 @@ type ackReq struct {
 // - BYE 	BYE信息（结束发送）
 //
 type recvServ struct {
-	ID   uint16            // 数据ID#RCV（<=ID#SND）
-	Recv Receiver          // 接收器实例，响应写入
-	AReq chan<- *ackReq    // 确认申请（-> xSender）
-	Rst  chan<- int        // 通知重置接收
-	Rtp  <-chan int        // 请求重发通知
-	Rack <-chan int        // 再次确认通知
-	Ack  <-chan int        // 应用确认通知（数据消耗）
-	pool map[int]*dataInfo // 接收数据池
+	ID   uint16         // 数据ID#RCV（<=ID#SND）
+	AReq chan<- *ackReq // 确认申请（-> xSender）
+	Rtp  <-chan int     // 请求重发通知
+	Rack <-chan int     // 再次确认通知
+	Ack  <-chan int     // 应用确认通知（数据消耗）
 }
 
 //
@@ -246,15 +254,6 @@ func (r *recvServ) Listen(xs *xSender, stop *goes.Stop) {
 // 分解信息派发给各个评估模块。
 //
 func (r *recvServ) Serve(di chan<- *dataInfo, rp chan<- *rtpInfo, ai chan<- *ackInfo, stop *goes.Stop) {
-	//
-}
-
-//
-// 重置接收处理。
-// 如果扩展重组包数量大于零，则为有限重置。
-// 否则为重新接收自目标序列号开始之后的全部数据。
-//
-func (r *recvServ) Reset(seq, rpz int) {
 	//
 }
 
@@ -296,74 +295,131 @@ type reAck struct {
 // 从对端发送过来的响应信息中提取的信息。
 // 用于应用接收器消耗数据并提供进度控制。
 //
-type dataInfo struct {
-	Seq  int    // 响应数据序列号
+type sndInfo struct {
+	Seq  int    // 序列号
 	Data []byte // 响应数据
+	Rpz  int    // 重组扩展大小
+	Rst  bool   // 重置标记
 	End  bool   // 传输完成
 }
 
 //
 // 确认评估器。
-// 应用接收器消化数据，确定当前进度线。
+// 应用接收器消化数据，制约当前的确认进度。
 //
 type ackEval struct {
-	Recv  Receiver         // 接收器实例，响应写入
-	Sndx  <-chan *dataInfo // 发送数据信道
-	Reset <-chan int       // 重置接收通知
-	used  map[int]int64    // 已消化历史栈
-	total int64            // 已消化数据量合计
-	acked int              // 实际确认号
-	line  int              // 进度线
-	mu    sync.Mutex       // line读写保护
-}
-
-//
-// 创建一个确认评估器。
-// ack 为初始包（BEG）的序列号。
-// 注记：
-// 这通常在接收到第一个包（BEG）时调用。下同。
-//
-func newAckEval(r Receiver, di <-chan *dataInfo, ack int) *ackEval {
-	return &ackEval{
-		Recv:  r,
-		Sndx:  di,
-		acked: ack,
-		line:  ack,
-		used:  make(map[int]int64),
-		pool:  make(map[int][]byte),
-	}
+	Snd   <-chan *sndInfo  // 发送数据信道（一级，接收）
+	Ready <-chan struct{}  // 应用写入就绪通知
+	used  map[int]int64    // 已消耗历史（字节数累计）
+	pool  map[int]dataInfo // 接收数据池
+	acked int              // 当前消耗进度号
+	mu    sync.Mutex       // 读写保护
 }
 
 //
 // 启动一个确认评估服务。
 // 接收数据提供给应用消耗，记录当前消耗进度。
-// 缓存未消耗的数据，简单记录已消耗历史（数据量）。
+// 简单记录已消耗历史（数据量）。
 // 主动提供确认申请（可能数据已消耗完，希望促进数据发送）。
 // 处理重置接收的逻辑。
 //
 // ach 为主动提供确认申请的通知信道。
-// 注：通常此时结构成员line已经与acked值相同了。
+// dch 为向应用接收器输出数据的信道
 //
-func (a *ackEval) Serve(ach chan<- int, stop *goes.Stop) {
+func (a *ackEval) Serve(ach chan<- int, dch chan<- dataInfo, stop *goes.Stop) {
+	var rest int64
+
 	for {
 		select {
 		case <-stop.C:
 			return
-		case v := <-a.Reset:
-			//
-		case sd := <-a.Sndx:
-			//
+		case sd := <-a.Snd:
+			switch {
+			case sd.Rst && sd.Seq <= a.acked:
+				total = a.used[a.acked]
+				count = a.used[seq-1]
+
+			}
+			if rest < 0 {
+				dch <- dataInfo{
+					sd.Data[len(sd.Data-rest):],
+					sd.End,
+				}
+			}
+			a.used[sd.Seq] = a.used[a.acked] + len(sd.Data)
 		}
 	}
 }
 
 //
-// 返回当前进度位置（应用已消化）。
+// 重置接收处理。
+// 如果扩展重组包数量大于零，则为有限重置。
+// 否则为重新接收自目标序列号开始之后的全部数据。
 //
-func (a *ackEval) Passed() int {
+// 返回重置时应用多消耗的字节数。
+//
+func (a *ackEval) Reset(seq, rpz int, data []byte, end bool) int64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.line
+
+	if rpz == 0 {
+		a.pool = make(map[int]*dataInfo)
+		if a.acked < seq {
+			return 0
+		}
+		if a.acked == seq {
+			return a.used[seq] - a.used[seq-1] - len(data)
+		}
+		return a.used[a.acked] - a.used[seq-1] - len(data)
+	}
+	for i := 1; i <= rpz; i++ {
+		delete(a.pool, (seq+i)%SeqLimit)
+	}
+}
+
+//
+// 数据信息。
+// 用于客户端接收器接收有效的数据（不含重置重叠段）。
+//
+type dataInfo struct {
+	Data []byte // 输出数据
+	End  bool   // 传输完成
+}
+
+//
+// 客户端接收处理。
+// 分离为一个单独的处理类，用于写入阻塞回馈。
+//
+type appRecv struct {
+	Recv Receiver        // 接收器实例
+	Dch  <-chan dataInfo // 发送数据信道（二级，连贯）
+}
+
+//
+// 开始接收器处理。
+// sem 为接收器每次写入完成后的通知信号。
+//
+func (a *appRecv) Start(sem chan<- struct{}, stop *goes.Stop) {
+	for {
+		select {
+		case <-stop.C:
+			return
+		case di := <-a.Dch:
+			if _, err := a.Recv.Write(di.Data); err != nil {
+				log.Printf("Write error on %d bytes.", a.total)
+				close(sem)
+				return
+			}
+			if di.End {
+				if err := a.Recv.Close(); err != nil {
+					log.Printf("Close error on %d bytes.", a.total)
+				}
+				close(sem)
+			} else {
+				sem <- struct{}{}
+			}
+		}
+	}
 }
 
 //

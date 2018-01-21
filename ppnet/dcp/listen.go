@@ -56,7 +56,7 @@ func (l *Listener) Accept() (*Contact, error) {
 		}
 		kr := raddr.String()
 		if srv, ok := l.pool[kr]; ok {
-			go srv.Post(pack)
+			go srv.Post(*pack)
 			continue
 		}
 		// 来自新的对端，新建连系
@@ -68,7 +68,7 @@ func (l *Listener) Accept() (*Contact, error) {
 			// rdsrv:  nil, // not needed.
 		}
 		l.pool[kr] = c.serv
-		go c.serv.Start().Post(pack)
+		go c.serv.Start().Post(*pack)
 
 		return &c, nil
 	}
