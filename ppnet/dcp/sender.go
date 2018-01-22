@@ -289,7 +289,7 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 
 	rand.Seed(time.Now().UnixNano())
 	// 随机初始值
-	seq := rand.Intn(0xffff-1) % SeqLimit
+	seq := rand.Intn(0xffff - 1)
 
 	// 正常发送通道，缓存>0
 	snd := make(chan *packet, 1)
@@ -348,7 +348,7 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 			s.Post <- p
 
 			buf[seq] = p
-			seq = (seq + 1) % SeqLimit
+			seq = round(seq, 1)
 			rst = false
 		}
 	}
@@ -388,7 +388,7 @@ func (s *servSend) Send(seq, size int, rst bool, pch chan *packet) <-chan *packe
 // 注：会同时删除目标值。
 //
 func (s *servSend) Buffer(mp map[int]*packet, beg, end int) [][]byte {
-	cnt := roundSpacing(beg, end, SeqLimit)
+	cnt := roundSpacing(beg, end)
 	buf := make([][]byte, 0, cnt)
 
 	for i := 0; i < cnt; i++ {
@@ -398,7 +398,7 @@ func (s *servSend) Buffer(mp map[int]*packet, beg, end int) [][]byte {
 		}
 		buf = append(buf, p.Data)
 		delete(mp, beg)
-		beg = (beg + 1) % SeqLimit
+		beg = round(beg, 1)
 	}
 	return buf
 }
@@ -426,7 +426,7 @@ func (s *servSend) Header(ack, seq int) *header {
 	return &header{
 		SID:    s.ID,
 		Seq:    uint16(seq),
-		SndDst: uint(roundSpacing(ack, seq, SeqLimit)),
+		SndDst: uint(roundSpacing(ack, seq)),
 	}
 }
 
@@ -444,8 +444,8 @@ func (s *servSend) Header(ack, seq int) *header {
 // - 除首个包外，删除被重组的包存储（后续丢失处理排除）。
 //
 func (s *servSend) Combine(hist map[int]*packet, beg, max, size int) (*packet, int) {
-	seq := (beg + 1) % SeqLimit
-	cnt := roundSpacing(beg, max, SeqLimit)
+	seq = round(beg, 1)
+	cnt := roundSpacing(beg, max)
 	if cnt > 15 {
 		cnt = 15
 	}
@@ -468,7 +468,7 @@ func (s *servSend) Combine(hist map[int]*packet, beg, max, size int) (*packet, i
 		buf = append(buf, p.Data)
 		end = p.END()
 		delete(hist, seq)
-		seq = (seq + 1) % SeqLimit
+		seq = round(seq, 1)
 	}
 	n := len(buf)
 	if n == 1 {
@@ -567,12 +567,12 @@ func (a *ackRecv) Serve(sch chan<- int, re *rateEval, stop *goes.Stop) {
 			}
 			a.mu.Lock()
 			if ai.Dist == 1 {
-				a.acked = (a.acked + 1) % SeqLimit
+				a.acked = round(a.acked, 1)
 			} else {
-				a.acked = roundBegin(ai.Rcv, ai.Dist, SeqLimit)
+				a.acked = roundBegin(ai.Rcv, ai.Dist)
 			}
 			if a.lost(ai.Dist, re) {
-				sch <- (a.acked + 1) % SeqLimit
+				sch <- round(a.acked, 1)
 			}
 			a.mu.Unlock()
 		}
