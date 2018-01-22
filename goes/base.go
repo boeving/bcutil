@@ -146,3 +146,10 @@ func (s *Sema) Done() <-chan struct{} {
 func (s *Sema) Fn() func() bool {
 	return s.fn
 }
+
+//
+// Reset 重置状态。
+//
+func (s *Sema) Reset() {
+	*s = *NewSema()
+}
