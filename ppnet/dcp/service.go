@@ -44,6 +44,7 @@ import (
 
 // 基础常量设置。
 const (
+	SeqLimit    = 0xffff            // 序列号上限（不含）
 	AliveProbes = 6                 // 保活探测次数上限
 	AliveTime   = 120 * time.Second // 保活时间界限，考虑NAT会话存活时间
 	AliveIntvl  = 10 * time.Second  // 保活报文间隔时间
@@ -323,68 +324,69 @@ type rstInfo struct {
 // 应用接收器消化数据，制约当前的确认进度。
 //
 type ackEval struct {
-	Snd   <-chan *sndInfo  // 发送数据信道（一级，接收）
-	Ready <-chan struct{}  // 应用写入就绪通知
-	used  map[int]int64    // 已消耗历史（字节数累计）
-	pool  map[int]dataInfo // 接收数据池
-	acked int              // 当前消耗进度号
-	mu    sync.Mutex       // 读写保护
+	Snd  <-chan *sndInfo // 发送数据信道
+	Pool *recvPool       // 数据池管理器
 }
 
 //
 // 启动一个确认评估服务。
-// 接收数据提供给应用消耗，记录当前消耗进度。
-// 简单记录已消耗历史（数据量）。
-// 主动提供确认申请（可能数据已消耗完，希望促进数据发送）。
-// 处理重置接收的逻辑。
+// dch 为向数据池管理器（recvPool）输出的信道。
+// 会正确处理重置导致的当前进度处的数据重叠，但不处理重复的分组（重发导致）。
 //
-// ach 为主动提供确认申请的通知信道。
-// dch 为向应用接收器输出数据的信道
+// 注记：
+// 重置之后会话验证码会改变，因此重置之前的旧分组会被上级排除。
 //
-func (a *ackEval) Serve(ach chan<- int, dch chan<- dataInfo, stop *goes.Stop) {
-	// 重置后
-	var xsum int64 // 新分组大小累计存储
-	var used int64 // 已消耗部分大小（自重置起点起）
-	var rest int64 // 重启消耗剩余计量
+func (a *ackEval) Serve(dch chan<- *dataInfo, stop *goes.Stop) {
+	// 重置后，已消耗数量
+	var used int64
 
 	for {
 		select {
 		case <-stop.C:
 			return
 		case sd := <-a.Snd:
-			if sd.Rst {
-				used = a.surplus(sd.Seq)
-				a.poolClean(sd.Seq, sd.Rpz, sd.Data, sd.End)
+			switch {
+			case sd.Rpz > 0: // and RST
+				used = a.Pool.RpzReset(sd.Seq, sd.Rpz)
+			case sd.Rst:
+				usde = a.Pool.Reset(sd.Seq)
 			}
-			size := len(sd.Data)
-			xsum += size
-			rest = size - (xsum - used)
-			if rest < 0 {
+			if used >= len(sd.Data) {
+				used -= len(sd.Data)
 				break
 			}
-			di := dataInfo{
-				Data: sd.Data[rest:],
-				End:  sd.End,
-			}
-			dch <- di
-			xsum = 0
-			a.used[sd.Seq] = a.used[a.acked] + size
-			a.acked = round(a.acked, 1)
-			a.pool[a.acked] = di
+			dch <- a.pack(sd.Data[used:], sd.Seq, sd.End)
+			used = 0
 		}
+	}
+}
+
+//
+// 创建数据池需要的数据包。
+//
+func (a *ackEval) pack(data []byte, seq int, end bool) *dataInfo {
+	return &dataInfo{
+		Seq:  seq,
+		Data: data,
+		End:  end,
 	}
 }
 
 //
 // 响应数据接收池。
 // 处理接收到的数据不连续的问题。
-// 仅连续的部分会提交到应用接收器消耗。
+// 连续的部分会提交到应用接收器（appRecv）消耗。
 //
 // pool 中存储的是当前未消耗的数据，可能不连续。
+// used 中存放历史的回绕长度足够大，视为安全。
+//
+// 注记：
+// 本类仅接收合法（非重叠）的数据，可能不连续。
+// 上层处理重置时有效数据的切分。
 //
 type recvPool struct {
-	Dch  <-chan *dataInfo  // 数据输出（到appRecv）
-	used map[int]int64     // 已消耗历史（字节数累计）
+	Dch  <-chan *dataInfo  // 接收数据（一级，接收）
+	used map[int]int64     // 已消耗历史（连续数据累计）
 	pool map[int]*dataInfo // 数据存放池
 	ack  int               // 当前进度号（已消耗分组号+1）
 	dmax int               // 接收包与进度的最大距离
@@ -393,21 +395,31 @@ type recvPool struct {
 
 //
 // 启动接收服务。
-// out 为输出数据到应用接收器的信道。
+// ach 为通知确认申请的信道（to recvSend）。
+// out 为输出数据到应用接收器（appRecv）的信道。
 //
-func (r *recvPool) Serve(out chan<- *dataInfo, stop *goes.Stop) {
+func (r *recvPool) Serve(ach chan<- int, out chan<- *dataInfo, stop *goes.Stop) {
 	for {
 		select {
 		case <-stop.C:
 			return
 		case di := <-r.Dch:
 			r.mu.Lock()
-			r.pool[di.Seq] = di
 			d := roundSpacing(r.ack, di.Seq)
+			// 忽略过时包
+			if d < -1 {
+				r.mu.Unlock()
+				break
+			}
+			// 重置
+			if d == -1 {
+				r.ack = roundPlus(r.ack, -1)
+			}
+			r.pool[di.Seq] = di
 			// 连续
 			if d == 0 {
-				n := r.puts(out)
-				r.ack = round(r.ack, n)
+				r.ack = roundPlus(r.ack, r.puts(out))
+				ach <- roundPlus(r.ack, -1)
 			}
 			if d > r.dmax {
 				r.dmax = d
@@ -418,31 +430,12 @@ func (r *recvPool) Serve(out chan<- *dataInfo, stop *goes.Stop) {
 }
 
 //
-// 返回已经完成的进度号。
-//
-func (r *recvPool) Acked() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return round(r.ack, -1)
-}
-
-//
-// 计算指定位置（重置点）应用的多余消耗。
-// seq 为目标点的序列号。
-// 返回-1表示无多余的消耗量，目标点在进度线之后。
-//
-func (r *recvPool) surplus(seq int) int64 {
-	if roundSpacing(seq, r.ack) <= 0 {
-		return -1
-	}
-	return r.Passed() - r.used[(seq-1)%SeqLimit]
-}
-
-//
 // 全重置处理。
 // 外部应当在递送数据之前调用。
+// 返回上层需要截除的数据量（已经被消耗）。
+// 零值表示seq在进度线上或之后，正常传递。
 //
-func (r *recvPool) Reset(seq int) {
+func (r *recvPool) Reset(seq int) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -450,18 +443,21 @@ func (r *recvPool) Reset(seq int) {
 		seq = r.ack
 	}
 	for i := 0; i < r.dmax; i++ {
-		delete(r.pool, round(seq, i))
+		delete(r.pool, roundPlus(seq, i))
 	}
+	return r.surplus(seq)
 }
 
 //
 // RPZ 重置处理。
 // 重组是合并小包，当前包只会更大。
-//
 // 被清理的包设置为nil，以保留其存在性标记。
 // 这与从数据池中删除不同，nil视为有效，影响接收包的连续性判断。
 //
-func (r *recvPool) RpzReset(seq, rpz int) {
+// 返回上层需要截除的数据量。
+// 零值表示seq在进度线上或之后，正常传递。
+//
+func (r *recvPool) RpzReset(seq, rpz int) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -471,10 +467,13 @@ func (r *recvPool) RpzReset(seq, rpz int) {
 	case d <= 0:
 		r.setNil(seq, rpz+1)
 
-	// rpz横跨ack位置
-	case rpz > d:
+	// rpz横跨ack点
+	case rpz >= d:
 		r.setNil(r.ack, rpz-d+1)
 	}
+	// 上层据此切分有效数据片段传递
+	// 如果值大于数据片长度，表示数据片全为历史，忽略。
+	return r.surplus(seq)
 }
 
 //
@@ -499,7 +498,7 @@ func (r *recvPool) LossCount(dist int) int {
 	var cnt int
 
 	for i := 0; i < dist; i++ {
-		if _, ok := r.pool[round(r.ack, i)]; !ok {
+		if _, ok := r.pool[roundPlus(r.ack, i)]; !ok {
 			cnt++
 		}
 	}
@@ -508,7 +507,7 @@ func (r *recvPool) LossCount(dist int) int {
 
 //
 // 最近的一个漏包序号。
-// 如果没有漏掉的包，返回0xffff。
+// 如果没有漏掉的包，返回-1。
 // 注记：
 // pool中连续的分组会全部传递给appRecv。
 //
@@ -517,7 +516,7 @@ func (r *recvPool) Lost() int {
 	defer r.mu.Unlock()
 
 	if len(r.pool) == 0 {
-		return SeqLimit // 0xffff
+		return -1
 	}
 	return r.ack
 }
@@ -528,8 +527,20 @@ func (r *recvPool) Lost() int {
 //
 func (r *recvPool) setNil(beg, rpz int) {
 	for i := 0; i < rpz; i++ {
-		r.pool[round(beg, i)] = nil
+		r.pool[roundPlus(beg, i)] = nil
 	}
+}
+
+//
+// 计算指定位置（重置点）应用的多余消耗。
+// seq 为目标点的序列号。
+// 零值表示无多余的消耗量，目标点在进度线上或之后。
+//
+func (r *recvPool) surplus(seq int) int64 {
+	if roundSpacing(seq, r.ack) <= 0 {
+		return 0
+	}
+	return r.passed() - r.used[roundPlus(r.ack, -1)]
 }
 
 //
@@ -548,16 +559,17 @@ func (r *recvPool) puts(out chan<- []*dataInfo) int {
 		if !ok {
 			break
 		}
-		if di == nil {
-			continue
-		}
 		buf = append(buf, di)
+		// must
 		delete(r.pool, i)
-		i = round(i, 1)
+		r.used[i] = r.passed() + len(di.Data)
+
+		i = roundPlus(i, 1)
 	}
-	if len(buf) > 0 {
-		out <- di
-	}
+	out <- buf
+	// 距离缩减
+	r.dmax -= len(buf)
+
 	return roundSpacing(r.ack, i)
 }
 
@@ -565,7 +577,7 @@ func (r *recvPool) puts(out chan<- []*dataInfo) int {
 // 返回已经消耗的数据量。
 //
 func (r *recvPool) passed() int64 {
-	return r.used[(r.ack-1)%SeqLimit]
+	return r.used[roundPlus(r.ack, -1)]
 }
 
 //
@@ -573,8 +585,9 @@ func (r *recvPool) passed() int64 {
 // 分离为一个单独的处理类，用于写入阻塞回馈。
 //
 type appRecv struct {
-	Recv Receiver           // 接收器实例
-	Dch  <-chan []*dataInfo // 响应数据集通道（二级，连贯）
+	Recv  Receiver           // 接收器实例
+	Dch   <-chan []*dataInfo // 响应数据集通道（二级，连贯）
+	total int64              // 已写入数据量累计
 }
 
 //
@@ -604,14 +617,16 @@ func (a *appRecv) Puts(ds []*dataInfo) bool {
 	var err error
 
 	for _, di := range ds {
-		_, err = a.Recv.Write(di.Data)
+		n, err = a.Recv.Write(di.Data)
 		if di.End {
 			if err = a.Recv.Close(); err == nil {
 				err = errFinish
 			}
 		}
+		a.total += n
+
 		if err != nil {
-			log.Printf("%v on receive.", err)
+			log.Printf("%v on receive %d bytes.", err, a.total)
 			break
 		}
 	}
@@ -738,7 +753,7 @@ func (r *rtpEval) lost(seq int) bool {
 //
 // 返回增量回绕的值。
 //
-func round(x, n int) int {
+func roundPlus(x, n int) int {
 	return (x + n) % SeqLimit
 }
 

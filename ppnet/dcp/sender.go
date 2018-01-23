@@ -56,7 +56,6 @@ const (
 	RateLimit   = 100 * time.Microsecond // 极限速率。万次/秒
 	SendTimeout = 500 * time.Millisecond // 发送超时
 	TimeoutMax  = 120 * time.Second      // 发送超时上限
-	SeqLimit    = 0xffff                 // 序列号上限（不含）
 )
 
 // 基本参数常量
@@ -348,7 +347,7 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 			s.Post <- p
 
 			buf[seq] = p
-			seq = round(seq, 1)
+			seq = roundPlus(seq, 1)
 			rst = false
 		}
 	}
@@ -398,7 +397,7 @@ func (s *servSend) Buffer(mp map[int]*packet, beg, end int) [][]byte {
 		}
 		buf = append(buf, p.Data)
 		delete(mp, beg)
-		beg = round(beg, 1)
+		beg = roundPlus(beg, 1)
 	}
 	return buf
 }
@@ -444,7 +443,7 @@ func (s *servSend) Header(ack, seq int) *header {
 // - 除首个包外，删除被重组的包存储（后续丢失处理排除）。
 //
 func (s *servSend) Combine(hist map[int]*packet, beg, max, size int) (*packet, int) {
-	seq = round(beg, 1)
+	seq = roundPlus(beg, 1)
 	cnt := roundSpacing(beg, max)
 	if cnt > 15 {
 		cnt = 15
@@ -468,7 +467,7 @@ func (s *servSend) Combine(hist map[int]*packet, beg, max, size int) (*packet, i
 		buf = append(buf, p.Data)
 		end = p.END()
 		delete(hist, seq)
-		seq = round(seq, 1)
+		seq = roundPlus(seq, 1)
 	}
 	n := len(buf)
 	if n == 1 {
@@ -567,12 +566,12 @@ func (a *ackRecv) Serve(sch chan<- int, re *rateEval, stop *goes.Stop) {
 			}
 			a.mu.Lock()
 			if ai.Dist == 1 {
-				a.acked = round(a.acked, 1)
+				a.acked = roundPlus(a.acked, 1)
 			} else {
 				a.acked = roundBegin(ai.Rcv, ai.Dist)
 			}
 			if a.lost(ai.Dist, re) {
-				sch <- round(a.acked, 1)
+				sch <- roundPlus(a.acked, 1)
 			}
 			a.mu.Unlock()
 		}
