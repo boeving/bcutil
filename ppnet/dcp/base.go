@@ -20,7 +20,7 @@
 //  +---------------------------------------------------------------+
 // 	|                       ...... (Payload)                        |
 //
-//	长度：16 字节
+//	长度：20 字节
 //	端口：UDP报头指定（4）
 //
 // 说明详见 header.txt, design.txt。
@@ -43,6 +43,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"io/ioutil"
 	"net"
 	"time"
 
@@ -52,7 +53,7 @@ import (
 const (
 	headIP      = 20                         // IP 报头长度
 	headUDP     = 8                          // UDP报文头部长
-	headDCP     = 16                         // DCP头部长
+	headDCP     = 20                         // DCP头部长
 	headAll     = headDCP + headUDP + headIP // 头部总长（除IP报头）
 	mtuBase     = 576                        // 基础MTU值
 	mtuBaseIPv6 = 1280                       // IPv6 MTU基础值
@@ -65,6 +66,7 @@ var (
 	errZero     = errors.New("no data for Query")
 	errNoRAddr  = errors.New("no remote address")
 	errDistance = errors.New("the distance value is out of range")
+	errHeadSize = errors.New("header length is not enough")
 )
 
 //
@@ -78,7 +80,6 @@ type flag uint8
 const (
 	END flag = 1 << iota // 分组结束
 	BEG                  // 分组开始
-	RST                  // 重置接收
 	RTP                  // 请求重发
 	BYE                  // 断开连系
 	SES                  // 会话申请/更新
@@ -101,10 +102,6 @@ func (f flag) BYE() bool {
 	return f&BYE != 0
 }
 
-func (f flag) RST() bool {
-	return f&RST != 0
-}
-
 func (f flag) SES() bool {
 	return f&SES != 0
 }
@@ -117,10 +114,6 @@ func (f flag) BEGEND() bool {
 	return f&BEG != 0 && f&END != 0
 }
 
-func (f flag) RSTSES() bool {
-	return f&RST != 0 && f&SES != 0
-}
-
 func (f *flag) Set(v flag) {
 	*f |= v
 }
@@ -131,20 +124,24 @@ func (f *flag) Set(v flag) {
 //
 type header struct {
 	flag            // 标志区（8）
-	SID, Seq uint16 // 发送数据ID，序列号
-	RID, Rcv uint16 // 接受数据ID，接收号
+	SID, RID uint16 // 发送/接收数据ID
+	Seq, Ack uint32 // 序列号，确认号
 	Rpz      byte   // RPZ扩展区（4）
 	AckDst   uint   // ACK distance，确认距离
 	SndDst   uint   // Send distance，发送距离
 	Sess     uint32 // Session verify code
 }
 
+//
 // RPZ 扩展大小。
+//
 func (h *header) RPZSize() int {
 	return int(h.Rpz >> 4)
 }
 
+//
 // 扩展区RPZ值设置。
+//
 func (h *header) SetRPZ(v int) error {
 	if v > 0xf || v < 0 {
 		return errRpzSize
@@ -153,29 +150,31 @@ func (h *header) SetRPZ(v int) error {
 	return nil
 }
 
+//
 // 解码头部数据。
-func (h *header) Decode(r io.Reader) error {
-	var buf [headDCP]byte
-	n, err := io.ReadFull(r, buf[:])
-	if n != headDCP {
-		return err
+//
+func (h *header) Decode(buf []byte) error {
+	if len(buf) != headDCP {
+		return errHeadSize
 	}
 	// binary.BigEndian.Uint16(buf[x:x+2])
 	h.SID = uint16(buf[0])<<8 | uint16(buf[1])
-	h.Seq = uint16(buf[2])<<8 | uint16(buf[3])
-	h.RID = uint16(buf[4])<<8 | uint16(buf[5])
-	h.Rcv = uint16(buf[6])<<8 | uint16(buf[7])
+	h.RID = uint16(buf[2])<<8 | uint16(buf[3])
+	h.Seq = binary.BigEndian.Uint32(buf[4:8])
+	h.Ack = binary.BigEndian.Uint32(buf[8:12])
 
-	h.Rpz = buf[8]
-	h.flag = flag(buf[9])
-	h.AckDst = uint(buf[10]) >> 2
-	h.SndDst = uint(buf[11]) | uint(buf[10]&3)<<8
-	h.Sess = binary.BigEndian.Uint32(buf[12:16])
+	h.Rpz = buf[12]
+	h.flag = flag(buf[13])
+	h.AckDst = uint(buf[14]) >> 2
+	h.SndDst = uint(buf[15]) | uint(buf[14]&3)<<8
+	h.Sess = binary.BigEndian.Uint32(buf[16:20])
 
-	return err
+	return nil
 }
 
+//
 // 编码头部数据。
+//
 func (h *header) Encode() ([]byte, error) {
 	if h.AckDst > 0x3f || h.SndDst > 0x3ff {
 		return nil, errDistance
@@ -183,15 +182,15 @@ func (h *header) Encode() ([]byte, error) {
 	var buf [headDCP]byte
 
 	binary.BigEndian.PutUint16(buf[0:2], h.SID)
-	binary.BigEndian.PutUint16(buf[2:4], h.Seq)
-	binary.BigEndian.PutUint16(buf[4:6], h.RID)
-	binary.BigEndian.PutUint16(buf[6:8], h.Rcv)
+	binary.BigEndian.PutUint16(buf[2:4], h.RID)
+	binary.BigEndian.PutUint32(buf[4:8], h.Seq)
+	binary.BigEndian.PutUint32(buf[8:12], h.Ack)
 
-	buf[8] = h.Rpz
-	buf[9] = byte(h.flag)
-	buf[10] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
-	buf[11] = byte(h.SndDst & 0xff)
-	binary.BigEndian.PutUint32(buf[12:16], h.Sess)
+	buf[12] = h.Rpz
+	buf[13] = byte(h.flag)
+	buf[14] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
+	buf[15] = byte(h.SndDst & 0xff)
+	binary.BigEndian.PutUint32(buf[16:20], h.Sess)
 
 	return buf[:], nil
 }
@@ -210,7 +209,11 @@ type packet struct {
 // 如果出错返回nil，同时记录日志。这通常很少发生。
 //
 func (p packet) Bytes() []byte {
-	//
+	b, err := p.Encode()
+	if err != nil {
+		panic(err)
+	}
+	return append(b, p.Data...)
 }
 
 //
@@ -234,7 +237,23 @@ type connReader struct {
 // 读取构造数据报实例。
 //
 func (r *connReader) Receive() (*packet, net.Addr, error) {
-	//
+	buf := make([]byte, headDCP)
+
+	n, addr, err := r.Conn.ReadFrom(buf)
+	if err != nil {
+		return nil, addr, err
+	}
+	if n != headDCP {
+		return nil, addr, errHeadSize
+	}
+	h := new(header)
+	h.Decode(buf)
+	b, err := ioutil.ReadAll(r.Conn)
+
+	if err != nil {
+		return nil, addr, err
+	}
+	return &packet{h, b}, addr, nil
 }
 
 func (r *connReader) Close() error {
@@ -252,8 +271,8 @@ type connWriter struct {
 //
 // 写入目标数据报实例。
 //
-func (w *connWriter) Send(p *packet) (int, error) {
-	//
+func (w *connWriter) Send(p packet) (int, error) {
+	return w.Conn.Write(p.Bytes())
 }
 
 //

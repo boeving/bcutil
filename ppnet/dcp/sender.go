@@ -49,6 +49,10 @@ import (
 	"github.com/qchen-zh/pputil/goes"
 )
 
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
 // 基础常量设置。
 const (
 	BaseRate    = 10 * time.Millisecond  // 基础速率。初始默认发包间隔
@@ -284,8 +288,6 @@ func (s *servSend) DataSize() int {
 func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 	var rst bool
 	buf := make(map[int]*packet)
-
-	rand.Seed(time.Now().UnixNano())
 	// 随机初始值
 	seq := rand.Intn(0xffff - 1)
 

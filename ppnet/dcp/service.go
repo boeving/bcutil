@@ -44,7 +44,7 @@ import (
 
 // 基础常量设置。
 const (
-	SeqLimit    = 0xffff            // 序列号上限（不含）
+	SeqLimit    = 1<<32 - 1         // 序列号上限（不含）
 	AliveProbes = 6                 // 保活探测次数上限
 	AliveTime   = 120 * time.Second // 保活时间界限，考虑NAT会话存活时间
 	AliveIntvl  = 10 * time.Second  // 保活报文间隔时间
@@ -167,10 +167,10 @@ type endAcks struct {
 // 之后的数据传输用一个固定的方式计算CRC32校验和。
 // 算法：
 //  CRC32(
-//  	验证前缀 +
-//  	数据ID #SND + 序列号 +
-//  	数据ID #ACK + 确认号 +
-//  	发送距离 + 确认距离 +
+//  	会话校验码 +
+//  	数据ID #SND + 数据ID #RCV +
+//  	序列号 + 确认号 +
+//  	确认距离 + 发送距离 +
 //  	数据
 //  )
 // 每一次的该值都会不一样，它既是对数据的校验，也是会话安全的认证。
@@ -189,8 +189,8 @@ type session struct {
 //
 type ackReq struct {
 	ID   uint16 // 数据ID#RCV
-	Rcv  uint16 // 接收号
-	Dist int    // 确认距离（0值用于首个确认）
+	Ack  uint   // 确认号
+	Dist int    // 确认距离（0值无漏包）
 	Rtp  bool   // 重发请求
 	Bye  bool   // 结束发送（END确认后）
 }
