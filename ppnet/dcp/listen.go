@@ -22,14 +22,14 @@ import (
 // 负责不同客户的服务器构造分配和数据传递。
 //
 type Listener struct {
-	conn  *connReader
-	laddr net.Addr
-	pool  map[string]*service
+	conn  *connReader         // 网络读取
+	laddr net.Addr            // 本地地址存储
+	pool  map[string]*service // Key: 远端地址
 }
 
 //
 // Listen 本地连系监听。
-// 返回的连系对象仅可用于断开连系。
+// 返回一个监听器实例，用于接收远端的连入（Accept）。
 //
 func Listen(laddr *DCPAddr) (*Listener, error) {
 	udpc, err := net.ListenUDP(laddr.net, laddr.addr)
@@ -46,7 +46,7 @@ func Listen(laddr *DCPAddr) (*Listener, error) {
 
 //
 // Accept 接收外部连系请求。
-// 如果是一个新的对端，返回一个处理服务器。
+// 如果是一个新的对端，返回一个连系实例（供请求资源）。
 //
 func (l *Listener) Accept() (*Contact, error) {
 	for {

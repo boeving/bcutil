@@ -3,35 +3,37 @@ package dcp
 /////////////////////
 /// DCP 内部服务实现。
 /// 流程
-/// 		客户端：应用请求 >> [发送]； [接收] >> 写入应用。
-/// 		服务端：[接收] >> 询问应用，获取io.Reader，读取 >> [发送]。
+/// 	客户端：应用请求 >> [发送]； [接收] >> 写入应用。
+/// 	服务端：[接收] >> 询问应用，获取io.Reader，读取 >> [发送]。
 ///
 /// 发送方
 /// ------
 /// - 根据对方的请求，从注册的响应服务应用获取响应数据。
 /// - 一个交互期的初始阶段按基准速率匀速发送。收到第一个确认后，即动态评估速率。
 /// - 后续的发送附带有效的发送距离。
-/// - 从接收端发来的数据报里的确认距离评估丢包，决定重发。
+/// - 从接收端反馈来的确认距离用于丢包评估，决定重发。
 ///
 ///
-/// 顺序并发
-/// - 数据体ID按应用请求的顺序编号，并顺序发送其首个分组。之后各数据体并行发送。
-/// - 数据体发送服务器以自身动态评估的即时速率发送，不等待确认。
+/// 有序并发
+/// - 数据体ID按应用请求的顺序递增编号，并发送首个分组（之后由数据体自行负责）。
+/// - 数据体发送服务器（servSend）以自身评估的动态速率发送，不等待确认。
 /// - 各数据体动态评估的速率会间接作用于全局基准速率（基准线）。
 /// - 一个交互期内起始发送数据体的数据ID随机，数据体内初始分组的序列号也随机。
 ///   注：
-///   首个分组按顺序发送可以使得接收端有所凭借，便于小数据体的丢包评估。
+///   首个分组有序发送可以使得接收端有所凭借，便于小数据体的丢包评估。
 ///
-/// 有序重发
+/// 被动重发
 /// - 每个数据体权衡确认距离因子计算重发。
-/// - 序列号顺序依然决定优先性，除非收到接收端的主动重发请求。
+/// - 除非收到接收端的主动重发请求，评估重发仅用于确认号（所需下一字节）。
+/// - 接收端可通过缓发确认来阻塞此处的发送行为。
 ///
 /// 速率评估
 /// - 速率以发送间隔的时间来表达，时间越长速率则越慢。
-/// - 各数据体自行评估自己的发送间隔时间并休眠，向总速率评估器传递发送距离变化量和丢包判断。
+/// - 各数据体自行评估自己的发送间隔时间，向总速率评估器传递发送距离变化量和丢包判断。
 /// - 总速率评估器根据各数据体的发送距离变化量和丢包情况，评估当前实际发送速率。
 /// - 总速率评估器的基准速率被定时评估调优，同时它也作为各数据体的基准速率。
-/// - 每个交互期的数据量也用于基准速率调优参照。
+/// - 每个交互期的数据量也用于基准速率调优参考。
+///
 /// 注：
 /// 各数据体按自身评估的速率并发提供构造好的数据报，由总发送器统一发送。
 ///
@@ -57,8 +59,7 @@ func init() {
 const (
 	BaseRate    = 10 * time.Millisecond  // 基础速率。初始默认发包间隔
 	RateLimit   = 100 * time.Microsecond // 极限速率。万次/秒
-	SendTimeout = 500 * time.Millisecond // 发送超时
-	TimeoutMax  = 120 * time.Second      // 发送超时上限
+	SendEndtime = 10 * time.Second       // 发送END包后超时结束时限
 )
 
 // 基本参数常量
@@ -78,35 +79,25 @@ const (
 	sendPackets        = 40                     // 发送通道缓存（有序性）
 )
 
-// END关联全局变量。
-// 可能根据网络状态而调整为适当的值，但通常无需修改。
-// （非并发安全）
-var (
-	SendEndtime = 10 * time.Second // 发送END包后超时结束时限
-)
-
 //
 // 总发送器（发送总管）。
 // 按自身评估的速率执行实际的网络发送。
 //
-// 通过缓存信道获取各数据体Go程的数据包。
-// 根据接收服务器的要求发送ACK确认，尽量携带数据发送。
-// 各Go程的递送无顺序关系，因此实现并行的效果。
-//
-// 外部保证每个数据体的首个分组优先递送，
-// 因此高数据ID的数据体必然后发送，从而方便接收端判断是否丢包。
+// 通过缓存信道获取基本有序的各数据体递送的数据报。
+// 提取各接收服务器的ACK申请，设置确认，尽量携带数据发送。
+// 各数据体的递送由自身速率决定，无顺序关系，仅由信道缓存获得一个简单顺序。
 //
 // 一个4元组两端连系对应一个本类实例。
 //
-// 注记：
-// 用单向链表存储确认信息申请，以保持先到先用的顺序。
-//
 type xSender struct {
-	Conn    *connWriter          // 数据报网络发送器
-	Eval    *rateEval            // 速率评估器
-	Post    <-chan *packet       // 待发送数据包通道（有缓存，一定有序性）
-	Acks    <-chan *ackReq       // 待确认信息包通道（同上）
-	RcvPool map[uint16]*recvServ // 接收服务器池（key:数据ID#RCV）
+	Conn *connWriter    // 数据报网络发送器
+	Eval *rateEval      // 速率评估器
+	Post <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
+	Acks <-chan *ackReq // 待确认信息包通道（同上）
+
+	// 接收服务器池（key:数据ID#RCV）
+	// 当收到BYE消息时传递并清理相应存储。
+	Pool map[uint16]*recvServ
 }
 
 //
@@ -115,7 +106,7 @@ type xSender struct {
 func (x *xSender) Serve(stop *goes.Stop) {
 	for {
 		var p *packet
-		var req *ackReq
+		var ack *ackReq
 
 		select {
 		case <-stop.C:
@@ -123,20 +114,20 @@ func (x *xSender) Serve(stop *goes.Stop) {
 
 		case p = <-x.Post:
 			// 忽略响应出错
-			// 接收端可等待超时后可重新请求。
+			// 接收端可等待超时后重新请求。
 			if p == nil {
 				continue
 			}
-			req = x.AckReq()
+			ack = x.AckReq()
 
-		case req = <-x.Acks:
-			if req == nil {
+		case ack = <-x.Acks:
+			if ack == nil {
 				continue
 			}
 			p = x.Packet()
 		}
 		// 失败后退出
-		if n, err := x.Send(p, req); err != nil {
+		if n, err := x.send(p, ack); err != nil {
 			log.Printf("write to net %d tries, but all failed.", n)
 			return
 		}
@@ -145,11 +136,15 @@ func (x *xSender) Serve(stop *goes.Stop) {
 }
 
 //
-// 发送请求。
-// 由外部客户请求调用，有更高的优先级。
+// 请求资源。
+// 通常仅由外部应用请求时或发送首个分组时调用。
 //
 func (x *xSender) Request(res []byte) error {
-	//
+	n, err := x.send(p, x.AckReq())
+	if n > 0 {
+		log.Printf("send [%d:%d] packet on %d times", p.SID, p.Seq, n)
+	}
+	return err
 }
 
 //
@@ -196,7 +191,7 @@ func (x *xSender) emptyPacket() *packet {
 // 如果失败会适当多次尝试，依然返回错误时，外部通常应结束服务。
 // 返回的整数值为失败尝试的次数。
 //
-func (x *xSender) Send(p *packet, req *ackReq) (int, error) {
+func (x *xSender) send(p *packet, req *ackReq) (int, error) {
 	if req != nil {
 		x.SetAcks(p, req)
 	}
@@ -204,7 +199,7 @@ func (x *xSender) Send(p *packet, req *ackReq) (int, error) {
 	var cnt int
 
 	for ; cnt < sendBadTries; cnt++ {
-		if _, err = x.Conn.Send(p); err == nil {
+		if _, err = x.Conn.Send(*p); err == nil {
 			break
 		}
 		log.Println(err)
@@ -232,13 +227,6 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 }
 
 //
-// 首个分组发送服务。
-// 保持各数据体首个分组发送的有序性。持续服务。
-//
-type firstSends struct {
-}
-
-//
 // 数据报发送器。
 // 一个响应服务对应一个本类实例。
 // - 从响应器接收数据负载，构造数据报递送到总发送器。
@@ -259,23 +247,21 @@ type firstSends struct {
 // 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离也会让发送停止。
 //
 type servSend struct {
-	ID      uint16           // 数据ID#SND
-	Post    chan<- *packet   // 数据报递送通道（有缓存）
-	Bye     chan<- *ackReq   // 结束通知（BYE）
-	Loss    <-chan int       // 丢包重发通知
-	Pmtu    <-chan int       // PMTU大小获取
-	Reset   <-chan int       // 重置发送通知
-	Eval    *evalRate        // 速率评估器
-	Resp    *response        // 响应器
-	Recv    *ackRecv         // 确认接收器
-	Timeout <-chan time.Time // END确认超时结束
+	ID     uint16           // 数据ID#SND
+	Post   chan<- *packet   // 数据报递送通道（有缓存）
+	Bye    chan<- *ackReq   // 结束通知（BYE）
+	Loss   <-chan int       // 丢包重发通知
+	Eval   *evalRate        // 速率评估器
+	Resp   *response        // 响应器
+	Recv   *ackRecv         // 确认接收器
+	endOut <-chan time.Time // END确认超时结束
 }
 
 //
 // 返回数据片合法大小。
 //
 func (s *servSend) DataSize() int {
-	return <-s.Pmtu - headAll
+	return PathMTU() - headAll
 }
 
 //
@@ -299,17 +285,13 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 		select {
 		case <-stop.C:
 			return // 外部强制结束
-		case <-s.Timeout:
+		case <-s.endOut:
 			// END包发送后超时，
-			// 接收端会重复多次END包的确认，因此通常不会至此。
+			// 接收端会重复多次END包的确认，因此通常不至于此。
+			// END/Bye可通知上层清理存储。
+			go s.End()
 			stop.Exit()
 			return
-
-		case i := <-s.Reset:
-			s.Reslice(s.Buffer(buf, i, seq), size)
-			seq = i
-			rst = true
-			log.Printf("reset sending from %d", i)
 
 		case i, ok := <-s.Loss:
 			if !ok {
@@ -356,12 +338,11 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 
 //
 // 发送结束通知（BYE）
-// 用于发送总管设置一个BYE通知（与携带数据无关）。
 //
 func (s *servSend) End() {
 	s.Bye <- &ackReq{
 		ID:  s.ID,
-		Rcv: 0xffff,
+		Ack: rand.Intn(xLimit32), // 无意义
 		Bye: true,
 	}
 }
@@ -373,11 +354,11 @@ func (s *servSend) End() {
 func (s *servSend) Send(seq, size int, rst bool, pch chan *packet) <-chan *packet {
 	p := s.Build(seq, size, rst)
 	if p == nil {
-		s.Timeout = time.After(SendEndtime)
+		s.endOut = time.After(SendEndtime)
 		// 阻塞
 		return nil
 	}
-	s.Timeout = nil
+	s.endOut = nil
 	pch <- p // buffer > 0
 	return pch
 }
@@ -425,7 +406,7 @@ func (s *servSend) Reslice(bs [][]byte, size int) {
 func (s *servSend) Header(ack, seq int) *header {
 	return &header{
 		SID:    s.ID,
-		Seq:    uint16(seq),
+		Seq:    uint32(seq),
 		SndDst: uint(roundSpacing(ack, seq)),
 	}
 }
@@ -444,7 +425,7 @@ func (s *servSend) Header(ack, seq int) *header {
 // - 除首个包外，删除被重组的包存储（后续丢失处理排除）。
 //
 func (s *servSend) Combine(hist map[int]*packet, beg, max, size int) (*packet, int) {
-	seq = roundPlus(beg, 1)
+	seq := roundPlus(beg, 1)
 	cnt := roundSpacing(beg, max)
 	if cnt > 15 {
 		cnt = 15

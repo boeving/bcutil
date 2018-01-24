@@ -3,8 +3,8 @@ package dcp
 /////////////////////
 /// DCP 内部服务实现。
 /// 流程
-/// 		客户端：应用请求 >> [发送]； [接收] >> 写入应用。
-/// 		服务端：[接收] >> 询问应用，获取io.Reader，读取 >> [发送]。
+/// 	客户端：应用请求 >> [发送]； [接收] >> 写入应用。
+/// 	服务端：[接收] >> 询问应用，获取io.Reader，读取 >> [发送]。
 ///
 /// 接收端
 /// ------
@@ -44,16 +44,18 @@ import (
 
 // 基础常量设置。
 const (
-	SeqLimit    = 1<<32 - 1         // 序列号上限（不含）
 	AliveProbes = 6                 // 保活探测次数上限
 	AliveTime   = 120 * time.Second // 保活时间界限，考虑NAT会话存活时间
 	AliveIntvl  = 10 * time.Second  // 保活报文间隔时间
+	CalmExpire  = 90 * time.Second  // 服务静置期限（SND/RCV子服务无活动）
 )
 
 // 基本参数常量
 const (
-	recvTimeoutx = 2.5 // 接收超时的包间隔倍数
-	recvLossx    = 12  // 接收丢包评估（数量距离积）
+	xLimit32     = 1<<32 - 1 // 序列号上限（不含）
+	xLimit16     = 1<<16 - 1 // 数据体ID上限
+	recvTimeoutx = 2.5       // 接收超时的包间隔倍数
+	recvLossx    = 12        // 接收丢包评估（数量距离积）
 )
 
 // END关联全局变量。
@@ -69,15 +71,18 @@ var (
 )
 
 //
-// service DCP底层服务。
+// service 基础服务。
+// 接收网络数据，转发到数据体的接收服务器。
+// 如果为一个资源请求，创建一个发送服务器（servSend）交付。
+//
 // 一个对端4元组连系对应一个本类实例。
 //
 type service struct {
-	Resp    Responser            // 请求响应器
-	Sndx    *xSender             // 总发送器
-	Pch     chan *packet         // 数据报发送信道备存
-	SndPool map[uint16]*servSend // 发送服务器池（key:数据ID#SND）
-	clean   func(net.Addr)       // 断开清理（Listener）
+	Resp  Responser            // 请求响应器
+	Sndx  *xSender             // 总发送器引用
+	Pch   chan *packet         // 数据报发送信道备存
+	Pool  map[uint16]*servSend // 发送服务器池（key:数据ID#SND）
+	clean func(net.Addr)       // 断开清理（Listener:pool）
 }
 
 func newService(w *connWriter, clean func(net.Addr)) *service {
@@ -189,7 +194,7 @@ type session struct {
 //
 type ackReq struct {
 	ID   uint16 // 数据ID#RCV
-	Ack  uint   // 确认号
+	Ack  int    // 确认号
 	Dist int    // 确认距离（0值无漏包）
 	Rtp  bool   // 重发请求
 	Bye  bool   // 结束发送（END确认后）
@@ -221,11 +226,23 @@ type ackReq struct {
 // - BYE 	BYE信息（结束发送）
 //
 type recvServ struct {
-	ID   uint16         // 数据ID#RCV（<=ID#SND）
-	AReq chan<- *ackReq // 确认申请（-> xSender）
-	Rtp  <-chan int     // 请求重发通知
-	Rack <-chan int     // 再次确认通知
-	Ack  <-chan int     // 应用确认通知（数据消耗）
+	ID    uint16         // 数据ID#RCV（<=ID#SND）
+	AReq  chan<- *ackReq // 确认申请（-> xSender）
+	Rtp   <-chan int     // 请求重发通知
+	Rack  <-chan int     // 再次确认通知
+	Ack   <-chan int     // 应用确认通知（数据消耗）
+	alive time.Time      // 活着时间戳
+}
+
+//
+// 服务存活判断。
+// 如果数据体接收停止时间过长，会被视为已死亡。
+// 它通常由BYE信息丢失或发送异常终止导致（上层无法即时清理）。
+//
+// 这会占用数据体ID资源，上层在分配数据体ID时据此检查。
+//
+func (r *recvServ) Alive() bool {
+	return time.Since(r.alive) < CalmExpire
 }
 
 //
@@ -721,7 +738,7 @@ func (r *rtpEval) timeOut() time.Duration {
 // 通知重发请求的序列号。
 //
 func (r *rtpEval) lossRtp(rch chan<- int) {
-	if lost := r.Rcpl.Lost(); lost < SeqLimit {
+	if lost := r.Rcpl.Lost(); lost < xLimit32 {
 		rch <- lost
 	}
 }
@@ -751,18 +768,25 @@ func (r *rtpEval) lost(seq int) bool {
 ///////////////////////////////////////////////////////////////////////////////
 
 //
-// 返回增量回绕的值。
+// 返回序列号增量回绕值。
 //
 func roundPlus(x, n int) int {
-	return (x + n) % SeqLimit
+	return (x + n) % xLimit32
+}
+
+//
+// 返回16位增量回绕值。
+//
+func round16(x, n int) int {
+	return (x + n) % xLimit16
 }
 
 //
 // 支持回绕的间距计算。
-// 环回范围为全局常量 SeqLimit（16位长）。
+// 环回范围为全局常量 xLimit32（16位长）。
 //
 func roundSpacing(beg, end int) int {
-	return (end - beg + SeqLimit) % SeqLimit
+	return (end - beg + xLimit32) % xLimit32
 }
 
 //

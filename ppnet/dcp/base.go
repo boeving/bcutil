@@ -12,9 +12,9 @@
 //  +---------------------------------------------------------------+
 //  |                      Acknowledgment number                    |
 //  +-------------------------------+-------------------------------+
-//  | RPZ-  |  ...  | . |R|S|B|R|B|E|              |                |
-//  | Extra |  ...  | . |E|E|Y|T|E|N| ACK distance |  Send distance |
-//  | Size  |  (4)  | . |Q|S|E|P|G|D|      (6)     |     (10)       |
+//  |B|E|R|B|R|S|        ...        |              |                |
+//  |Y|N|T|E|E|E|        ...        | ACK distance |  Send distance |
+//  |E|D|P|G|Q|S|       (2+8)       |      (6)     |      (10)      |
 //  +-------------------------------+-------------------------------+
 //  |                      Session verify code                      |
 //  +---------------------------------------------------------------+
@@ -45,6 +45,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/qchen-zh/pputil/goes"
@@ -70,6 +71,31 @@ var (
 )
 
 //
+// 路径MTU全局共享。
+// 该值由所有子服务共享，由PMTU探测服务设置。
+//
+var mtuGlobal = mtuBase
+var mtuShare sync.Mutex
+
+//
+// PathMTU 获取全局路径MTU大小。
+//
+func PathMTU() int {
+	mtuShare.Lock()
+	defer mtuShare.Unlock()
+	return mtuGlobal
+}
+
+//
+// SetPMTU 设置全局路径MTU共享。
+//
+func SetPMTU(size int) {
+	mtuShare.Lock()
+	mtuGlobal = size
+	mtuShare.Unlock()
+}
+
+//
 // 头部标记。
 //
 type flag uint8
@@ -78,20 +104,22 @@ type flag uint8
 // 标记常量定义。
 //
 const (
-	END flag = 1 << iota // 分组结束
-	BEG                  // 分组开始
-	RTP                  // 请求重发
-	BYE                  // 断开连系
-	SES                  // 会话申请/更新
-	REQ                  // 请求（request）
+	_   flag = 1 << iota
+	_        // ...
+	SES      // 会话申请/更新
+	REQ      // 请求
+	BEG      // 分组开始
+	RTP      // 请求重发
+	END      // 分组结束
+	BYE      // 断开连系
 )
 
-func (f flag) END() bool {
-	return f&END != 0
+func (f flag) SES() bool {
+	return f&SES != 0
 }
 
-func (f flag) BEG() bool {
-	return f&BEG != 0
+func (f flag) REQ() bool {
+	return f&REQ != 0
 }
 
 func (f flag) RTP() bool {
@@ -102,12 +130,12 @@ func (f flag) BYE() bool {
 	return f&BYE != 0
 }
 
-func (f flag) SES() bool {
-	return f&SES != 0
+func (f flag) BEG() bool {
+	return f&BEG != 0
 }
 
-func (f flag) REQ() bool {
-	return f&REQ != 0
+func (f flag) END() bool {
+	return f&END != 0
 }
 
 func (f flag) BEGEND() bool {
@@ -126,28 +154,10 @@ type header struct {
 	flag            // 标志区（8）
 	SID, RID uint16 // 发送/接收数据ID
 	Seq, Ack uint32 // 序列号，确认号
-	Rpz      byte   // RPZ扩展区（4）
+	None     byte   // 保留未用
 	AckDst   uint   // ACK distance，确认距离
 	SndDst   uint   // Send distance，发送距离
 	Sess     uint32 // Session verify code
-}
-
-//
-// RPZ 扩展大小。
-//
-func (h *header) RPZSize() int {
-	return int(h.Rpz >> 4)
-}
-
-//
-// 扩展区RPZ值设置。
-//
-func (h *header) SetRPZ(v int) error {
-	if v > 0xf || v < 0 {
-		return errRpzSize
-	}
-	h.Rpz = h.Rpz&0xf | byte(v)<<4
-	return nil
 }
 
 //
@@ -163,8 +173,8 @@ func (h *header) Decode(buf []byte) error {
 	h.Seq = binary.BigEndian.Uint32(buf[4:8])
 	h.Ack = binary.BigEndian.Uint32(buf[8:12])
 
-	h.Rpz = buf[12]
-	h.flag = flag(buf[13])
+	h.flag = flag(buf[12])
+	h.None = buf[13]
 	h.AckDst = uint(buf[14]) >> 2
 	h.SndDst = uint(buf[15]) | uint(buf[14]&3)<<8
 	h.Sess = binary.BigEndian.Uint32(buf[16:20])
@@ -186,8 +196,8 @@ func (h *header) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint32(buf[4:8], h.Seq)
 	binary.BigEndian.PutUint32(buf[8:12], h.Ack)
 
-	buf[12] = h.Rpz
-	buf[13] = byte(h.flag)
+	buf[12] = byte(h.flag)
+	buf[13] = h.None
 	buf[14] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
 	buf[15] = byte(h.SndDst & 0xff)
 	binary.BigEndian.PutUint32(buf[16:20], h.Sess)
@@ -277,8 +287,11 @@ func (w *connWriter) Send(p packet) (int, error) {
 
 //
 // 简单读取服务。
-// 成功读取后将数据报（packet）发送给DCP服务器。
+// 成功读取后将数据报发送到service。
 // 外部可通过Stop.Exit()结束服务。
+// 注：
+// 仅用于直接拨号连系（Dial）时的读取转发，
+// istener会在Accept时自己接收数据转发。
 //
 type servReader struct {
 	Read *connReader
@@ -295,8 +308,7 @@ func newServReader(conn *net.UDPConn, srv *service) *servReader {
 }
 
 //
-// 服务启动。
-// 应当在一个Go程中单独运行。
+// 服务启动（阻塞）。
 //
 func (s *servReader) Serve() {
 	for {
@@ -393,7 +405,7 @@ type Contact struct {
 	serv         *service    // DCP内部服务
 	alive        time.Time   // 最近活跃（收/发）
 	begid        uint16      // 起始数据ID（交互期）
-	rdsrv        *servReader // 读取服务器，可选
+	rdsrv        *servReader // 简单读取服务（Dial需要）
 }
 
 //
