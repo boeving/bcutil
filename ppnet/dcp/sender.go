@@ -59,6 +59,7 @@ func init() {
 const (
 	BaseRate    = 10 * time.Millisecond  // 基础速率。初始默认发包间隔
 	RateLimit   = 100 * time.Microsecond // 极限速率。万次/秒
+	SendTimeout = 2 * time.Minute        // 发送超时（资源请求）
 	SendEndtime = 10 * time.Second       // 发送END包后超时结束时限
 )
 
@@ -179,8 +180,8 @@ func (x *xSender) AckReq() *ackReq {
 //
 func (x *xSender) emptyPacket() *packet {
 	h := header{
-		SID: 0xffff,
-		Seq: 0xffff,
+		SID: xLimit16,
+		Seq: xLimit32,
 	}
 	return &packet{&h, nil}
 }
@@ -275,7 +276,7 @@ func (s *servSend) Serve(re *rateEval, stop *goes.Stop) {
 	var rst bool
 	buf := make(map[int]*packet)
 	// 随机初始值
-	seq := rand.Intn(0xffff - 1)
+	seq := rand.Intn(xLimit32 - 1)
 
 	// 正常发送通道，缓存>0
 	snd := make(chan *packet, 1)
@@ -395,7 +396,7 @@ func (s *servSend) Reslice(bs [][]byte, size int) {
 	}
 	// 可能为END包重构，
 	// 因此需预防重置为无效值。
-	s.Recv.SetEnd(0xffff)
+	s.Recv.SetEnd(xLimit32)
 
 	s.Resp.Shift(pieces(bytes.Join(bs, nil), size))
 }

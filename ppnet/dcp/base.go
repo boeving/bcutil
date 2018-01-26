@@ -44,6 +44,7 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -431,6 +432,7 @@ func Dial(laddr, raddr *DCPAddr) (*Contact, error) {
 		raddr: raddr.addr,
 		serv:  srv,
 		alive: time.Now(),
+		begid: uint16(rand.Intn(xLimit16 - 1)),
 		rdsrv: newServReader(udpc, srv),
 	}
 
@@ -489,28 +491,6 @@ func (c *Contact) Query(res []byte, rec Receiver) error {
 		return errZero
 	}
 	// ...
-}
-
-//
-// 字节序列名称。
-// 提取最多32字节数据，返回16进制表示串。
-//
-/*
-func (c *Contact) bytesName(res []byte) string {
-	n := len(res)
-	if n > 32 {
-		n = 32
-	}
-	return fmt.Sprintf("%x", res[:n])
-}
-*/
-
-//
-// StartID 设置起始数据ID。
-// 通常在会话申请或更新后被调用。其值用于下一个交互期。
-//
-func (c *Contact) StartID(rnd uint16) {
-	c.begid = rnd
 }
 
 //

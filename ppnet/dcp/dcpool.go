@@ -57,6 +57,13 @@ func (x *dcpx) NewRecvServ(req chan<- *ackReq, rtp, rack, ack <-chan int) (int, 
 }
 
 //
+// 返回数据ID的接收子服务器。
+//
+func (x *dcpx) RecvServ(id uint16) *recvServ {
+	return x.rPool[id]
+}
+
+//
 // 创建一个发送服务。
 // 发送的数据ID由对端的资源请求传递过来。
 //
@@ -81,18 +88,11 @@ func (x *dcpx) ServSend(id uint16) *servSend {
 }
 
 //
-// 返回数据ID的接收子服务器。
-//
-func (x *dcpx) RecvServ(id uint16) *recvServ {
-	return x.rPool[id]
-}
-
-//
 // 工具函数
 ///////////////////////////////////////////////////////////////////////////////
 
 //
-// 查询获取最近的有效ID。
+// 查询获取离id实参值最近的有效ID。
 // 如果空位被用完，会执行一次清理。
 // 返回0xffff为一个无效值，表示无资源可回收。
 //
@@ -104,7 +104,8 @@ func (x *dcpx) reqID(id int) int {
 			return id
 		}
 	}
-	return x.clean(id)
+	// 兼顾性能和存活宽容，只清理1/3。
+	return x.Clean(id, 3)
 }
 
 //
@@ -112,12 +113,12 @@ func (x *dcpx) reqID(id int) int {
 // 如果没有回收资源可用，返回一个无效值0xffff。
 // 否则返回第一个回收的值。
 //
-// 注：兼顾性能和存活宽容，一次只清理总量的1/3。
+// lev 为清理等级，1为全部清理，3为三分之一。
 //
-func (x *dcpx) clean(id int) int {
+func (x *dcpx) Clean(id, lev int) int {
 	n := xLimit16
 
-	for i := 0; i < xLimit16/3; i++ {
+	for i := 0; i < xLimit16/lev; i++ {
 		id = round16(id, 1)
 		if x.rPool[uint16(id)].Alive() {
 			continue
