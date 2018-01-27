@@ -78,11 +78,9 @@ var (
 // 一个对端4元组连系对应一个本类实例。
 //
 type service struct {
-	Resp  Responser            // 请求响应器
-	Sndx  *xSender             // 总发送器引用
-	Pch   chan *packet         // 数据报发送信道备存
-	Pool  map[uint16]*servSend // 发送服务器池（key:数据ID#SND）
-	clean func(net.Addr)       // 断开清理（Listener:pool）
+	Recv  chan<- *rcvInfo // 信息递送通道
+	dcpx  *dcp2s          // 子服务管理器
+	clean func(net.Addr)  // 接收到断开后的清理（Listener:pool）
 }
 
 func newService(w *connWriter, clean func(net.Addr)) *service {
@@ -98,7 +96,7 @@ func newService(w *connWriter, clean func(net.Addr)) *service {
 }
 
 //
-// 开始DCP服务。
+// 开启接收服务。
 //
 func (s *service) Start() *service {
 	//
@@ -201,6 +199,17 @@ type ackReq struct {
 }
 
 //
+// 子接收/确认服务所需参数备存。
+// 用于创建 recvServ 实例的成员。
+//
+type forAcks struct {
+	AckReq chan<- *ackReq // 确认申请（-> xSender）
+	Rtp    <-chan int     // 请求重发通知
+	Rack   <-chan int     // 再次确认通知
+	Ack    <-chan int     // 应用确认通知（数据消耗）
+}
+
+//
 // 接收服务器。
 // 处理对端传输来的响应数据。向发送总管提供确认或重发申请。
 // 只有头部信息的申请配置，没有负载数据传递。
@@ -232,6 +241,17 @@ type recvServ struct {
 	Rack  <-chan int     // 再次确认通知
 	Ack   <-chan int     // 应用确认通知（数据消耗）
 	alive time.Time      // 活着时间戳
+}
+
+func newRecvServ(id int, x forAcks) *recvServ {
+	return &recvServ{
+		ID:     uint16(id),
+		AckReq: x.AckReq,
+		Rtp:    x.Rtp,
+		Rack:   x.Rack,
+		Ack:    x.Ack,
+		alive:  time.Now(),
+	}
 }
 
 //
@@ -316,9 +336,8 @@ type reAck struct {
 type sndInfo struct {
 	Seq  int    // 序列号
 	Data []byte // 响应数据
-	Rpz  int    // 重组扩展大小
-	Rst  bool   // 重置标记
 	End  bool   // 传输完成
+	Bye  bool   // 结束标记
 }
 
 //

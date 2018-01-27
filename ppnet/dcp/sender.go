@@ -91,14 +91,16 @@ const (
 // 一个4元组两端连系对应一个本类实例。
 //
 type xSender struct {
-	Conn *connWriter    // 数据报网络发送器
-	Eval *rateEval      // 速率评估器
-	Post <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
-	Acks <-chan *ackReq // 待确认信息包通道（同上）
+	chxAcks                // recvServ 所需备存
+	Conn    *connWriter    // 数据报网络发送器
+	Post    <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
+	Acks    <-chan *ackReq // 待确认信息包通道（同上）
+	Eval    *rateEval      // 速率评估器
+	dcpx    *dcp2s         // 子服务管理器
+}
 
-	// 接收服务器池（key:数据ID#RCV）
-	// 当收到BYE消息时传递并清理相应存储。
-	Pool map[uint16]*recvServ
+func newXSender(w *connWriter, dx *dcp2s, pch <-chan *packet, ach <-chan *ackReq) {
+
 }
 
 //
@@ -141,6 +143,9 @@ func (x *xSender) Serve(stop *goes.Stop) {
 // 通常仅由外部应用请求时或发送首个分组时调用。
 //
 func (x *xSender) Request(res []byte) error {
+	p := x.emptyPacket()
+	p.Data = res
+
 	n, err := x.send(p, x.AckReq())
 	if n > 0 {
 		log.Printf("send [%d:%d] packet on %d times", p.SID, p.Seq, n)
@@ -228,6 +233,17 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 }
 
 //
+// 子发送服务所需参数备存。
+// 用于创建 servSend 实例的成员。
+//
+type forSend struct {
+	Post chan<- *packet  // 数据报发送信道备存
+	Bye  chan<- *ackReq  // 结束通知（BYE）
+	Loss <-chan int      // 丢包重发通知
+	Recv <-chan *rcvInfo // 接收信息传递信道
+}
+
+//
 // 数据报发送器。
 // 一个响应服务对应一个本类实例。
 // - 从响应器接收数据负载，构造数据报递送到总发送器。
@@ -254,8 +270,12 @@ type servSend struct {
 	Loss   <-chan int       // 丢包重发通知
 	Eval   *evalRate        // 速率评估器
 	Resp   *response        // 响应器
-	Recv   *ackRecv         // 确认接收器
+	Recv   *ackRecv         // 接收确认
 	endOut <-chan time.Time // END确认超时结束
+}
+
+func newServSend(id int, rsp *response, ar *ackRecv, x forSend) *servSend {
+	//
 }
 
 //
@@ -365,6 +385,22 @@ func (s *servSend) Send(seq, size int, rst bool, pch chan *packet) <-chan *packe
 }
 
 //
+// 对分片集重新分片。
+// 这在丢包且路径MTU变小的情况下发生。
+// 新的分片集会返还到响应器。
+//
+func (s *servSend) Reslice(bs [][]byte, size int) {
+	if len(bs) == 0 {
+		return
+	}
+	// 可能为END包重构，
+	// 因此需预防重置为无效值。
+	s.Recv.SetEnd(xLimit32)
+
+	s.Resp.Shift(pieces(bytes.Join(bs, nil), size))
+}
+
+//
 // 提取map集内特定范围的分片集。
 // end可能小于beg，如果end在seqLimit的范围内回绕的话。
 // 注：会同时删除目标值。
@@ -383,22 +419,6 @@ func (s *servSend) Buffer(mp map[int]*packet, beg, end int) [][]byte {
 		beg = roundPlus(beg, 1)
 	}
 	return buf
-}
-
-//
-// 对分片集重新分片。
-// 这在丢包且路径MTU变小的情况下发生。
-// 新的分片集会返还到响应器。
-//
-func (s *servSend) Reslice(bs [][]byte, size int) {
-	if len(bs) == 0 {
-		return
-	}
-	// 可能为END包重构，
-	// 因此需预防重置为无效值。
-	s.Recv.SetEnd(xLimit32)
-
-	s.Resp.Shift(pieces(bytes.Join(bs, nil), size))
 }
 
 //
@@ -480,17 +500,10 @@ func (s *servSend) Build(seq, size int, rst bool) *packet {
 //
 // 构建数据报。
 //
-func (s *servSend) build(b []byte, seq, rpz int, rst, end bool) *packet {
+func (s *servSend) build(b []byte, seq int, end bool) *packet {
 	h := s.Header(s.Recv.Acked(), seq)
 	if end {
 		h.Set(END)
-		s.Recv.SetEnd(seq)
-	}
-	if rst {
-		h.Set(RST)
-	}
-	if rpz != 0 {
-		h.SetRPZ(rpz)
 	}
 	return s.packet(h, b)
 }
@@ -516,7 +529,7 @@ type rcvInfo struct {
 // 确认接收器。
 // 接收对端的确认号和确认距离，并评估是否丢包。
 // - 丢包时通过通知信道传递丢失包的序列号。
-// - 如果包含END标记的数据报已确认，则关闭通知信道。
+// - 如果收到END数据报的确认，关闭通知信道。
 //
 type ackRecv struct {
 	Rcvs  <-chan *rcvInfo // 接收信息传递信道

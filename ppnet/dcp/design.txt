@@ -378,8 +378,8 @@ ACK滞速
 >>>>>>>>>>>>>>> |  service  |            |  xSender  | >>>>>>>>>>>>>>>>>>> (B Peer)
 (Request)    |  +-----------+            +-----------+             |
 (or Data)    |        |                        A                   |
-             |        | Request|               |                   |
-             |        | Rcv, Dist              | (Packets)         |
+             |        |                        |                   |
+             |        | Rcv, Dist, RTP         | (Packets)         |
              |        |                        |                   |
              |        |      +----------+      |                   |
              |        +----> | servSend | -----+                   |

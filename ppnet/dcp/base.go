@@ -44,10 +44,8 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/qchen-zh/pputil/goes"
 )
@@ -295,16 +293,16 @@ func (w *connWriter) Send(p packet) (int, error) {
 // istener会在Accept时自己接收数据转发。
 //
 type servReader struct {
-	Read *connReader
-	Serv *service
-	Stop *goes.Stop
+	read *connReader
+	post func(packet)
+	stop *goes.Stop
 }
 
-func newServReader(conn *net.UDPConn, srv *service) *servReader {
+func newServReader(conn *net.UDPConn, post func(packet)) *servReader {
 	return &servReader{
-		Read: &connReader{conn},
-		Serv: srv,
-		Stop: goes.NewStop(),
+		read: &connReader{conn},
+		post: post,
+		stop: goes.NewStop(),
 	}
 }
 
@@ -313,16 +311,21 @@ func newServReader(conn *net.UDPConn, srv *service) *servReader {
 //
 func (s *servReader) Serve() {
 	for {
-		pack, _, err := s.Read.Receive()
 		select {
-		case <-s.Stop.C:
+		case <-s.stop.C:
 			return
 		default:
-		}
-		if err == nil {
-			go s.Serv.Post(*pack)
+			pack, _, err := s.read.Receive()
+			if err != nil {
+				break
+			}
+			go s.post(*pack)
 		}
 	}
+}
+
+func (s *servReader) Exit() {
+	s.stop.Exit()
 }
 
 //
@@ -403,9 +406,8 @@ func ResolveDCPAddr(network, address string) (*DCPAddr, error) {
 //
 type Contact struct {
 	laddr, raddr net.Addr    // 4元组
-	serv         *service    // DCP内部服务
-	alive        time.Time   // 最近活跃（收/发）
-	begid        uint16      // 起始数据ID（交互期）
+	servs        *service    // 接收服务（分配）
+	sends        *xSender    // 总发送器
 	rdsrv        *servReader // 简单读取服务（Dial需要）
 }
 
@@ -430,14 +432,13 @@ func Dial(laddr, raddr *DCPAddr) (*Contact, error) {
 	c := Contact{
 		laddr: laddr.addr,
 		raddr: raddr.addr,
-		serv:  srv,
-		alive: time.Now(),
-		begid: uint16(rand.Intn(xLimit16 - 1)),
-		rdsrv: newServReader(udpc, srv),
+		servs: srv,
+		sends: newXSender(),
+		rdsrv: newServReader(udpc, srv.Post),
 	}
 
-	go c.serv.Start()  // DCP服务启动
-	go c.rdsrv.Serve() // 读取服务启动
+	go c.servs.Start() // 接收服务启动
+	go c.rdsrv.Serve() // 网络读取服务启动
 
 	return &c, nil
 }
@@ -480,10 +481,11 @@ func (c *Contact) Register(resp Responser) {
 }
 
 //
-// Query 向服务端查询数据。
+// Query 资源查询。
 // 最多同时处理64k的目标查询，超出会返回errOverflow错误。
+// 目标资源不可为空，否则返回一个errZero错误。
 //
-//  res  目标数据的标识。
+//  res  资源的标识。
 //  rec  外部接收器接口的实现。
 //
 func (c *Contact) Query(res []byte, rec Receiver) error {
@@ -494,8 +496,8 @@ func (c *Contact) Query(res []byte, rec Receiver) error {
 }
 
 //
-// Bye 断开连系。
-// 无论数据是否传递完毕，都会结发送或接收。
+// Bye 主动断开。
+// 无论数据是否传递完毕，都会结束发送或接收。
 // 未完成数据传输的中途结束会返回一个错误，记录了一些基本信息。
 //
 // 对端可能是一个服务器，也可能是一个普通的客户端。
@@ -504,5 +506,5 @@ func (c *Contact) Bye() error {
 	if c.rdsrv != nil {
 		c.rdsrv.Stop.Exit()
 	}
-	return c.serv.Exit()
+	return c.servs.Exit()
 }
