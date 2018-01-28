@@ -29,6 +29,7 @@ import (
 
 //
 // 发送/接收子服务管理。
+// 一个4元组两端连系对应一个本类实例。
 //
 type dcp2s struct {
 	Sndx  forSend              // servSend 创建参数
@@ -42,9 +43,11 @@ type dcp2s struct {
 // 新建一个子服务管理器。
 // 初始id为一个随机值。
 //
-func newDcp2s() *dcp2s {
+func newDcp2s(sx forSend, ax forAcks) *dcp2s {
 	return &dcp2s{
-		id:    rand.Intn(xLimit16 - 1),
+		Sndx:  sx,
+		Acks:  ax,
+		idx:   rand.Intn(xLimit16 - 1),
 		sPool: make(map[uint16]*servSend),
 		rPool: make(map[uint16]*recvServ),
 	}
@@ -56,13 +59,13 @@ func newDcp2s() *dcp2s {
 // 如果没有可用的ID资源，返回一个无效值（0xffff）和false。
 //
 func (d *dcp2s) NewRecvServ(req chan<- *ackReq, rtp, rack, ack <-chan int) (int, bool) {
-	id := x.reqID(d.idx)
-	if id == xLimit16 {
-		return id, false
+	x := d.reqID(d.idx)
+	if x == xLimit16 {
+		return x, false
 	}
-	d.rPool[uint16(id)] = newRecvServ(id, d.Acks)
-	d.idx = id
-	return id, true
+	d.rPool[uint16(x)] = newRecvServ(x, d.Acks)
+	d.idx = x
+	return x, true
 }
 
 //
@@ -72,38 +75,33 @@ func (d *dcp2s) NewRecvServ(req chan<- *ackReq, rtp, rack, ack <-chan int) (int,
 // 仅需清除recvServ存储即可（servSend的ID为依赖关系）。
 //
 func (d *dcp2s) Clean(id uint16) {
-	delete(x.rPool, id)
+	delete(d.rPool, id)
 }
 
 //
 // 返回数据ID的接收子服务器。
 //
 func (d *dcp2s) RecvServ(id uint16) *recvServ {
-	return x.rPool[id]
+	return d.rPool[id]
 }
 
 //
 // 创建一个发送服务。
-// 发送的数据ID由对端的资源请求传递过来。
+// ID由对端的资源请求传递过来。
+// 本方法由service实例接收到一个资源请求时调用。
 //
-func (d *dcp2s) NewServSend(id uint16, pch chan<- *packet, bye chan<- *ackReq, lch <-chan int, er *evalRate, rp *response, ar *ackRecv) {
-	ss := servSend{
-		ID:   id,
-		Post: pch,
-		Bye:  bye,
-		Loss: lch,
-		Eval: er,
-		Resp: rp,
-		Recv: ar,
-	}
-	x.sPool[id] = &ss
+func (d *dcp2s) NewServSend(id int, rsp *response, re *rateEval, x forSend) {
+	ss := newServSend(id, rsp, x)
+	go ss.Serve(re)
+
+	d.sPool[uint16(id)] = ss
 }
 
 //
 // 返回数据ID的发送子服务器。
 //
 func (d *dcp2s) ServSend(id uint16) *servSend {
-	return x.sPool[id]
+	return d.sPool[id]
 }
 
 //
@@ -118,13 +116,13 @@ func (d *dcp2s) ServSend(id uint16) *servSend {
 func (d *dcp2s) reqID(id int) int {
 	// 空位
 	for i := 0; i < xLimit16; i++ {
-		id = round16(id, 1)
-		if _, ok := x.rPool[uint16(id)]; !ok {
+		id = roundPlus2(id, 1)
+		if _, ok := d.rPool[uint16(id)]; !ok {
 			return id
 		}
 	}
 	// 兼顾性能和存活宽容，只清理1/3。
-	return x.Recycle(id, 3)
+	return d.Recycle(id, 3)
 }
 
 //
@@ -138,14 +136,14 @@ func (d *dcp2s) Recycle(id, lev int) int {
 	n := xLimit16
 
 	for i := 0; i < xLimit16/lev; i++ {
-		id = round16(id, 1)
-		if x.rPool[uint16(id)].Alive() {
+		id = roundPlus2(id, 1)
+		if d.rPool[uint16(id)].Alive() {
 			continue
 		}
 		if n == xLimit16 {
-			n = id
+			n = id // first its
 		}
-		delete(x.rPool, uint16(id))
+		delete(d.rPool, uint16(id))
 	}
 	return n
 }

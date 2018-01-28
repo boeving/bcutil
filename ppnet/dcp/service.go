@@ -789,29 +789,29 @@ func (r *rtpEval) lost(seq int) bool {
 //
 // 返回序列号增量回绕值。
 //
-func roundPlus(x, n int) int {
-	return (x + n) % xLimit32
+func roundPlus(x, n int64) int64 {
+	return (x + n + xLimit32) % xLimit32
 }
 
 //
-// 返回16位增量回绕值。
+// 返回2字节（16位）增量回绕值。
 //
-func round16(x, n int) int {
-	return (x + n) % xLimit16
+func roundPlus2(x, n int) int {
+	return (x + n + xLimit16) % xLimit16
 }
 
 //
 // 支持回绕的间距计算。
 // 环回范围为全局常量 xLimit32（16位长）。
 //
-func roundSpacing(beg, end int) int {
+func roundSpacing(beg, end int64) int64 {
 	return (end - beg + xLimit32) % xLimit32
 }
 
 //
 // 支持回绕的起点计算。
 //
-func roundBegin(end, dist int) int {
+func roundBegin(end, dist int64) int64 {
 	return roundSpacing(dist, end)
 }
 
@@ -840,35 +840,10 @@ func limitCounter(max, step int) func(int) bool {
 }
 
 //
-// 路径MTU大小通知器。
-// 用于全局对各数据体发送器的PMTU通知。
+// 距离计数器。
+// 用于发送距离和确认距离的计数。
+// 需要排除相同序列号/确认号的数据报。
 //
-type mtuSize struct {
-	Chg <-chan int // 修改信道
-	Snd chan<- int // 发送信道
-	val int        // 当前值（初始mtuBase）
-}
-
-func newMTUSize(chg <-chan int, snd chan<- int) *mtuSize {
-	return &mtuSize{
-		Chg: chg,
-		Snd: snd,
-		val: mtuBase,
-	}
-}
-
-//
-// 启动服务（阻塞）。
-// 外部通过修改信道传递更新值，通过发送信道取值。
-// stop 用于外部终止服务。
-//
-func (m *mtuSize) Serve(stop *goes.Stop) {
-	for {
-		select {
-		case <-stop.C:
-			return
-		case m.val = <-m.Chg:
-		case m.Snd <- m.val:
-		}
-	}
+type distCounter struct {
+	//
 }
