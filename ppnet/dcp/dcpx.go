@@ -122,7 +122,7 @@ func (d *dcp2s) reqID(id int) int {
 		}
 	}
 	// 兼顾性能和存活宽容，只清理1/3。
-	return d.Recycle(id, 3)
+	return d.recycle(id, 3)
 }
 
 //
@@ -132,7 +132,7 @@ func (d *dcp2s) reqID(id int) int {
 //
 // lev 为清理等级，1为全部清理，3为三分之一。
 //
-func (d *dcp2s) Recycle(id, lev int) int {
+func (d *dcp2s) recycle(id, lev int) int {
 	n := xLimit16
 
 	for i := 0; i < xLimit16/lev; i++ {

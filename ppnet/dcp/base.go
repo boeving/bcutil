@@ -30,13 +30,13 @@ package dcp
 ///////////////
 /// MTU 值参考
 /// 1) 基础值。也为初始轻启动的值。
-///    576 （x-44 = 532/IPv4，x-64 = 512/IPv6）
+///    576 （x-48 = 528/IPv4，x-68 = 508/IPv6）
 /// 2) 基础值IPv6。IPv6默认包大小。
-///    1280（x-64 = 1216/IPv6）
+///    1280（x-68 = 1212/IPv6）
 /// 3) PPPoE链路。
-///    1492（x-44 = 1448/IPv4，x-64 = 1428/IPv6）
+///    1492（x-48 = 1444/IPv4，x-68 = 1424/IPv6）
 /// 4) 常用以太网通路。
-///    1500（x-44 = 1456/IPv4，x-64 = 1436/IPv6）
+///    1500（x-48 = 1452/IPv4，x-68 = 1432/IPv6）
 ///////////////////////////////////////////////////////////////////////////////
 
 import (
@@ -73,13 +73,13 @@ var (
 // 路径MTU全局共享。
 // 该值由所有子服务共享，由PMTU探测服务设置。
 //
-var mtuGlobal = mtuBase
+var mtuGlobal = int64(mtuBase)
 var mtuShare sync.Mutex
 
 //
 // PathMTU 获取全局路径MTU大小。
 //
-func PathMTU() int {
+func PathMTU() int64 {
 	mtuShare.Lock()
 	defer mtuShare.Unlock()
 	return mtuGlobal
@@ -88,10 +88,17 @@ func PathMTU() int {
 //
 // SetPMTU 设置全局路径MTU共享。
 //
-func SetPMTU(size int) {
+func SetPMTU(size int64) {
 	mtuShare.Lock()
 	mtuGlobal = size
 	mtuShare.Unlock()
+}
+
+//
+// 分组有效负载合法尺寸。
+//
+func payloadSize() int64 {
+	return PathMTU() - headAll
 }
 
 //
@@ -225,6 +232,10 @@ func (p packet) Bytes() []byte {
 	return append(b, p.Data...)
 }
 
+func (p packet) Size() int64 {
+	return int64(len(p.Data))
+}
+
 //
 // datagram 数据报处理器。
 // 面对网络套接字的简单接收和发送处理。
@@ -345,7 +356,7 @@ type Receiver interface {
 type Responser interface {
 	// res 为客户端请求资源的标识。
 	// addr 为远端地址。
-	GetReader(res []byte) (io.Reader, error)
+	GetReader(res []byte, addr net.Addr) (io.Reader, error)
 }
 
 //
@@ -477,7 +488,7 @@ func (c *Contact) RemoteAddr() net.Addr {
 // 单独的注册接口提供一种灵活性。如不同对端不同对待。
 //
 func (c *Contact) Register(resp Responser) {
-	c.serv.Resp = resp
+	c.servs.Resp = resp
 }
 
 //
@@ -504,7 +515,7 @@ func (c *Contact) Query(res []byte, rec Receiver) error {
 //
 func (c *Contact) Bye() error {
 	if c.rdsrv != nil {
-		c.rdsrv.Stop.Exit()
+		c.rdsrv.stop.Exit()
 	}
 	return c.servs.Exit()
 }

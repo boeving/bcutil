@@ -78,6 +78,7 @@ var (
 // 一个对端4元组连系对应一个本类实例。
 //
 type service struct {
+	Resp  Responser       // 响应器
 	Recv  chan<- *rcvInfo // 信息递送通道
 	dcpx  *dcp2s          // 子服务管理器
 	clean func(net.Addr)  // 接收到断开后的清理（Listener:pool）
@@ -104,10 +105,12 @@ func (s *service) Start() *service {
 
 //
 // 递送数据报。
-// 由监听器读取网络接口解析后分发。
-// 事项：
-// - 判断数据报是对端的请求还是对端对本地请求的响应。
-//   请求交由响应&发送器接口，响应交由接收器接口。
+// 由监听器读取网络接口解析后分发（调用）。
+// 1.
+// 判断数据报是对端的资源请求还是对端对本端资源请求的响应。
+// - 资源请求包含REQ标记。交由响应&发送器接口。
+// - 无REQ标记的为响应数据报，交由接收器接口。
+// - 如果数据报有BYE标记，则取接收数据ID传递到接收接口。
 //
 // - 向响应接口（ackRecv）传递确认号和确认距离（rcvInfo）。
 // - 向响应接口（servSend）传递重置发送消息。
@@ -187,15 +190,19 @@ type session struct {
 
 //
 // 确认或重发请求申请。
-// 用于接收器提供确认申请重发请求给发送总管。
+// 用于接收器提供确认申请或重发请求给发送总管。
 // 发送总管将信息设置到数据报头后发送（发送器提供）。
+//
+// 注记：
+// Bye信息由发送子服务servSend提供，而非接收器recvServ。
+// 因为BYE通知没有数据负载（只能由servSend提供）。
 //
 type ackReq struct {
 	ID   uint16 // 数据ID#RCV
-	Ack  int    // 确认号
+	Ack  uint32 // 确认号
 	Dist int    // 确认距离（0值无漏包）
 	Rtp  bool   // 重发请求
-	Bye  bool   // 结束发送（END确认后）
+	Bye  bool   // 结束（END确认后）
 }
 
 //
@@ -232,7 +239,7 @@ type forAcks struct {
 // - RST 	重置接收标记
 // - RPZ-Size 	扩展重组大小
 // - END 	END包标记（发送完成）
-// - BYE 	BYE信息（结束发送）
+// - BYE 	BYE信息（结束）
 //
 type recvServ struct {
 	ID    uint16         // 数据ID#RCV（<=ID#SND）
@@ -337,7 +344,7 @@ type sndInfo struct {
 	Seq  int    // 序列号
 	Data []byte // 响应数据
 	End  bool   // 传输完成
-	Bye  bool   // 结束标记
+	Bye  bool   // 发送结束/退出
 }
 
 //
@@ -842,8 +849,63 @@ func limitCounter(max, step int) func(int) bool {
 //
 // 距离计数器。
 // 用于发送距离和确认距离的计数。
-// 需要排除相同序列号/确认号的数据报。
+// 注记：
+// 数据报距离为一个不大的计量值，因此用map简单处理。
+// 计数和清理通常不在同一个Go程中，因此锁保护。
 //
 type distCounter struct {
-	//
+	sum int64            // 当前累计值
+	buf map[uint32]int64 // 序列号：数据报个数累计
+	mu  sync.Mutex       // 清理保护
+}
+
+func newDistCounter() *distCounter {
+	return &distCounter{
+		buf: make(map[uint32]int64),
+	}
+}
+
+//
+// 添加一个数据报计数。
+// 相同序列号的数据报不重复计数。
+//
+// seq 为数据报的序列号。
+//
+func (d *distCounter) Add(seq uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, ok := d.buf[seq]; ok {
+		return
+	}
+	d.sum++
+	d.buf[seq] = d.sum
+}
+
+//
+// 清理已确认历史。
+// ack 为当前确认进度的序列号。
+//
+func (d *distCounter) Clean(ack uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	max, ok := d.buf[ack]
+	if !ok {
+		return
+	}
+	for s, n := range d.buf {
+		if n < max {
+			delete(d.buf, s)
+		}
+	}
+}
+
+//
+// 返回距离（计数）。
+//
+func (d *distCounter) Dist() uint {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return uint(len(d.buf))
 }

@@ -102,15 +102,16 @@ var (
 // 一个4元组两端连系对应一个本类实例。
 //
 type xSender struct {
-	Conn *connWriter    // 数据报网络发送器
-	Post <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
-	Acks <-chan *ackReq // 待确认信息包通道（同上）
-	Eval *rateEval      // 速率评估器
-	dcpx *dcp2s         // 子服务管理器
+	Conn  *connWriter    // 数据报网络发送器
+	Post  <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
+	Acks  <-chan *ackReq // 待确认信息包通道（同上）
+	Eval  *rateEval      // 速率评估器
+	dcpx  *dcp2s         // 子服务管理器
+	curid int            // 当前数据体ID存储
 }
 
-func newXSender(w *connWriter, dx *dcp2s, pch <-chan *packet, ach <-chan *ackReq) {
-
+func newXSender(w *connWriter, dx *dcp2s, pch <-chan *packet, ach <-chan *ackReq) *xSender {
+	//
 }
 
 //
@@ -149,18 +150,53 @@ func (x *xSender) Serve(stop *goes.Stop) {
 }
 
 //
-// 请求资源。
-// 通常仅由外部应用请求时或发送首个分组时调用。
+// 资源请求。
+// 请求标识res没有大小限制，但通常仅为一个分组大小。
+// 大小超过一个分组时，采用发送子服务发送（同响应逻辑）。
+//
+// 单个分组大小的请求有较好的性能。
+// 请求的首个分组发送不受速率限制，数据体ID顺序递增，发送有序。
 //
 func (x *xSender) Request(res []byte) error {
 	p := x.emptyPacket()
+	p.Set(REQ)
+	p.Set(BEG)
+	p.SID = uint16(roundPlus2(x.curid, 1))
+
+	// 随机起始值
+	seq := rand.Int63() % xLimit32
+	p.Seq = uint32(seq)
+
+	sz := payloadSize()
+
+	if int64(len(res)) <= sz {
+		p.Set(END)
+	} else {
+		x.multiRequest(p.SID, seq+sz, res[sz:])
+		res = res[:sz]
+	}
 	p.Data = res
 
+	// 首个优先发送
+	return x.firstRequest(p)
+}
+
+//
+// 发送单分组资源请求。
+//
+func (x *xSender) firstRequest(p *packet) error {
 	n, err := x.send(p, x.AckReq())
 	if n > 0 {
 		log.Printf("send [%d:%d] packet on %d times", p.SID, p.Seq, n)
 	}
 	return err
+}
+
+//
+// 请求分组发送服务。
+//
+func (x *xSender) multiRequest(id uint16, seq int64, rest []byte) {
+	//
 }
 
 //
@@ -239,7 +275,7 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 		p.Set(BYE)
 	}
 	p.RID = req.ID
-	p.Rcv = req.Rcv
+	p.Ack = req.Ack
 }
 
 //
@@ -264,8 +300,8 @@ type forSend struct {
 // - 接收到END确认后（ackRecv），发送一个BYE通知即退出。
 // - 接收端最多重复endAcks次END确认，如果都丢失，则由超时机制退出。
 //
-// 接收项（ackRecv:rcvInfo）：
-// - Rcv 	接收号
+// 接收确认信息（ackRecv:rcvInfo）：
+// - Ack 	确认号
 // - Dist 	确认距离
 // - RTP 	请求重发标记
 //
@@ -281,33 +317,30 @@ type servSend struct {
 	stop   *goes.Stop       // 外部结束开关
 	eval   *evalRate        // 速率评估器
 	recv   *ackRecv         // 接收确认
+	dcnt   *distCounter     // 距离计数器
+	seq    int64            // 当前序列号
+	byreq  bool             // 为资源请求（REQ）
 	endOut <-chan time.Time // END确认超时结束
 }
 
 //
 // 新建一个子发送服务器。
 //
-func newServSend(id int, rsp *response, x forSend) *servSend {
-	ar := ackRecv{
-		Recv: x.Recv,
-		Loss: newLossEval(subEaseRate, sendRateZoom),
-		Resp: rsp,
-	}
-	er := evalRate{
-		lossEval: ar.Loss,
-		Zoom:     sendRateZoom,
-		Ease:     subEaseRate,
-		Dist:     x.Dist,
-	}
+func newServSend(id int, seq int64, rsp *response, x forSend) *servSend {
+	dcnt := newDistCounter()
+	loss := newLossEval(subEaseRate, sendRateZoom)
+
 	return &servSend{
-		ID:   id,
+		ID:   uint16(id),
 		Post: x.Post,
 		Bye:  x.Bye,
 		Loss: make(chan int64),
 		Resp: rsp,
 		stop: goes.NewStop(),
-		eval: &er,
-		recv: &ar,
+		eval: newEvalRate(loss, sendRateZoom, subEaseRate, x.Dist),
+		recv: newAckRecv(x.Recv, loss, rsp, dcnt),
+		seq:  seq,
+		dcnt: dcnt,
 	}
 }
 
@@ -319,10 +352,10 @@ func (s *servSend) Exit() {
 }
 
 //
-// 返回数据片合法大小。
+// 设置为资源请求发送。
 //
-func (s *servSend) DataSize() int {
-	return PathMTU() - headAll
+func (s *servSend) ReqFlag() {
+	s.byreq = true
 }
 
 //
@@ -336,14 +369,11 @@ func (s *servSend) Serve(re *rateEval) {
 	// 确认接收处理。
 	go s.recv.Serve(s.Loss, re, s.stop)
 
-	// 随机起始值
-	seq := rand.Intn(xLimit32 - 1)
-
 	// 正常发送通道，缓存>0
 	snd := make(chan *packet, 1)
 
 	for {
-		size := s.DataSize()
+		size := payloadSize()
 		select {
 		case <-s.stop.C:
 			return // 外部强制结束
@@ -384,25 +414,26 @@ func (s *servSend) Serve(re *rateEval) {
 			}
 
 		// 结束后阻塞（等待确认）。
-		// 不影响丢包后的重构发送或对端请求重置发送。
+		// 不影响判断为丢包后的重发。
 		case p := <-s.Send(seq, size, rst, snd):
-			// 速率控制
+			// 先休眠，友好
+			// 与上层首个发送相间隔。
 			time.Sleep(s.eval.Rate(int(p.SndDst), re.Base()))
 			s.Post <- p
-
-			buf[seq] = p
-			seq = roundPlus(seq, 1)
-			rst = false
+			seq = roundPlus(seq, p.Size())
+			s.dcnt.Add(seq)
 		}
 	}
 }
 
 //
 // 发送结束通知（BYE）
+// 虽然属于发送子服务，但因为无数据负载，BYE作为一个确认信息被发出。
+// 对端在检测到BYE消息后，应当传递给接收器（recvServ）以结束接收子服务。
 //
 func (s *servSend) End() {
 	s.Bye <- &ackReq{
-		ID:  s.ID,
+		ID:  s.ID,                // 作为ID#RCV
 		Ack: rand.Intn(xLimit32), // 无意义
 		Bye: true,
 	}
@@ -464,11 +495,11 @@ func (s *servSend) Buffer(mp map[int]*packet, beg, end int) [][]byte {
 //
 // 创建一个报头。
 //
-func (s *servSend) Header(ack, seq int) *header {
+func (s *servSend) Header(seq uint32) *header {
 	return &header{
 		SID:    s.ID,
-		Seq:    uint32(seq),
-		SndDst: uint(roundSpacing(ack, seq)),
+		Seq:    seq,
+		SndDst: s.dcnt.Dist(),
 	}
 }
 
@@ -541,9 +572,12 @@ func (s *servSend) Build(seq, size int, rst bool) *packet {
 // 构建数据报。
 //
 func (s *servSend) build(b []byte, seq int, end bool) *packet {
-	// h := s.Header(s.recv.Acked(), seq)
+	h := s.Header(seq)
 	if end {
 		h.Set(END)
+	}
+	if s.byreq {
+		h.Set(REQ)
 	}
 	return s.packet(h, b)
 }
@@ -560,25 +594,40 @@ func (s *servSend) packet(h *header, b []byte) *packet {
 // 对端对本端响应的确认信息。
 //
 type rcvInfo struct {
-	Ack  int64 // 确认号
-	Dist int   // 确认距离
-	Rtp  bool  // 重传请求
+	Ack  uint32 // 确认号
+	Dist int    // 确认距离
+	Rtp  bool   // 重传请求
 }
 
 //
 // 确认接收器。
-// 接收对端的确认号和确认距离，并评估是否丢包。
-// - 丢包时通过通知信道传递丢失包的序列号。
+// 接收对端的确认信息，评估丢包和重发通知。
+// - 丢包或对端主动请求重发时，通知目标数据包的序列号。
+//   注：上层自行计算与进度线的位置偏移。
 // - 如果收到END数据报的确认，关闭通知信道。
 //
 type ackRecv struct {
 	Rcvs  <-chan *rcvInfo // 接收信息传递信道
 	Loss  *lossEval       // 丢包评估器
 	Resp  *response       // 响应器引用
-	end   int64           // END包的确认号
-	acked int64           // 确认号（进度）存储
-	count int             // 收到的非连续包计数
-	mu    sync.Mutex      // count同步锁
+	Dcnt  *distCounter    // 距离计数器引用
+	acked uint32          // 确认号（进度）存储
+	end   uint32          // END包的确认号
+	mu    sync.Mutex      // end 读写保护
+}
+
+//
+// acked/end 需要初始化为一个无效值。
+//
+func newAckRecv(rch <-chan *rcvInfo, le *lossEval, rsp *response, dc *distCounter) *ackRecv {
+	return &ackRecv{
+		Recv:  rch,
+		Loss:  le,
+		Resp:  rsp,
+		Dcnt:  dc,
+		acked: xLimit32,
+		end:   xLimit32,
+	}
 }
 
 //
@@ -598,65 +647,54 @@ func (a *ackRecv) Serve(sch chan<- int64, re *rateEval, stop *goes.Stop) {
 				close(sch)
 				return
 			}
-			off := roundSpacing(a.acked, ai.Ack)
 			if ai.Rtp {
-				sch <- off
+				// 此时Ack为目标序列号
+				sch <- ai.Ack
 				continue
 			}
-			if d := a.SetAck(ai.Ack); d != 0 {
-				// a.count -= xx
-				a.Resp.Acked(d)
-			} else {
-				a.count++
-			}
+			// 确认进度。
+			a.update(ai.Ack)
+
 			if a.lost(ai.Dist, re) {
-				sch <- off
+				// 此时Ack为进度线确认号
+				sch <- ai.Ack
 			}
 		}
 	}
 }
 
 //
-// 返回当前进度（确认号）。
-//
-func (a *ackRecv) Acked() int64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.acked
-}
-
-//
-// 设置当前进度。
-// 返回新进度增加的字节数。
-//
-func (a *ackRecv) SetAck(ack int64) int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	d := roundSpacing(a.acked, ack)
-	if d == 0 {
-		return 0
-	}
-	a.acked = ack
-	return d
-}
-
-//
 // 设置END包的确认号。
 // 由servSend在发送END包时设置。
 // 注：
-// ack 虚拟的下一个数据报序列号。
+// ack 为虚拟的下一个数据报序列号。
 //
-func (a *ackRecv) SetEnd(ack int64) {
+func (a *ackRecv) SetEnd(ack uint32) {
 	a.mu.Lock()
 	a.end = ack
 	a.mu.Unlock()
 }
 
 //
+// 更新当前进度。
+// - 更新当前确认号（进度）。
+// - 对响应器已确认历史的移动清理。
+// - 清理距离计数器。
+//
+func (a *ackRecv) update(ack uint32) {
+	d := roundSpacing(a.acked, ack)
+	if d == 0 {
+		return
+	}
+	a.acked = ack
+	a.Dcnt.Clean(ack)
+	a.Resp.Acked(d)
+}
+
+//
 // 是否接收到END包的确认。
 //
-func (a *ackRecv) isEnd(ack int64) bool {
+func (a *ackRecv) isEnd(ack uint32) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return ack == a.end
@@ -696,6 +734,9 @@ func newResponse(r io.Reader) *response {
 // amount 为回收的数量，即与上一次确认点的字节偏移量。
 //
 func (r *response) Acked(amount int) {
+	if amount == 0 {
+		return
+	}
 	if amount > r.buf.Len() {
 		panic("too large of Ack offset.")
 	}
@@ -1088,6 +1129,15 @@ type evalRate struct {
 	Ease      easeRate   // 曲线速率生成
 	Dist      chan<- int // 发送距离增减量通知
 	prev      int        // 前一个发送距离暂存
+}
+
+func newEvalRate(le *lossEval, zoom float64, er easeRate, dch chan<- int) *evalRate {
+	return &evalRate{
+		lossEval: le,
+		Zoom:     zoom,
+		Ease:     er,
+		Dist:     dch,
+	}
 }
 
 //
