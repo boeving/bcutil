@@ -1,4 +1,4 @@
-package dcp
+package ppnet
 
 /////////////////////
 /// DCP 内部服务实现。
@@ -80,7 +80,7 @@ var (
 type service struct {
 	Resp  Responser       // 响应器
 	Recv  chan<- *rcvInfo // 信息递送通道
-	dcpx  *dcp2s          // 子服务管理器
+	dcps  *dcps           // 子服务管理器
 	clean func(net.Addr)  // 接收到断开后的清理（Listener:pool）
 }
 
@@ -210,10 +210,19 @@ type ackReq struct {
 // 用于创建 recvServ 实例的成员。
 //
 type forAcks struct {
-	AckReq chan<- *ackReq // 确认申请（-> xSender）
-	Rtp    <-chan int     // 请求重发通知
-	Rack   <-chan int     // 再次确认通知
-	Ack    <-chan int     // 应用确认通知（数据消耗）
+	AckReq chan *ackReq // 确认申请（-> xSender）
+	Rtp    chan int     // 请求重发通知
+	Rack   chan int     // 再次确认通知
+	Ack    chan int     // 应用确认通知（数据消耗）
+}
+
+func newForAcks() *forAcks {
+	return &forAcks{
+		AckReq: make(chan *ackReq, PostChSize),
+		Rtp:    make(chan int, 1),
+		Rack:   make(chan int, 1),
+		Ack:    make(chan int, 1),
+	}
 }
 
 //
@@ -250,7 +259,7 @@ type recvServ struct {
 	alive time.Time      // 活着时间戳
 }
 
-func newRecvServ(id int, x forAcks) *recvServ {
+func newRecvServ(id int, x *forAcks) *recvServ {
 	return &recvServ{
 		ID:     uint16(id),
 		AckReq: x.AckReq,

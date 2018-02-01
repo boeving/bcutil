@@ -1,7 +1,7 @@
-package dcp
+package ppnet
 
 /////////////////////
-/// DCP 内部服务实现。
+/// DCP 发送服务实现。
 /// 流程
 /// 	客户端：应用请求 >> [发送]； [接收] >> 写入应用。
 /// 	服务端：[接收] >> 询问应用，获取io.Reader，读取 >> [发送]。
@@ -62,6 +62,8 @@ const (
 	RateLimit   = 100 * time.Microsecond // 极限速率。万次/秒
 	SendTimeout = 2 * time.Minute        // 发送超时（资源请求）
 	SendEndtime = 10 * time.Second       // 发送END包后超时结束时限
+	PostChSize  = 20                     // 数据报递送通道缓存
+	EvalChSize  = 5                      // 速率评估距离增减量传递通道缓存
 )
 
 // 基本参数常量
@@ -106,11 +108,11 @@ type xSender struct {
 	Post  <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
 	Acks  <-chan *ackReq // 待确认信息包通道（同上）
 	Eval  *rateEval      // 速率评估器
-	dcpx  *dcp2s         // 子服务管理器
+	dcps  *dcps          // 子服务管理器
 	curid int            // 当前数据体ID存储
 }
 
-func newXSender(w *connWriter, dx *dcp2s, pch <-chan *packet, ach <-chan *ackReq) *xSender {
+func newXSender(w *connWriter, dx *dcps, pch <-chan *packet, ach <-chan *ackReq) *xSender {
 	//
 }
 
@@ -172,7 +174,7 @@ func (x *xSender) Request(res []byte) error {
 	if int64(len(res)) <= sz {
 		p.Set(END)
 	} else {
-		x.multiRequest(p.SID, seq+sz, res[sz:])
+		x.restRequest(p.SID, seq+sz, res[sz:])
 		res = res[:sz]
 	}
 	p.Data = res
@@ -193,9 +195,9 @@ func (x *xSender) firstRequest(p *packet) error {
 }
 
 //
-// 请求分组发送服务。
+// 剩余请求分组的发送服务。
 //
-func (x *xSender) multiRequest(id uint16, seq int64, rest []byte) {
+func (x *xSender) restRequest(id uint16, seq int64, rest []byte) {
 	//
 }
 
@@ -283,10 +285,19 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 // 用于创建 servSend 实例的成员。
 //
 type forSend struct {
-	Post chan<- *packet  // 数据报发送信道备存
-	Bye  chan<- *ackReq  // 结束通知（BYE）
-	Dist chan<- int      // 发送距离增减量通知（-> rateEval）
-	Recv <-chan *rcvInfo // 接收信息传递信道
+	Post chan *packet  // 数据报发送信道备存
+	Bye  chan *ackReq  // 结束通知（BYE）
+	Dist chan int      // 发送距离增减量通知（-> rateEval）
+	Recv chan *rcvInfo // 接收信息传递信道
+}
+
+func newForSend() *forSend {
+	return &forSend{
+		Post: make(chan *packet, PostChSize),
+		Bye:  make(chan *ackReq, 1),
+		Dist: make(chan int, EvalChSize),
+		Recv: make(chan *rcvInfo),
+	}
 }
 
 //
@@ -321,12 +332,13 @@ type servSend struct {
 	seq    int64            // 当前序列号
 	byreq  bool             // 为资源请求（REQ）
 	endOut <-chan time.Time // END确认超时结束
+	exit   *goes.Stop       // 总结束开关
 }
 
 //
 // 新建一个子发送服务器。
 //
-func newServSend(id int, seq int64, rsp *response, x forSend) *servSend {
+func newServSend(id int, seq int64, rsp *response, x *forSend, exit *goes.Stop) *servSend {
 	dcnt := newDistCounter()
 	loss := newLossEval(subEaseRate, sendRateZoom)
 
@@ -341,6 +353,7 @@ func newServSend(id int, seq int64, rsp *response, x forSend) *servSend {
 		recv: newAckRecv(x.Recv, loss, rsp, dcnt),
 		seq:  seq,
 		dcnt: dcnt,
+		exit: exit,
 	}
 }
 
@@ -375,18 +388,21 @@ func (s *servSend) Serve(re *rateEval) {
 	for {
 		size := payloadSize()
 		select {
+		case <-s.exit.C:
+			s.Exit()
+			return // 外部总结束
 		case <-s.stop.C:
-			return // 外部强制结束
+			return // 当前服务结束
 		case <-s.endOut:
-			// END包发送后超时，
-			// 接收端会重复多次END包的确认，因此通常不至于此。
-			go s.End()
+			// END包发送后超时
+			// 注：接收端会多次END确认，因此通常不至于此。
+			go s.toBye()
 			s.Exit()
 			return
 
 		case i, ok := <-s.Loss:
 			if !ok {
-				go s.End()
+				go s.toBye()
 				return // END确认，正常结束
 			}
 			p := buf[i]
@@ -415,9 +431,9 @@ func (s *servSend) Serve(re *rateEval) {
 
 		// 结束后阻塞（等待确认）。
 		// 不影响判断为丢包后的重发。
-		case p := <-s.Send(seq, size, rst, snd):
-			// 先休眠，友好
-			// 与上层首个发送相间隔。
+		case p := <-s.backSend(seq, size, rst, snd):
+			// 先休眠，
+			// 资源请求时由上层发送首个分组。
 			time.Sleep(s.eval.Rate(int(p.SndDst), re.Base()))
 			s.Post <- p
 			seq = roundPlus(seq, p.Size())
@@ -431,7 +447,7 @@ func (s *servSend) Serve(re *rateEval) {
 // 虽然属于发送子服务，但因为无数据负载，BYE作为一个确认信息被发出。
 // 对端在检测到BYE消息后，应当传递给接收器（recvServ）以结束接收子服务。
 //
-func (s *servSend) End() {
+func (s *servSend) toBye() {
 	s.Bye <- &ackReq{
 		ID:  s.ID,                // 作为ID#RCV
 		Ack: rand.Intn(xLimit32), // 无意义
@@ -443,7 +459,7 @@ func (s *servSend) End() {
 // 返回一个正常发送数据报的读取信道。
 // 传递并返回通道，主要用于读取结束后的阻塞控制。
 //
-func (s *servSend) Send(seq, size int, rst bool, pch chan *packet) <-chan *packet {
+func (s *servSend) backSend(seq, size int, rst bool, pch chan *packet) <-chan *packet {
 	p := s.Build(seq, size, rst)
 	if p == nil {
 		s.endOut = time.After(SendEndtime)
@@ -551,10 +567,16 @@ func (s *servSend) Combine(hist map[int]*packet, beg, max, size int) (*packet, i
 }
 
 //
-// 构建数据报。
+// 丢包后的数据报构建。
+//
+func (s *servSend) lossBuild(seq, size int) *packet {
+	//
+}
+
+//
+// 正常构建数据报。
 // 从响应器获取数据片构造数据报。
 // 返回nil表示读取出错（非io.EOF）。
-// 返回的布尔值表示是否读取结束。
 //
 func (s *servSend) Build(seq, size int, rst bool) *packet {
 	b, err := s.Resp.Get(size)
@@ -575,17 +597,11 @@ func (s *servSend) build(b []byte, seq int, end bool) *packet {
 	h := s.Header(seq)
 	if end {
 		h.Set(END)
+		s.recv.SetEnd(seq + len(b))
 	}
 	if s.byreq {
 		h.Set(REQ)
 	}
-	return s.packet(h, b)
-}
-
-//
-// 创建一个数据报。
-//
-func (s *servSend) packet(h *header, b []byte) *packet {
 	return &packet{header: h, Data: b}
 }
 
@@ -756,6 +772,9 @@ func (r *response) LossGet(size, off int) ([]byte, error) {
 
 	if off >= len(b) {
 		return nil, errLossOffset
+	}
+	if size+off >= len(b) {
+		return b[off:], nil
 	}
 	return b[off : off+size], nil
 }

@@ -1,4 +1,4 @@
-package dcp
+package ppnet
 
 import (
 	"math/rand"
@@ -31,25 +31,25 @@ import (
 // 发送/接收子服务管理。
 // 一个4元组两端连系对应一个本类实例。
 //
-type dcp2s struct {
-	Sndx  forSend              // servSend 创建参数
-	Acks  forAcks              // recvServ 创建参数
-	idx   int                  // 最新请求ID记录
-	sPool map[uint16]*servSend // 发送服务器池（key:#SND）
-	rPool map[uint16]*recvServ // 接收服务器池（key:#RCV）
+type dcps struct {
+	*forSend                      // servSend 创建参考
+	*forAcks                      // recvServ 创建参考
+	idx      int                  // 最新请求ID（数据体ID）存储
+	sPool    map[uint16]*servSend // 发送服务器池（key:#SND）
+	rPool    map[uint16]*recvServ // 接收服务器池（key:#RCV）
 }
 
 //
 // 新建一个子服务管理器。
 // 初始id为一个随机值。
 //
-func newDcp2s(sx forSend, ax forAcks) *dcp2s {
-	return &dcp2s{
-		Sndx:  sx,
-		Acks:  ax,
-		idx:   rand.Intn(xLimit16 - 1),
-		sPool: make(map[uint16]*servSend),
-		rPool: make(map[uint16]*recvServ),
+func newDcps() *dcps {
+	return &dcps{
+		forSend: newForSend(),
+		forAcks: newForAcks(),
+		idx:     rand.Intn(xLimit16 - 1),
+		sPool:   make(map[uint16]*servSend),
+		rPool:   make(map[uint16]*recvServ),
 	}
 }
 
@@ -58,14 +58,14 @@ func newDcp2s(sx forSend, ax forAcks) *dcp2s {
 // 返回分配的数据体ID（用于设置请求数据报的发送ID）。
 // 如果没有可用的ID资源，返回一个无效值（0xffff）和false。
 //
-func (d *dcp2s) NewRecvServ(req chan<- *ackReq, rtp, rack, ack <-chan int) (int, bool) {
-	x := d.reqID(d.idx)
-	if x == xLimit16 {
-		return x, false
+func (d *dcps) NewRecvServ() (int, bool) {
+	i := d.reqID(d.idx)
+	if i == xLimit16 {
+		return i, false
 	}
-	d.rPool[uint16(x)] = newRecvServ(x, d.Acks)
-	d.idx = x
-	return x, true
+	d.rPool[uint16(i)] = newRecvServ(i, d.forAcks)
+	d.idx = i
+	return i, true
 }
 
 //
@@ -74,14 +74,14 @@ func (d *dcp2s) NewRecvServ(req chan<- *ackReq, rtp, rack, ack <-chan int) (int,
 // 注记：
 // 仅需清除recvServ存储即可（servSend的ID为依赖关系）。
 //
-func (d *dcp2s) Clean(id uint16) {
+func (d *dcps) Clean(id uint16) {
 	delete(d.rPool, id)
 }
 
 //
 // 返回数据ID的接收子服务器。
 //
-func (d *dcp2s) RecvServ(id uint16) *recvServ {
+func (d *dcps) RecvServ(id uint16) *recvServ {
 	return d.rPool[id]
 }
 
@@ -90,8 +90,8 @@ func (d *dcp2s) RecvServ(id uint16) *recvServ {
 // ID由对端的资源请求传递过来。
 // 本方法由service实例接收到一个资源请求时调用。
 //
-func (d *dcp2s) NewServSend(id int, rsp *response, re *rateEval, x forSend) {
-	ss := newServSend(id, rsp, x)
+func (d *dcps) NewServSend(id int, seq int64, rsp *response, re *rateEval) {
+	ss := newServSend(id, seq, rsp, d.forSend)
 	go ss.Serve(re)
 
 	d.sPool[uint16(id)] = ss
@@ -100,7 +100,7 @@ func (d *dcp2s) NewServSend(id int, rsp *response, re *rateEval, x forSend) {
 //
 // 返回数据ID的发送子服务器。
 //
-func (d *dcp2s) ServSend(id uint16) *servSend {
+func (d *dcps) ServSend(id uint16) *servSend {
 	return d.sPool[id]
 }
 
@@ -113,7 +113,7 @@ func (d *dcp2s) ServSend(id uint16) *servSend {
 // 如果空位被用完，会执行一次清理。
 // 返回0xffff为一个无效值，表示无资源可回收。
 //
-func (d *dcp2s) reqID(id int) int {
+func (d *dcps) reqID(id int) int {
 	// 空位
 	for i := 0; i < xLimit16; i++ {
 		id = roundPlus2(id, 1)
@@ -132,7 +132,7 @@ func (d *dcp2s) reqID(id int) int {
 //
 // lev 为清理等级，1为全部清理，3为三分之一。
 //
-func (d *dcp2s) recycle(id, lev int) int {
+func (d *dcps) recycle(id, lev int) int {
 	n := xLimit16
 
 	for i := 0; i < xLimit16/lev; i++ {

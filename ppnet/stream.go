@@ -1,4 +1,4 @@
-package dcp
+package ppnet
 
 import (
 	"io"
