@@ -13,8 +13,12 @@ package ppnet
 ///////////////////////////////////////////////////////////////////////////////
 
 import (
+	"errors"
 	"net"
-	"time"
+)
+
+var (
+	errListenExit = errors.New("listening exit")
 )
 
 //
@@ -22,9 +26,10 @@ import (
 // 负责不同客户的服务器构造分配和数据传递。
 //
 type Listener struct {
-	conn  *connReader         // 网络读取
-	laddr net.Addr            // 本地地址存储
-	pool  map[string]*service // Key: 远端地址
+	conn    *connReader         // 网络读取
+	laddr   net.Addr            // 本地地址存储
+	pool    map[string]*service // Key: 远端地址
+	stopped bool                // 停止监听标记
 }
 
 //
@@ -55,30 +60,51 @@ func (l *Listener) Accept() (*Contact, error) {
 			return nil, err
 		}
 		kr := raddr.String()
+
 		if srv, ok := l.pool[kr]; ok {
-			go srv.Post(*pack)
+			go srv.Post(pack)
 			continue
 		}
-		// 来自新的对端，新建连系
-		c := Contact{
-			laddr: l.laddr,
-			raddr: raddr,
-			serv:  newService(&connWriter{raddr, l.conn.Conn}, l.remove),
-			alive: time.Now(),
-			// rdsrv:  nil, // not needed.
+		if l.stopped {
+			if len(l.pool) == 0 {
+				break
+			}
+			continue
 		}
-		l.pool[kr] = c.serv
-		go c.serv.Start().Post(*pack)
-
-		return &c, nil
+		// 来自新的对端
+		return l.newContact(raddr, pack, kr), nil
 	}
+	return nil, errListenExit
 }
 
 //
-// Close 关闭本地监听（结束服务）。
+// 创建一个新的连系。
+//
+func (l *Listener) newContact(raddr net.Addr, pack *packet, k string) *Contact {
+	c := Contact{
+		laddr: l.laddr,
+		raddr: raddr,
+		sends: newXSender(),
+		servs: newService(&connWriter{raddr, l.conn.Conn}, l.remove),
+		// rdsrv:  nil, // not needed.
+	}
+	l.pool[k] = c.servs
+	go c.servs.Start().Post(pack)
+
+	return &c
+}
+
+//
+// Close 停止本地监听。
+// 已创建连系的两个端点间仍然可正常通信。
 //
 func (l *Listener) Close() error {
-	return l.conn.Close()
+	l.stopped = true
+
+	if len(l.pool) == 0 {
+		return l.conn.Close()
+	}
+	return nil
 }
 
 //
@@ -93,5 +119,8 @@ func (l *Listener) Addr() net.Addr {
 // 这可能在远端主动Bye之后发生，或本地主动清理。
 //
 func (l *Listener) remove(raddr net.Addr) {
+	if l.stopped && len(l.pool) == 1 {
+		l.conn.Close()
+	}
 	delete(l.pool, raddr.String())
 }

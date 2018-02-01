@@ -107,25 +107,28 @@ type xSender struct {
 	Conn  *connWriter    // 数据报网络发送器
 	Post  <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
 	Acks  <-chan *ackReq // 待确认信息包通道（同上）
+	Bye   <-chan *ackBye // BYE通知信道
 	Eval  *rateEval      // 速率评估器
+	Stop  *goes.Stop     // 外部停止通知
 	dcps  *dcps          // 子服务管理器
 	curid int            // 当前数据体ID存储
 }
 
-func newXSender(w *connWriter, dx *dcps, pch <-chan *packet, ach <-chan *ackReq) *xSender {
+func newXSender(w *connWriter, dx *dcps, pch <-chan *packet, ach <-chan *ackReq, stop *goes.Stop) *xSender {
 	//
 }
 
 //
 // 启动发送服务。
 //
-func (x *xSender) Serve(stop *goes.Stop) {
+func (x *xSender) Serve() {
 	for {
 		var p *packet
 		var ack *ackReq
+		var bye *ackBye
 
 		select {
-		case <-stop.C:
+		case <-x.Stop.C:
 			return
 
 		case p = <-x.Post:
@@ -141,9 +144,19 @@ func (x *xSender) Serve(stop *goes.Stop) {
 				continue
 			}
 			p = x.Packet()
+
+		case bye = <-x.Bye:
+			p = x.Packet()
+			x.SetBye(p, bye)
+			// clean..
+			x.dcps.Done(bye.ID, bye.Qer)
+		}
+
+		if ack != nil {
+			x.SetAcks(p, ack)
 		}
 		// 失败后退出
-		if n, err := x.send(p, ack); err != nil {
+		if n, err := x.send(p); err != nil {
 			log.Printf("write to net %d tries, but all failed.", n)
 			return
 		}
@@ -160,21 +173,25 @@ func (x *xSender) Serve(stop *goes.Stop) {
 // 请求的首个分组发送不受速率限制，数据体ID顺序递增，发送有序。
 //
 func (x *xSender) Request(res []byte) error {
+	id, err := x.dcps.NewRecvServ()
+	if err != nil {
+		return err
+	}
 	p := x.emptyPacket()
 	p.Set(REQ)
 	p.Set(BEG)
-	p.SID = uint16(roundPlus2(x.curid, 1))
+	p.SID = uint16(id)
 
 	// 随机起始值
 	seq := rand.Int63() % xLimit32
 	p.Seq = uint32(seq)
 
-	sz := payloadSize()
+	sz := PayloadSize()
 
 	if int64(len(res)) <= sz {
 		p.Set(END)
 	} else {
-		x.restRequest(p.SID, seq+sz, res[sz:])
+		x.restRequest(id, seq+sz, res[sz:])
 		res = res[:sz]
 	}
 	p.Data = res
@@ -187,7 +204,11 @@ func (x *xSender) Request(res []byte) error {
 // 发送单分组资源请求。
 //
 func (x *xSender) firstRequest(p *packet) error {
-	n, err := x.send(p, x.AckReq())
+	ack := x.AckReq()
+	if ack != nil {
+		x.SetAcks(p, ack)
+	}
+	n, err := x.send(p)
 	if n > 0 {
 		log.Printf("send [%d:%d] packet on %d times", p.SID, p.Seq, n)
 	}
@@ -197,8 +218,14 @@ func (x *xSender) firstRequest(p *packet) error {
 //
 // 剩余请求分组的发送服务。
 //
-func (x *xSender) restRequest(id uint16, seq int64, rest []byte) {
-	//
+func (x *xSender) restRequest(id int, seq int64, rest []byte) {
+	ss := x.dcps.ReqServSend(
+		id,
+		seq,
+		newResponse(bytes.NewReader(rest)),
+		x.Stop,
+	)
+	go ss.Serve(x.Eval)
 }
 
 //
@@ -245,10 +272,7 @@ func (x *xSender) emptyPacket() *packet {
 // 如果失败会适当多次尝试，依然返回错误时，外部通常应结束服务。
 // 返回的整数值为失败尝试的次数。
 //
-func (x *xSender) send(p *packet, req *ackReq) (int, error) {
-	if req != nil {
-		x.SetAcks(p, req)
-	}
+func (x *xSender) send(p *packet) (int, error) {
 	var err error
 	var cnt int
 
@@ -273,11 +297,22 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 	if req.Dist > 0 {
 		p.AckDst = uint(req.Dist)
 	}
-	if req.Bye {
-		p.Set(BYE)
+	if req.Qer {
+		p.Set(QER)
 	}
 	p.RID = req.ID
 	p.Ack = req.Ack
+}
+
+//
+// 设置BYE通知（ACK）。
+//
+func (x *xSender) SetBye(p *packet, bye *ackBye) {
+	if bye.Qer {
+		p.Set(QER)
+	}
+	p.RID = bye.ID
+	p.Ack = rand.Uint32() // 无意义
 }
 
 //
@@ -286,7 +321,7 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 //
 type forSend struct {
 	Post chan *packet  // 数据报发送信道备存
-	Bye  chan *ackReq  // 结束通知（BYE）
+	Bye  chan *ackBye  // 结束通知（BYE）
 	Dist chan int      // 发送距离增减量通知（-> rateEval）
 	Recv chan *rcvInfo // 接收信息传递信道
 }
@@ -294,10 +329,18 @@ type forSend struct {
 func newForSend() *forSend {
 	return &forSend{
 		Post: make(chan *packet, PostChSize),
-		Bye:  make(chan *ackReq, 1),
+		Bye:  make(chan *ackBye, 1),
 		Dist: make(chan int, EvalChSize),
 		Recv: make(chan *rcvInfo),
 	}
+}
+
+//
+// BYE确认通知。
+//
+type ackBye struct {
+	ID  uint16 // 数据ID#SND（=>#RCV）
+	Qer bool   // 是否为资源请求
 }
 
 //
@@ -322,17 +365,17 @@ func newForSend() *forSend {
 type servSend struct {
 	ID     uint16           // 数据ID#SND
 	Post   chan<- *packet   // 数据报递送通道（有缓存）
-	Bye    chan<- *ackReq   // 结束通知（BYE）
+	Bye    chan<- *ackBye   // 结束通知（BYE）
 	Loss   chan int64       // 丢包重发通知
 	Resp   *response        // 响应器
-	stop   *goes.Stop       // 外部结束开关
+	stop   *goes.Stop       // 分支服务停止
 	eval   *evalRate        // 速率评估器
 	recv   *ackRecv         // 接收确认
 	dcnt   *distCounter     // 距离计数器
 	seq    int64            // 当前序列号
 	byreq  bool             // 为资源请求（REQ）
 	endOut <-chan time.Time // END确认超时结束
-	exit   *goes.Stop       // 总结束开关
+	exit   *goes.Stop       // 上层结束开关
 }
 
 //
@@ -386,11 +429,11 @@ func (s *servSend) Serve(re *rateEval) {
 	snd := make(chan *packet, 1)
 
 	for {
-		size := payloadSize()
+		size := PayloadSize()
 		select {
 		case <-s.exit.C:
 			s.Exit()
-			return // 外部总结束
+			return // 上层结束
 		case <-s.stop.C:
 			return // 当前服务结束
 		case <-s.endOut:
@@ -448,10 +491,9 @@ func (s *servSend) Serve(re *rateEval) {
 // 对端在检测到BYE消息后，应当传递给接收器（recvServ）以结束接收子服务。
 //
 func (s *servSend) toBye() {
-	s.Bye <- &ackReq{
-		ID:  s.ID,                // 作为ID#RCV
-		Ack: rand.Intn(xLimit32), // 无意义
-		Bye: true,
+	s.Bye <- &ackBye{
+		ID:  s.ID, // 作为ID#RCV
+		Qer: s.byreq,
 	}
 }
 
@@ -733,14 +775,14 @@ func (a *ackRecv) lost(dist int, re *rateEval) bool {
 //
 type response struct {
 	br   *bufio.Reader // 响应读取器
-	buf  *bytes.Buffer // 确认前发送暂存
+	sent *bytes.Buffer // 确认前发送暂存
 	done bool          // 读取结束
 }
 
 func newResponse(r io.Reader) *response {
 	return &response{
-		br:  bufio.NewReader(r),
-		buf: bytes.NewBuffer(nil),
+		br:   bufio.NewReader(r),
+		sent: bytes.NewBuffer(nil),
 	}
 }
 
@@ -753,10 +795,10 @@ func (r *response) Acked(amount int) {
 	if amount == 0 {
 		return
 	}
-	if amount > r.buf.Len() {
+	if amount > r.sent.Len() {
 		panic("too large of Ack offset.")
 	}
-	r.buf.Next(amount)
+	r.sent.Next(amount)
 }
 
 //
@@ -768,7 +810,7 @@ func (r *response) Acked(amount int) {
 // off 为丢包所需数据起点相对于确认点的字节偏移。
 //
 func (r *response) LossGet(size, off int) ([]byte, error) {
-	b := r.buf.Bytes()
+	b := r.sent.Bytes()
 
 	if off >= len(b) {
 		return nil, errLossOffset
@@ -792,7 +834,7 @@ func (r *response) Get(size int) ([]byte, error) {
 		return nil, err
 	}
 	// 已发送暂存
-	if _, err = r.buf.Write(b); err != nil {
+	if _, err = r.sent.Write(b); err != nil {
 		return nil, err
 	}
 	return b, err

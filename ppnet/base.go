@@ -98,9 +98,9 @@ func SetPMTU(size int64) {
 }
 
 //
-// 分组有效负载合法尺寸。
+// PayloadSize 计算分组有效负载尺寸。
 //
-func payloadSize() int64 {
+func PayloadSize() int64 {
 	return PathMTU() - headAll
 }
 
@@ -255,6 +255,8 @@ type datagram struct {
 
 //
 // 网络连接读取器。
+// 注记：
+// 仅对读取接口实现Close方法。
 //
 type connReader struct {
 	Conn *net.UDPConn
@@ -289,6 +291,7 @@ func (r *connReader) Close() error {
 
 //
 // 网络连接写入器。
+// 注记：Close由connReader实现。
 //
 type connWriter struct {
 	Raddr net.Addr
@@ -299,7 +302,7 @@ type connWriter struct {
 // 写入目标数据报实例。
 //
 func (w *connWriter) Send(p packet) (int, error) {
-	return w.Conn.Write(p.Bytes())
+	return w.Conn.WriteTo(p.Bytes(), w.Raddr)
 }
 
 //
@@ -312,11 +315,11 @@ func (w *connWriter) Send(p packet) (int, error) {
 //
 type servReader struct {
 	read *connReader
-	post func(packet)
+	post func(*packet)
 	stop *goes.Stop
 }
 
-func newServReader(conn *net.UDPConn, post func(packet)) *servReader {
+func newServReader(conn *net.UDPConn, post func(*packet)) *servReader {
 	return &servReader{
 		read: &connReader{conn},
 		post: post,
@@ -337,7 +340,7 @@ func (s *servReader) Serve() {
 			if err != nil {
 				break
 			}
-			go s.post(*pack)
+			go s.post(pack)
 		}
 	}
 }
@@ -426,6 +429,7 @@ type Contact struct {
 	laddr, raddr net.Addr    // 4元组
 	servs        *service    // 接收服务（分配）
 	sends        *xSender    // 总发送器
+	stop         *goes.Stop  // 结束通知
 	rdsrv        *servReader // 简单读取服务（Dial需要）
 }
 
@@ -516,13 +520,11 @@ func (c *Contact) Query(res []byte, rec Receiver) error {
 //
 // Bye 主动断开。
 // 无论数据是否传递完毕，都会结束发送或接收。
-// 未完成数据传输的中途结束会返回一个错误，记录了一些基本信息。
-//
 // 对端可能是一个服务器，也可能是一个普通的客户端。
 //
-func (c *Contact) Bye() error {
+func (c *Contact) Bye() {
 	if c.rdsrv != nil {
-		c.rdsrv.stop.Exit()
+		c.rdsrv.Exit()
 	}
-	return c.servs.Exit()
+	c.stop.Exit()
 }

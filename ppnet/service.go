@@ -105,8 +105,8 @@ func (s *service) Start() *service {
 
 //
 // 递送数据报。
-// 由监听器读取网络接口解析后分发（调用）。
-// 1.
+// 由监听器读取网络接口解析后分发（并发安全）。
+//
 // 判断数据报是对端的资源请求还是对端对本端资源请求的响应。
 // - 资源请求包含REQ标记。交由响应&发送器接口。
 // - 无REQ标记的为响应数据报，交由接收器接口。
@@ -121,7 +121,7 @@ func (s *service) Start() *service {
 // - 如果重置发送针对整个数据体，新建一个发送器实例执行。
 // - 如果重置接收针对整个数据体，新建一个接收器服务执行。
 //
-func (s *service) Post(pack packet) {
+func (s *service) Post(pack *packet) {
 	//
 }
 
@@ -193,16 +193,12 @@ type session struct {
 // 用于接收器提供确认申请或重发请求给发送总管。
 // 发送总管将信息设置到数据报头后发送（发送器提供）。
 //
-// 注记：
-// Bye信息由发送子服务servSend提供，而非接收器recvServ。
-// 因为BYE通知没有数据负载（只能由servSend提供）。
-//
 type ackReq struct {
 	ID   uint16 // 数据ID#RCV
 	Ack  uint32 // 确认号
 	Dist int    // 确认距离（0值无漏包）
 	Rtp  bool   // 重发请求
-	Bye  bool   // 结束（END确认后）
+	Qer  bool   // 资源请求的确认
 }
 
 //

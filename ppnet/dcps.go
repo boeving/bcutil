@@ -1,7 +1,11 @@
 package ppnet
 
 import (
+	"errors"
 	"math/rand"
+	"sync"
+
+	"github.com/qchen-zh/pputil/goes"
 )
 
 //////////////
@@ -27,6 +31,10 @@ import (
 ///
 ///////////////////////////////////////////////////////////////////////////////
 
+var (
+	errRecvServ = errors.New("not enough id resources")
+)
+
 //
 // 发送/接收子服务管理。
 // 一个4元组两端连系对应一个本类实例。
@@ -35,8 +43,10 @@ type dcps struct {
 	*forSend                      // servSend 创建参考
 	*forAcks                      // recvServ 创建参考
 	idx      int                  // 最新请求ID（数据体ID）存储
-	sPool    map[uint16]*servSend // 发送服务器池（key:#SND）
-	rPool    map[uint16]*recvServ // 接收服务器池（key:#RCV）
+	sPool    map[uint16]*servSend // 响应发送子服务（key:#SND）
+	rPool    map[uint16]*recvServ // 数据接收子服务（key:#RCV）
+	qPool    map[uint16]*servSend // 资源请求发送子服务
+	mu       sync.Mutex           // 集合保护（3 map）
 }
 
 //
@@ -50,22 +60,26 @@ func newDcps() *dcps {
 		idx:     rand.Intn(xLimit16 - 1),
 		sPool:   make(map[uint16]*servSend),
 		rPool:   make(map[uint16]*recvServ),
+		qPool:   make(map[uint16]*servSend),
 	}
 }
 
 //
 // 创建一个接收服务器。
 // 返回分配的数据体ID（用于设置请求数据报的发送ID）。
-// 如果没有可用的ID资源，返回一个无效值（0xffff）和false。
+// 如果没有可用的ID资源，返回一个无效值（0xffff）和一个错误提示。
 //
-func (d *dcps) NewRecvServ() (int, bool) {
+func (d *dcps) NewRecvServ() (int, error) {
 	i := d.reqID(d.idx)
 	if i == xLimit16 {
-		return i, false
+		return i, errRecvServ
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.rPool[uint16(i)] = newRecvServ(i, d.forAcks)
 	d.idx = i
-	return i, true
+	return i, nil
 }
 
 //
@@ -75,32 +89,77 @@ func (d *dcps) NewRecvServ() (int, bool) {
 // 仅需清除recvServ存储即可（servSend的ID为依赖关系）。
 //
 func (d *dcps) Clean(id uint16) {
+	d.mu.Lock()
 	delete(d.rPool, id)
+	d.mu.Unlock()
 }
 
 //
 // 返回数据ID的接收子服务器。
 //
 func (d *dcps) RecvServ(id uint16) *recvServ {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	return d.rPool[id]
 }
 
 //
 // 创建一个发送服务。
-// ID由对端的资源请求传递过来。
+// id 由对端的资源请求传递过来。
 // 本方法由service实例接收到一个资源请求时调用。
 //
-func (d *dcps) NewServSend(id int, seq int64, rsp *response, re *rateEval) {
-	ss := newServSend(id, seq, rsp, d.forSend)
-	go ss.Serve(re)
+func (d *dcps) NewServSend(id int, seq int64, rsp *response, stop *goes.Stop) *servSend {
+	ss := newServSend(id, seq, rsp, d.forSend, stop)
 
+	d.mu.Lock()
 	d.sPool[uint16(id)] = ss
+	d.mu.Unlock()
+
+	return ss
+}
+
+//
+// 创建一个资源请求的发送子服务。
+// id 由 NewRecvServ 返回的新分配值指定。
+// rsp 通常由一个[]byte构造而来（bytes.Reader）。
+// 注：
+// 单个数据报的资源请求无需创建此服务。
+//
+func (d *dcps) ReqServSend(id int, seq int64, rsp *response, stop *goes.Stop) *servSend {
+	ss := newServSend(id, seq, rsp, d.forSend, stop)
+	ss.ReqFlag()
+
+	d.mu.Lock()
+	d.qPool[uint16(id)] = ss
+	d.mu.Unlock()
+
+	return ss
+}
+
+//
+// 响应/请求发送完成。
+// 在响应发送完成之后（BYE发出）调用。
+//
+func (d *dcps) Done(id uint16, req bool) {
+	d.mu.Lock()
+	if req {
+		delete(d.qPool, id)
+	} else {
+		delete(d.sPool, id)
+	}
+	d.mu.Unlock()
 }
 
 //
 // 返回数据ID的发送子服务器。
+// req 标识是否为资源请求的发送子服务。
 //
-func (d *dcps) ServSend(id uint16) *servSend {
+func (d *dcps) ServSend(id uint16, req bool) *servSend {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if req {
+		return d.qPool[id]
+	}
 	return d.sPool[id]
 }
 
