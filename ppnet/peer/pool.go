@@ -1,4 +1,4 @@
-package ppnet
+package peer
 
 ///////////
 // 端点集
@@ -16,8 +16,8 @@ const (
 )
 
 //
-// Peers 端点集（连接池）。
+// 连接池（端点集）。
 //
-type Peers struct {
+type Pool struct {
 	cntID, cntAll int
 }
