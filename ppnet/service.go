@@ -255,9 +255,9 @@ type recvServ struct {
 	alive time.Time      // 活着时间戳
 }
 
-func newRecvServ(id int, x *forAcks) *recvServ {
+func newRecvServ(id uint16, x *forAcks) *recvServ {
 	return &recvServ{
-		ID:     uint16(id),
+		ID:     id,
 		AckReq: x.AckReq,
 		Rtp:    x.Rtp,
 		Rack:   x.Rack,
@@ -801,30 +801,31 @@ func (r *rtpEval) lost(seq int) bool {
 //
 // 返回序列号增量回绕值。
 //
-func roundPlus(x, n int64) int64 {
-	return (x + n + xLimit32) % xLimit32
+func roundPlus(x uint32, n int) int64 {
+	return (int64(x) + int64(n) + xLimit32) % xLimit32
 }
 
 //
 // 返回2字节（16位）增量回绕值。
 //
-func roundPlus2(x, n int) int {
-	return (x + n + xLimit16) % xLimit16
+func roundPlus2(x uint16, n int) int {
+	return (int(x) + n + xLimit16) % xLimit16
 }
 
 //
 // 支持回绕的间距计算。
-// 环回范围为全局常量 xLimit32（16位长）。
+// 环回范围为全局常量 xLimit32。
 //
-func roundSpacing(beg, end int64) int64 {
-	return (end - beg + xLimit32) % xLimit32
+func roundSpacing(beg, end uint32) int64 {
+	return (int64(end) - int64(beg) + xLimit32) % xLimit32
 }
 
 //
 // 支持回绕的起点计算。
+// 注意dist的值应当在uint32范围内。
 //
-func roundBegin(end, dist int64) int64 {
-	return roundSpacing(dist, end)
+func roundBegin(end uint32, dist int) int64 {
+	return roundSpacing(uint32(dist), end)
 }
 
 //

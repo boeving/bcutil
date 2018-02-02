@@ -76,13 +76,13 @@ var (
 // 路径MTU全局共享。
 // 该值由所有子服务共享，由PMTU探测服务设置。
 //
-var mtuGlobal = int64(mtuBase)
+var mtuGlobal = mtuBase
 var mtuShare sync.Mutex
 
 //
 // PathMTU 获取全局路径MTU大小。
 //
-func PathMTU() int64 {
+func PathMTU() int {
 	mtuShare.Lock()
 	defer mtuShare.Unlock()
 	return mtuGlobal
@@ -91,7 +91,7 @@ func PathMTU() int64 {
 //
 // SetPMTU 设置全局路径MTU共享。
 //
-func SetPMTU(size int64) {
+func SetPMTU(size int) {
 	mtuShare.Lock()
 	mtuGlobal = size
 	mtuShare.Unlock()
@@ -100,7 +100,7 @@ func SetPMTU(size int64) {
 //
 // PayloadSize 计算分组有效负载尺寸。
 //
-func PayloadSize() int64 {
+func PayloadSize() int {
 	return PathMTU() - headAll
 }
 
@@ -239,8 +239,8 @@ func (p packet) Bytes() []byte {
 	return append(b, p.Data...)
 }
 
-func (p packet) Size() int64 {
-	return int64(len(p.Data))
+func (p packet) Size() int {
+	return len(p.Data)
 }
 
 //

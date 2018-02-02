@@ -4,8 +4,6 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
-
-	"github.com/qchen-zh/pputil/goes"
 )
 
 //////////////
@@ -42,7 +40,7 @@ var (
 type dcps struct {
 	*forSend                      // servSend 创建参考
 	*forAcks                      // recvServ 创建参考
-	idx      int                  // 最新请求ID（数据体ID）存储
+	idx      uint16               // 最新请求ID（数据体ID）存储
 	sPool    map[uint16]*servSend // 响应发送子服务（key:#SND）
 	rPool    map[uint16]*recvServ // 数据接收子服务（key:#RCV）
 	qPool    map[uint16]*servSend // 资源请求发送子服务
@@ -57,7 +55,7 @@ func newDcps() *dcps {
 	return &dcps{
 		forSend: newForSend(),
 		forAcks: newForAcks(),
-		idx:     rand.Intn(xLimit16 - 1),
+		idx:     uint16(rand.Intn(xLimit16)),
 		sPool:   make(map[uint16]*servSend),
 		rPool:   make(map[uint16]*recvServ),
 		qPool:   make(map[uint16]*servSend),
@@ -69,7 +67,7 @@ func newDcps() *dcps {
 // 返回分配的数据体ID（用于设置请求数据报的发送ID）。
 // 如果没有可用的ID资源，返回一个无效值（0xffff）和一个错误提示。
 //
-func (d *dcps) NewRecvServ() (int, error) {
+func (d *dcps) NewRecvServ() (uint16, error) {
 	i := d.reqID(d.idx)
 	if i == xLimit16 {
 		return i, errRecvServ
@@ -77,7 +75,7 @@ func (d *dcps) NewRecvServ() (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.rPool[uint16(i)] = newRecvServ(i, d.forAcks)
+	d.rPool[i] = newRecvServ(i, d.forAcks)
 	d.idx = i
 	return i, nil
 }
@@ -108,8 +106,8 @@ func (d *dcps) RecvServ(id uint16) *recvServ {
 // id 由对端的资源请求传递过来。
 // 本方法由service实例接收到一个资源请求时调用。
 //
-func (d *dcps) NewServSend(id int, seq int64, rsp *response, stop *goes.Stop) *servSend {
-	ss := newServSend(id, seq, rsp, d.forSend, stop)
+func (d *dcps) NewServSend(id uint16, seq uint32, rsp *response) *servSend {
+	ss := newServSend(id, seq, rsp, d.forSend)
 
 	d.mu.Lock()
 	d.sPool[uint16(id)] = ss
@@ -125,8 +123,8 @@ func (d *dcps) NewServSend(id int, seq int64, rsp *response, stop *goes.Stop) *s
 // 注：
 // 单个数据报的资源请求无需创建此服务。
 //
-func (d *dcps) ReqServSend(id int, seq int64, rsp *response, stop *goes.Stop) *servSend {
-	ss := newServSend(id, seq, rsp, d.forSend, stop)
+func (d *dcps) ReqServSend(id uint16, seq uint32, rsp *response) *servSend {
+	ss := newServSend(id, seq, rsp, d.forSend)
 	ss.ReqFlag()
 
 	d.mu.Lock()
@@ -172,11 +170,11 @@ func (d *dcps) ServSend(id uint16, req bool) *servSend {
 // 如果空位被用完，会执行一次清理。
 // 返回0xffff为一个无效值，表示无资源可回收。
 //
-func (d *dcps) reqID(id int) int {
+func (d *dcps) reqID(id uint16) uint16 {
 	// 空位
 	for i := 0; i < xLimit16; i++ {
-		id = roundPlus2(id, 1)
-		if _, ok := d.rPool[uint16(id)]; !ok {
+		id = uint16(roundPlus2(id, 1))
+		if _, ok := d.rPool[id]; !ok {
 			return id
 		}
 	}
@@ -191,12 +189,12 @@ func (d *dcps) reqID(id int) int {
 //
 // lev 为清理等级，1为全部清理，3为三分之一。
 //
-func (d *dcps) recycle(id, lev int) int {
-	n := xLimit16
+func (d *dcps) recycle(id uint16, lev int) uint16 {
+	var n uint16 = xLimit16
 
 	for i := 0; i < xLimit16/lev; i++ {
-		id = roundPlus2(id, 1)
-		if d.rPool[uint16(id)].Alive() {
+		id = uint16(roundPlus2(id, 1))
+		if d.rPool[id].Alive() {
 			continue
 		}
 		if n == xLimit16 {
