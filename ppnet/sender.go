@@ -116,12 +116,12 @@ type xSender struct {
 	ackOut <-chan time.Time // 末尾数据体无确认超时
 }
 
-func newXSender(w *connWriter, dx *dcps, fs *forSend, ach <-chan *ackReq, re *rateEval, exit *goes.Stop) *xSender {
+func newXSender(w *connWriter, dx *dcps, re *rateEval, exit *goes.Stop) *xSender {
 	return &xSender{
 		Conn:  w,
-		Post:  fs.Post,
-		Acks:  ach,
-		Bye:   fs.Bye,
+		Post:  dx.Post,
+		Acks:  dx.AckReq,
+		Bye:   dx.Bye,
 		Eval:  re,
 		Dcps:  dx,
 		Exit:  exit,
