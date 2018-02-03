@@ -48,6 +48,7 @@ const (
 	AliveTime   = 120 * time.Second // 保活时间界限，考虑NAT会话存活时间
 	AliveIntvl  = 10 * time.Second  // 保活报文间隔时间
 	CalmExpire  = 90 * time.Second  // 服务静置期限（SND/RCV子服务无活动）
+	ReadyTime   = 6 * time.Second   // 请求发送就绪，接收超时
 )
 
 // 基本参数常量
@@ -247,12 +248,13 @@ func newForAcks() *forAcks {
 // - BYE 	BYE信息（结束）
 //
 type recvServ struct {
-	ID    uint16         // 数据ID#RCV（<=ID#SND）
-	AReq  chan<- *ackReq // 确认申请（-> xSender）
-	Rtp   <-chan int     // 请求重发通知
-	Rack  <-chan int     // 再次确认通知
-	Ack   <-chan int     // 应用确认通知（数据消耗）
-	alive time.Time      // 活着时间戳
+	ID       uint16           // 数据ID#RCV（<=ID#SND）
+	AReq     chan<- *ackReq   // 确认申请（-> xSender）
+	Rtp      <-chan int       // 请求重发通知
+	Rack     <-chan int       // 再次确认通知
+	Ack      <-chan int       // 应用确认通知（数据消耗）
+	alive    time.Time        // 活着时间戳
+	readyOut <-chan time.Time // 资源请求发送就绪后超时
 }
 
 func newRecvServ(id uint16, x *forAcks) *recvServ {
@@ -262,7 +264,7 @@ func newRecvServ(id uint16, x *forAcks) *recvServ {
 		Rtp:    x.Rtp,
 		Rack:   x.Rack,
 		Ack:    x.Ack,
-		alive:  time.Now(),
+		// alive:  time.Time{}, // zero
 	}
 }
 
@@ -275,6 +277,18 @@ func newRecvServ(id uint16, x *forAcks) *recvServ {
 //
 func (r *recvServ) Alive() bool {
 	return time.Since(r.alive) < CalmExpire
+}
+
+//
+// 资源请求发送就绪调用（servSend）。
+// 用于接收器准备接收首个响应数据片的超时重发请求。
+// 如果已经接收到响应数据，则无行为。
+//
+func (r *recvServ) Ready() {
+	if !r.alive.IsZero() {
+		return
+	}
+	r.readyOut = time.After(ReadyTime)
 }
 
 //
@@ -800,32 +814,49 @@ func (r *rtpEval) lost(seq int) bool {
 
 //
 // 返回序列号增量回绕值。
+// 注：排除xLimit32值本身。
 //
-func roundPlus(x uint32, n int) int64 {
-	return (int64(x) + int64(n) + xLimit32) % xLimit32
+func roundPlus(x, n uint32) uint32 {
+	return uint32((int64(x) + int64(n)) % xLimit32)
 }
 
 //
 // 返回2字节（16位）增量回绕值。
+// 注：排除xLimit16值本身。
 //
-func roundPlus2(x uint16, n int) int {
-	return (int(x) + n + xLimit16) % xLimit16
+func roundPlus2(x, n uint16) uint16 {
+	return uint16((int(x) + int(n)) % xLimit16)
 }
 
 //
 // 支持回绕的间距计算。
-// 环回范围为全局常量 xLimit32。
+// 环回范围为全局常量xLimit32。
 //
-func roundSpacing(beg, end uint32) int64 {
-	return (int64(end) - int64(beg) + xLimit32) % xLimit32
+func roundSpacing(beg, end uint32) uint32 {
+	if end >= beg {
+		return end - beg
+	}
+	// 不计xLimit32本身
+	return xLimit32 - (beg - end)
+}
+
+//
+// 支持回绕的间距计算。
+// 环回范围为全局常量xLimit16。
+//
+func roundSpacing2(beg, end uint16) int {
+	if end >= beg {
+		return int(end - beg)
+	}
+	return int(xLimit16 - (beg - end))
 }
 
 //
 // 支持回绕的起点计算。
 // 注意dist的值应当在uint32范围内。
 //
-func roundBegin(end uint32, dist int) int64 {
-	return roundSpacing(uint32(dist), end)
+func roundBegin(end, dist uint32) uint32 {
+	return roundSpacing(dist, end)
 }
 
 //
