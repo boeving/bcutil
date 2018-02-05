@@ -130,13 +130,30 @@ func (d *dcps) RecvServ(id uint16) *recvServ {
 }
 
 //
+// 创建一个请求接收子服务。
+//
+func (d *dcps) NewRecvServ(id uint16) *recvServ {
+	rs := newRecvServ(id, d.forAcks)
+
+	d.mu.Lock()
+	d.reqRecv[id] = rs
+	d.mu.Unlock()
+
+	return rs
+}
+
+//
 // 创建一个响应发送服务。
 // 由service实例接收到一个资源请求时调用。
 // 注：id由对端的资源请求传递过来。
 //
-func (d *dcps) NewServSend(id uint16, seq uint32, rsp *response) *servSend {
-	ss := newServSend(id, seq, rsp, d.forSend)
-
+func (d *dcps) NewServSend(id uint16, rsp *response) *servSend {
+	ss := newServSend(
+		id,
+		rand.Uint32()%xLimit32,
+		rsp,
+		d.forSend,
+	)
 	d.mu.Lock()
 	d.rspSend[uint16(id)] = ss
 	d.mu.Unlock()
