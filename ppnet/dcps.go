@@ -203,7 +203,7 @@ func (d *dcps) ServSend(id uint16, req bool) *servSend {
 func (d *dcps) reqID(id uint16) uint16 {
 	// 空位
 	for i := 0; i < xLimit16; i++ {
-		id = uint16(roundPlus2(id, 1))
+		id = roundPlus2(id, 1)
 		if _, ok := d.rspRecv[id]; !ok {
 			return id
 		}
@@ -223,7 +223,7 @@ func (d *dcps) recycle(id uint16, lev int) uint16 {
 	var n uint16 = xLimit16
 
 	for i := 0; i < xLimit16/lev; i++ {
-		id = uint16(roundPlus2(id, 1))
+		id = roundPlus2(id, 1)
 		if d.rspRecv[id].Alive() {
 			continue
 		}

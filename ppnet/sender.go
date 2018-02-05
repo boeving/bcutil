@@ -404,7 +404,7 @@ type servSend struct {
 // seq 实参为一个初始的随机值。
 //
 func newServSend(id uint16, seq uint32, rsp *response, x *forSend) *servSend {
-	dcnt := newDistCounter()
+	dcnt := &distCounter{}
 	loss := newLossEval(subEaseRate, sendRateZoom)
 
 	return &servSend{
@@ -451,6 +451,7 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 
 	for {
 		size := PayloadSize()
+
 		select {
 		case <-exit.C:
 			s.Exit()
@@ -478,8 +479,8 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 		// 不影响丢包重发。
 		case p := <-s.Send(size):
 			s.Post <- p
-			s.seqUpdate(p.Size())
-			s.dcnt.Add(s.seq)
+			s.update(p.Size(), p.BEG())
+
 			// 速率控制
 			time.Sleep(s.eval.Rate(int(p.SndDst), re.Base()))
 		}
@@ -496,7 +497,7 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 func (s *servSend) toBye() {
 	go func() {
 		s.Bye <- ackBye{
-			ID:  s.ID, // 作为ID#RCV
+			ID:  s.ID, // => #RCV
 			Qer: s.rcvSrv != nil,
 		}
 	}()
@@ -506,11 +507,19 @@ func (s *servSend) toBye() {
 }
 
 //
-// 序列号更新。
+// 状态更新。
+// 设置下一个序列号，同时会更新距离计数器。
 // size 为数据报有效负载大小，保证为正。
+// beg 标记是否为首个分组。
 //
-func (s *servSend) seqUpdate(size int) {
-	s.seq = roundPlus(s.seq, uint32(size))
+func (s *servSend) update(size int, beg bool) {
+	v := roundPlus(s.seq, size)
+	if beg {
+		s.dcnt.Init(v)
+	} else {
+		s.dcnt.Add(v)
+	}
+	s.seq = v
 }
 
 //
@@ -555,7 +564,7 @@ func (s *servSend) Build(seq uint32, size int) *packet {
 		return nil
 	}
 	if err == io.EOF {
-		s.end = roundPlus(seq, uint32(len(b)))
+		s.end = roundPlus(seq, len(b))
 		s.recv.SetEnd(s.end)
 	}
 	return s.build(b, seq, err == io.EOF)
@@ -580,7 +589,7 @@ func (s *servSend) lossBuild(seq uint32, size, off int) *packet {
 	return s.build(
 		b,
 		seq,
-		roundPlus(seq, uint32(len(b))) == s.end,
+		roundPlus(seq, len(b)) == s.end,
 	)
 }
 
@@ -724,7 +733,7 @@ func (a *ackRecv) sendAck(ack uint32) *ackLoss {
 	var off int
 
 	if ack != a.acked {
-		off = int(roundSpacing(a.acked, ack))
+		off = roundSpacing(a.acked, ack)
 	}
 	return &ackLoss{a.acked, off}
 }
@@ -754,16 +763,14 @@ func newResponse(r io.Reader) *response {
 // 外部应当保证回收的数量正确，否则会导致panic。
 // amount 为回收的数量，即与上一次确认点的字节偏移量。
 //
-func (r *response) Acked(amount uint32) {
+func (r *response) Acked(amount int) {
 	if amount == 0 {
 		return
 	}
-	sz := int(amount)
-
-	if sz > r.sent.Len() {
+	if amount > r.sent.Len() {
 		panic("too large of Ack offset.")
 	}
-	r.sent.Next(sz)
+	r.sent.Next(amount)
 }
 
 //
@@ -834,23 +841,6 @@ func (r *response) read(size int) ([]byte, error) {
 		r.done = true
 	}
 	return buf[:n], err
-}
-
-//
-// 切分数据片为指定大小的子片。
-//
-func pieces(data []byte, size int) [][]byte {
-	n := len(data) / size
-	buf := make([][]byte, 0, n+1)
-
-	for i := 0; i < n; i++ {
-		x := i * size
-		buf = append(buf, data[x:x+size])
-	}
-	if len(data)%size > 0 {
-		buf = append(buf, data[n*size:])
-	}
-	return buf
 }
 
 //

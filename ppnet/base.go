@@ -51,6 +51,7 @@ import (
 	"sync"
 
 	"github.com/qchen-zh/pputil/goes"
+	"golang.org/x/tools/container/intsets"
 )
 
 const (
@@ -527,4 +528,198 @@ func (c *Contact) Bye() {
 		c.rdsrv.Exit()
 	}
 	c.stop.Exit()
+}
+
+//
+// 简单工具集。
+///////////////////////////////////////////////////////////////////////////////
+
+//
+// 返回序列号增量回绕值。
+// 注：排除xLimit32值本身。
+//
+func roundPlus(x uint32, n int) uint32 {
+	return uint32((int64(x) + int64(n)) % xLimit32)
+}
+
+//
+// 返回2字节（16位）增量回绕值。
+// 注：排除xLimit16值本身。
+//
+func roundPlus2(x uint16, n int) uint16 {
+	return uint16((int(x) + n) % xLimit16)
+}
+
+//
+// 支持回绕的间距计算。
+// 环回范围为全局常量xLimit32。
+//
+func roundSpacing(beg, end uint32) int {
+	if end >= beg {
+		return int(end - beg)
+	}
+	// 不计xLimit32本身
+	return int(xLimit32 - (beg - end))
+}
+
+//
+// 支持回绕的间距计算。
+// 环回范围为全局常量xLimit16。
+//
+func roundSpacing2(beg, end uint16) int {
+	if end >= beg {
+		return int(end - beg)
+	}
+	return int(xLimit16 - (beg - end))
+}
+
+//
+// 支持回绕的起点计算。
+// 注意dist的值应当在uint32范围内。
+//
+func roundBegin(end uint32, dist int) uint32 {
+	d := uint32(dist)
+	if end > d {
+		return end - d
+	}
+	return xLimit32 - (d - end)
+}
+
+//
+// 限定计数器。
+// 对特定键计数，到达和超过目标限度后返回真。
+// 不含限度值本身（如：3，返回2个true）。
+// 如果目标键改变，计数起始重置为零。
+//
+// max 为计数最大值（应为正值）。
+// step 为递增步进值。
+//
+// 返回的函数用于递增和测试，参数为递增计数键。
+//
+func limitCounter(max, step int) func(int) bool {
+	var cnt, key int
+
+	return func(k int) bool {
+		if k != key {
+			key = k
+			cnt = 0
+		}
+		cnt += step
+		return cnt >= max
+	}
+}
+
+//
+// 切分数据片为指定大小的子片。
+//
+func pieces(data []byte, size int) [][]byte {
+	n := len(data) / size
+	buf := make([][]byte, 0, n+1)
+
+	for i := 0; i < n; i++ {
+		x := i * size
+		buf = append(buf, data[x:x+size])
+	}
+	if len(data)%size > 0 {
+		buf = append(buf, data[n*size:])
+	}
+	return buf
+}
+
+//
+// 距离计数器。
+// 先进先出的逻辑，但后添加的重复值无效。
+// 用于发送距离和确认距离的计数。
+// 注记：
+// intsets 仅用于标记存储，唯一性保证。
+//
+type distCounter struct {
+	buf []uint32       // 确认号集
+	set intsets.Sparse // 重复排除
+	mu  sync.Mutex     // 清理保护
+}
+
+//
+// 初始确认号（进度线）。
+// 注意：
+// 用于接收端时，需要提取BEG包的序列号计算确认号。
+//
+func (d *distCounter) Init(ack uint32) {
+	d.buf[0] = ack
+	d.set.Insert(int(ack))
+}
+
+//
+// 添加一个数据报计数。
+// 相同序列号的数据报不重复计数。
+//
+// ack 为确认号（下一个数据报序列号）。
+//
+func (d *distCounter) Add(ack uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.set.Insert(int(ack)) {
+		return
+	}
+	d.buf = d.orderPush(d.buf, ack)
+}
+
+//
+// 有序插入确认号。
+// 与首个确认号（进度线）比较距离即可。
+// 注记：
+// 发送时是有序地添加，但接收时则无法保证。
+//
+func (d *distCounter) orderPush(buf []uint32, ack uint32) []uint32 {
+	i := len(buf) - 1
+	v := roundSpacing(buf[0], ack)
+
+	// 先扩展
+	if cap(buf) == len(buf) {
+		buf = append(buf, 0)
+	}
+	// 逆向：后到的确认号通常靠后。
+	for ; i >= 0; i-- {
+		if v > roundSpacing(buf[0], buf[i]) {
+			break
+		}
+	}
+	i++
+	// 后移一格
+	// 最后的0被有效值覆盖。
+	copy(buf[i+1:], buf[i:])
+	buf[i] = ack
+
+	return buf
+}
+
+//
+// 进度之前的历史清理。
+// 注：原序列即已有序，从头开始检查。
+//
+func (d *distCounter) Clean(ack uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.set.Has(int(ack)) {
+		return
+	}
+	i := 0
+	for ; i < len(d.buf); i++ {
+		if d.buf[i] == ack {
+			break
+		}
+		d.set.Remove(int(d.buf[i]))
+	}
+	d.buf = d.buf[i:]
+}
+
+//
+// 返回距离（计数）。
+//
+func (d *distCounter) Dist() uint {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return uint(len(d.buf))
 }
