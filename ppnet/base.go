@@ -536,10 +536,11 @@ func (c *Contact) Bye() {
 
 //
 // 返回序列号增量回绕值。
-// 注：排除xLimit32值本身。
+// 支持负增量值。排除xLimit32值本身。
 //
 func roundPlus(x uint32, n int) uint32 {
-	return uint32((int64(x) + int64(n)) % xLimit32)
+	v := int64(x) + int64(n) + xLimit32
+	return uint32(v % xLimit32)
 }
 
 //
@@ -547,7 +548,7 @@ func roundPlus(x uint32, n int) uint32 {
 // 注：排除xLimit16值本身。
 //
 func roundPlus2(x uint16, n int) uint16 {
-	return uint16((int(x) + n) % xLimit16)
+	return uint16((int(x) + n + xLimit16) % xLimit16)
 }
 
 //
@@ -627,53 +628,15 @@ func pieces(data []byte, size int) [][]byte {
 }
 
 //
-// 距离计数器。
-// 先进先出的逻辑，但后添加的重复值无效。
-// 用于发送距离和确认距离的计数。
+// 序列号有序压入。
+// 用于有回绕逻辑的序列号和确认号的有序排列。
+// 注意，首个序列号必须已经存在，且在逻辑上为最前。
 // 注记：
-// intsets 仅用于标记存储，唯一性保证。
+// 与首个序列号/确认号比较距离即可。
 //
-type distCounter struct {
-	buf []uint32       // 确认号集
-	set intsets.Sparse // 重复排除
-	mu  sync.Mutex     // 清理保护
-}
-
-//
-// 初始确认号（进度线）。
-// 注意：
-// 用于接收端时，需要提取BEG包的序列号计算确认号。
-//
-func (d *distCounter) Init(ack uint32) {
-	d.buf[0] = ack
-	d.set.Insert(int(ack))
-}
-
-//
-// 添加一个数据报计数。
-// 相同序列号的数据报不重复计数。
-//
-// ack 为确认号（下一个数据报序列号）。
-//
-func (d *distCounter) Add(ack uint32) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if !d.set.Insert(int(ack)) {
-		return
-	}
-	d.buf = d.orderPush(d.buf, ack)
-}
-
-//
-// 有序插入确认号。
-// 与首个确认号（进度线）比较距离即可。
-// 注记：
-// 发送时是有序地添加，但接收时则无法保证。
-//
-func (d *distCounter) orderPush(buf []uint32, ack uint32) []uint32 {
+func orderPush(buf []uint32, seq uint32) []uint32 {
 	i := len(buf) - 1
-	v := roundSpacing(buf[0], ack)
+	v := roundSpacing(buf[0], seq)
 
 	// 先扩展
 	if cap(buf) == len(buf) {
@@ -689,37 +652,84 @@ func (d *distCounter) orderPush(buf []uint32, ack uint32) []uint32 {
 	// 后移一格
 	// 最后的0被有效值覆盖。
 	copy(buf[i+1:], buf[i:])
-	buf[i] = ack
+	buf[i] = seq
 
 	return buf
 }
 
 //
-// 进度之前的历史清理。
-// 注：原序列即已有序，从头开始检查。
+// 序列号队列。
+// 先进先出的逻辑，但后添加的重复值无效。
+// 处理不连续序列号/确认号的排列问题。
+// 注：
+// 也可用于确认号的处理，同为回绕逻辑。
 //
-func (d *distCounter) Clean(ack uint32) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if !d.set.Has(int(ack)) {
-		return
-	}
-	i := 0
-	for ; i < len(d.buf); i++ {
-		if d.buf[i] == ack {
-			break
-		}
-		d.set.Remove(int(d.buf[i]))
-	}
-	d.buf = d.buf[i:]
+type seqQueue struct {
+	buf []uint32       // 序列号集
+	set intsets.Sparse // 重复排除
 }
 
 //
-// 返回距离（计数）。
+// 新建一个队列。
+// first应当为逻辑上的首个序列号。
 //
-func (d *distCounter) Dist() uint {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return uint(len(d.buf))
+func newSeqQueue(first uint32) *seqQueue {
+	sq := seqQueue{
+		buf: []uint32{first},
+	}
+	sq.set.Insert(int(first))
+	return &sq
+}
+
+//
+// 添加一个序列号。
+// 注意，新的序列号必然在首个序列号之后。
+// 成功添加后返回true，否则返回false（重复）。
+//
+func (q *seqQueue) Push(seq uint32) bool {
+	if !q.set.Insert(int(seq)) {
+		return false
+	}
+	q.buf = orderPush(q.buf, seq)
+	return true
+}
+
+//
+// 进度清理。
+// 移除进度线之前的历史（不含进度本身）。
+// 返回移除的条目数量。
+// 注记：
+// 原序列即已有序，从头开始检查。
+//
+func (q *seqQueue) Clean(seq uint32) int {
+	if !q.set.Has(int(seq)) {
+		return 0
+	}
+	i := 0
+	for ; i < len(q.buf); i++ {
+		if q.buf[i] == seq {
+			break
+		}
+		q.set.Remove(int(q.buf[i]))
+	}
+	q.buf = q.buf[i:]
+	return i
+}
+
+//
+// 返回队列大小。
+//
+func (q *seqQueue) Size() int {
+	return len(q.buf)
+}
+
+//
+// 返回内部有序队列。
+// 外部不应当修改返回的队列。
+// 返回的队列仅在新的Add调用之前有效。
+// 注：
+// 主要用于外部迭代读取。
+//
+func (q *seqQueue) Queue() []uint32 {
+	return q.buf
 }

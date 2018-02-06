@@ -392,7 +392,7 @@ type servSend struct {
 	stop   *goes.Stop       // 分支服务停止
 	eval   *evalRate        // 速率评估器
 	recv   *ackRecv         // 接收确认
-	dcnt   *distCounter     // 距离计数器
+	dcnt   *sendDister      // 距离计数器
 	end    uint32           // END包的确认号
 	seq    uint32           // 当前序列号
 	rcvSrv *recvServ        // 资源请求关联接收器
@@ -404,7 +404,7 @@ type servSend struct {
 // seq 实参为一个初始的随机值。
 //
 func newServSend(id uint16, seq uint32, rsp *response, x *forSend) *servSend {
-	dcnt := &distCounter{}
+	dcnt := &sendDister{}
 	loss := newLossEval(subEaseRate, sendRateZoom)
 
 	return &servSend{
@@ -621,14 +621,13 @@ type rcvInfo struct {
 // 确认接收器。
 // 接收对端的确认信息，评估丢包和重发通知。
 // - 丢包或对端主动请求重发时，通知目标数据包的序列号。
-//   注：上层自行计算与进度线的位置偏移。
 // - 如果收到END数据报的确认，关闭通知信道。
 //
 type ackRecv struct {
 	Rcvs  <-chan *rcvInfo // 接收信息传递信道
 	Loss  *lossEval       // 丢包评估器
 	Resp  *response       // 响应器引用
-	Dcnt  *distCounter    // 距离计数器引用
+	Dcnt  *sendDister     // 距离计数器引用
 	acked uint32          // 确认号（进度）存储
 	end   uint32          // END包的确认号
 	mu    sync.Mutex      // end 读写保护
@@ -637,12 +636,12 @@ type ackRecv struct {
 //
 // acked/end 需要初始化为一个无效值。
 //
-func newAckRecv(rch <-chan *rcvInfo, le *lossEval, rsp *response, dc *distCounter) *ackRecv {
+func newAckRecv(rch <-chan *rcvInfo, le *lossEval, rsp *response, sd *sendDister) *ackRecv {
 	return &ackRecv{
 		Rcvs:  rch,
 		Loss:  le,
 		Resp:  rsp,
-		Dcnt:  dc,
+		Dcnt:  sd,
 		acked: xLimit32, // 与下同
 		end:   xLimit32, // 与上同！
 	}
@@ -650,12 +649,12 @@ func newAckRecv(rch <-chan *rcvInfo, le *lossEval, rsp *response, dc *distCounte
 
 //
 // 启动接收&评估服务。
-// 传入的stop可用于异常终止服务。
+// 传递丢包序列号和与进度线的偏移值。
 //
-// sch 通知当前进度确认号和丢包序列号偏移值（相对于进度线）。
+// ach 通知当前进度确认号和丢包序列号偏移值（相对于进度线）。
 // 当收到END信息时关闭通知信道，发送器据此退出服务。
 //
-func (a *ackRecv) Serve(sch chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
+func (a *ackRecv) Serve(ach chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
 	for {
 		select {
 		case <-exit.C:
@@ -663,11 +662,11 @@ func (a *ackRecv) Serve(sch chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
 		case ai := <-a.Rcvs:
 			if ai.Rtp {
 				// Ack为目标序列号
-				sch <- a.sendAck(ai.Ack)
+				ach <- a.sendAck(ai.Ack)
 				continue
 			}
 			if a.isEnd(ai.Ack) {
-				close(sch)
+				close(ach)
 				return
 			}
 			// 确认进度。
@@ -675,7 +674,7 @@ func (a *ackRecv) Serve(sch chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
 
 			if a.lost(ai.Dist, re) {
 				// Ack为进度线确认号
-				sch <- a.sendAck(ai.Ack)
+				ach <- a.sendAck(ai.Ack)
 			}
 		}
 	}
@@ -841,6 +840,51 @@ func (r *response) read(size int) ([]byte, error) {
 		r.done = true
 	}
 	return buf[:n], err
+}
+
+//
+// 发送距离计数。
+// 注：
+// 发送时的记录和收到确认时的清理在不同的Go程中。
+//
+type sendDister struct {
+	ackQue *seqQueue  // 确认队列
+	mu     sync.Mutex // 清理保护
+}
+
+//
+// 初始确认号（进度）。
+//
+func (d *sendDister) Init(ack uint32) {
+	d.ackQue = newSeqQueue(ack)
+}
+
+//
+// 添加一个数据报计数。
+// ack 为确认号（下一个数据报序列号）。
+//
+func (d *sendDister) Add(ack uint32) {
+	d.mu.Lock()
+	d.ackQue.Push(ack)
+	d.mu.Unlock()
+}
+
+//
+// 进度之前的历史清理。
+//
+func (d *sendDister) Clean(ack uint32) {
+	d.mu.Lock()
+	d.ackQue.Clean(ack)
+	d.mu.Unlock()
+}
+
+//
+// 返回发送距离。
+//
+func (d *sendDister) Dist() uint {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return uint(d.ackQue.Size() - 1)
 }
 
 //
