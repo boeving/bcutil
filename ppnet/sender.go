@@ -59,13 +59,13 @@ func init() {
 
 // 基础常量设置。
 const (
-	BaseRate    = 10 * time.Millisecond  // 基础速率。初始默认发包间隔
-	RateLimit   = 100 * time.Microsecond // 极限速率。万次/秒
-	SendTimeout = 2 * time.Minute        // 发送超时上限
-	SendEndtime = 10 * time.Second       // 发送END包后超时结束时限
-	SendAckTime = 600 * time.Millisecond // 发送的首个确认超时
-	PostChSize  = 20                     // 数据报递送通道缓存
-	EvalChSize  = 5                      // 速率评估距离增减量传递通道缓存
+	BaseRate    = 10 * time.Millisecond   // 基础速率。初始默认发包间隔
+	RateLimit   = 100 * time.Microsecond  // 极限速率。万次/秒
+	SendTimeout = 2 * time.Minute         // 发送超时上限
+	SendEndtime = 10 * time.Second        // 发送END包后超时结束时限
+	SendAckTime = 1000 * time.Millisecond // 首个确认等待超时
+	PostChSize  = 20                      // 数据报递送通道缓存
+	EvalChSize  = 5                       // 速率评估距离增减量传递通道缓存
 )
 
 // 基本参数常量
@@ -106,15 +106,14 @@ var (
 // 一个4元组两端连系对应一个本类实例。
 //
 type xSender struct {
-	Conn   *connWriter      // 数据报网络发送器
-	Post   <-chan *packet   // 待发送数据包通道（有缓存，一定有序性）
-	Acks   <-chan *ackReq   // 待确认信息包通道（同上）
-	Bye    <-chan ackBye    // BYE通知信道
-	Eval   *rateEval        // 速率评估器
-	Dcps   *dcps            // 子服务管理器
-	Exit   *goes.Stop       // 外部结束通知
-	curid  int              // 当前数据体ID存储
-	ackOut <-chan time.Time // 末尾数据体无确认超时
+	Conn  *connWriter    // 数据报网络发送器
+	Post  <-chan *packet // 待发送数据包通道（有缓存，一定有序性）
+	Acks  <-chan *ackReq // 待确认信息包通道（同上）
+	Bye   <-chan ackBye  // BYE通知信道
+	Eval  *rateEval      // 速率评估器
+	Dcps  *dcps          // 子服务管理器
+	Exit  *goes.Stop     // 外部结束通知
+	curid int            // 当前数据体ID存储
 }
 
 func newXSender(w *connWriter, dx *dcps, re *rateEval, exit *goes.Stop) *xSender {
@@ -134,11 +133,6 @@ func newXSender(w *connWriter, dx *dcps, re *rateEval, exit *goes.Stop) *xSender
 // 启动发送服务。
 //
 func (x *xSender) Serve() {
-	// 末尾数据报暂存
-	var last *packet
-	// 数据体首确认等待超时
-	wait := SendAckTime
-
 	for {
 		var p *packet
 		var ack *ackReq
@@ -147,13 +141,6 @@ func (x *xSender) Serve() {
 		case <-x.Exit.C:
 			return
 
-		case <-x.ackOut:
-			if wait = x.freshAckTime(wait); wait > SendTimeout {
-				log.Println("wait response was timeout.")
-				return
-			}
-			p = last
-
 		case p = <-x.Post:
 			// 忽略响应出错
 			// 接收端可等待超时后重新请求。
@@ -161,8 +148,6 @@ func (x *xSender) Serve() {
 				continue
 			}
 			ack = x.AckReq()
-			// 重置
-			x.ackOut = time.After(SendAckTime)
 
 		case ack = <-x.Acks:
 			if ack == nil {
@@ -185,42 +170,8 @@ func (x *xSender) Serve() {
 			log.Printf("write to net all failed.")
 			return
 		}
-		last = x.lastPacket(last, p)
-
 		time.Sleep(x.Eval.Rate())
 	}
-}
-
-//
-// 更新发送超时。
-// 指数退避的方式，最多不超过SendTimeout（2分钟）。
-//
-func (x *xSender) freshAckTime(d time.Duration) time.Duration {
-	d *= 2
-	x.ackOut = time.After(d)
-	return d
-}
-
-//
-// 判断返回更后面的数据报。
-// 间距大于集合大小表示为反向计算。
-// 注：
-// 保证为最后一个数据体，但不保证为最后一个分组（重发干扰）。
-// 另：若有重发，其实也就不再会触发超时。
-//
-func (x *xSender) lastPacket(prev, cur *packet) *packet {
-	if prev == nil {
-		return cur
-	}
-	if cur == nil {
-		return prev
-	}
-	d := roundSpacing2(prev.SID, cur.SID)
-
-	if d <= x.Dcps.ReqSize() {
-		return cur
-	}
-	return prev
 }
 
 //
@@ -416,7 +367,7 @@ func newServSend(id uint16, seq uint32, rsp *response, x *forSend) *servSend {
 		read: make(chan *packet, 1), // 缓存>0
 		stop: goes.NewStop(),
 		eval: newEvalRate(loss, sendRateZoom, subEaseRate, x.Dist),
-		recv: newAckRecv(x.Recv, loss, rsp, dcnt),
+		recv: newAckRecv(x.Recv, loss, rsp, seq, dcnt),
 		seq:  seq,
 		dcnt: dcnt,
 	}
@@ -450,6 +401,7 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 	go s.recv.Serve(s.Loss, re, s.stop)
 
 	for {
+		var p *packet
 		size := PayloadSize()
 
 		select {
@@ -579,10 +531,6 @@ func (s *servSend) lossBuild(seq uint32, size, off int) *packet {
 		log.Println(err)
 		return nil
 	}
-	// 首个包即丢包
-	if seq == xLimit32 {
-		seq = s.seq
-	}
 	// 重置超时计数。
 	s.endOut = time.After(SendEndtime)
 
@@ -624,26 +572,30 @@ type rcvInfo struct {
 // - 如果收到END数据报的确认，关闭通知信道。
 //
 type ackRecv struct {
-	Rcvs  <-chan *rcvInfo // 接收信息传递信道
-	Loss  *lossEval       // 丢包评估器
-	Resp  *response       // 响应器引用
-	Dcnt  *sendDister     // 距离计数器引用
-	acked uint32          // 确认号（进度）存储
-	end   uint32          // END包的确认号
-	mu    sync.Mutex      // end 读写保护
+	Rcvs   <-chan *rcvInfo  // 接收信息传递信道
+	Loss   *lossEval        // 丢包评估器
+	Resp   *response        // 响应器引用
+	Dcnt   *sendDister      // 距离计数器引用
+	seq0   uint32           // 起始分组序列号（超时重发用）
+	acked  uint32           // 确认号（进度）存储
+	end    uint32           // END包的确认号
+	mu     sync.Mutex       // end 读写保护
+	ackOut <-chan time.Time // 首确认等待超时
 }
 
 //
 // acked/end 需要初始化为一个无效值。
 //
-func newAckRecv(rch <-chan *rcvInfo, le *lossEval, rsp *response, sd *sendDister) *ackRecv {
+func newAckRecv(rch <-chan *rcvInfo, le *lossEval, rsp *response, seq uint32, sd *sendDister) *ackRecv {
 	return &ackRecv{
-		Rcvs:  rch,
-		Loss:  le,
-		Resp:  rsp,
-		Dcnt:  sd,
-		acked: xLimit32, // 与下同
-		end:   xLimit32, // 与上同！
+		Rcvs:   rch,
+		Loss:   le,
+		Resp:   rsp,
+		Dcnt:   sd,
+		seq0:   seq,
+		acked:  xLimit32, // 与下同
+		end:    xLimit32, // 与上同！
+		ackOut: time.After(SendAckTime),
 	}
 }
 
@@ -655,10 +607,21 @@ func newAckRecv(rch <-chan *rcvInfo, le *lossEval, rsp *response, sd *sendDister
 // 当收到END信息时关闭通知信道，发送器据此退出服务。
 //
 func (a *ackRecv) Serve(ach chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
+	// 等待首个确认
+	wait := SendAckTime
+
 	for {
 		select {
 		case <-exit.C:
 			return
+
+		case <-a.ackOut:
+			if wait = a.freshAckTime(wait); wait > SendTimeout {
+				log.Println("wait Acknowledgment was timeout.")
+				return
+			}
+			ach <- &ackLoss{a.seq0, 0}
+
 		case ai := <-a.Rcvs:
 			if ai.Rtp {
 				// Ack为目标序列号
@@ -676,8 +639,19 @@ func (a *ackRecv) Serve(ach chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
 				// Ack为进度线确认号
 				ach <- a.sendAck(ai.Ack)
 			}
+			a.ackOut = nil // 不再需要
 		}
 	}
+}
+
+//
+// 更新发送超时。
+// 2倍指数退避方式，最多不超过SendTimeout。
+//
+func (a *ackRecv) freshAckTime(d time.Duration) time.Duration {
+	d += d
+	a.ackOut = time.After(d)
+	return d
 }
 
 //

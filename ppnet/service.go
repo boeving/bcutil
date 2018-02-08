@@ -16,8 +16,8 @@ package ppnet
 ///   > 如果消化处于饥饿状态，则ACK为全发模式，每收到一个数据报回馈一个确认。
 ///
 /// - 根据发送距离因子，评估本端发送的ACK丢失情况，可能重新确认丢失的ACK。
-/// - 根据传输路径超时（连续包间隔时间的2-3倍），评估所需包丢包并请求重发。
-/// - 如果收到END包，主动持续请求确认号的目标包（结合新到包）。
+/// - 根据传输路径超时（参考两个连续包的间隔时间），请求最先检查到的缺失包。
+/// - 如果收到END包，连续请求中间缺失的包（顺序未定义）。
 ///
 ///
 /// 并行接收
@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/qchen-zh/pputil/goes"
+	"golang.org/x/tools/container/intsets"
 )
 
 // 基础常量设置。
@@ -446,14 +447,14 @@ func (p *recvPool) ToAck(seq uint32) [][]byte {
 
 //
 // 确认检查。
-// 检查并返回确认号所确认数据的序列号。
+// 检查并返回当前进度的序列号和确认号。
 // 注记：
 // 前一个数据的确认号与后一个数据的序列号相等即为连续。
 //
-func (p *recvPool) AckedSeq() uint32 {
+func (p *recvPool) Acked() (seq, ack uint32) {
 	buf := p.sQue.Queue()
-	seq := buf[0]
-	ack := roundPlus(seq, len(p.pool[seq]))
+	seq = buf[0]
+	ack = roundPlus(seq, len(p.pool[seq]))
 
 	for i := 1; i < len(buf); i++ {
 		s2 := buf[i]
@@ -463,7 +464,7 @@ func (p *recvPool) AckedSeq() uint32 {
 		seq = s2
 		ack = roundPlus(s2, len(p.pool[s2]))
 	}
-	return seq
+	return seq, ack
 }
 
 //
@@ -519,11 +520,10 @@ func (a *appReceive) Puts(ds [][]byte, end bool) error {
 
 //
 // RTP关联信息。
-// 从对端发送过来的响应中提取的信息。
 //
 type rtpInfo struct {
-	Seq int  // 序列号
-	End bool // 传输完成（END）
+	Seq, Ack uint32 // 确认号
+	End      bool   // 传输完成（END）
 }
 
 //
@@ -536,20 +536,22 @@ type rtpInfo struct {
 // 如果收到END包且没有漏掉的包，则关闭通知信道。
 //
 type rtpEval struct {
-	Rcpl *recvPool       // 数据池实例（信息共享）
-	Info <-chan *rtpInfo // 基本响应信息通道
-	end  bool            // 已收到END包
-	last time.Time       // 上一个包的接收时间
+	Info      <-chan *rtpInfo // 基本响应信息通道
+	stat      intsets.Sparse  // 已收到统计
+	ack       uint32          // 最近确认号（所需包序列号）
+	end       bool            // 已收到END包
+	last, cur time.Time       // 上一个与当前包的接收时间
 }
 
 //
 // 创建一个重发申请评估器。
 // ack 为初始包（BEG）的序列号。
 //
-func newRtpEval(ri <-chan *rtpInfo, rp *recvPool) *rtpEval {
+func newRtpEval(ri <-chan *rtpInfo) *rtpEval {
 	return &rtpEval{
-		Rcpl: rp,
 		Info: ri,
+		ack:  xLimit32,
+		cur:  time.Now(),
 	}
 }
 
@@ -557,71 +559,76 @@ func newRtpEval(ri <-chan *rtpInfo, rp *recvPool) *rtpEval {
 // 执行评估服务。
 // rch 为请求重发数据报的序列号通知信道。
 //
-func (r *rtpEval) Serve(rch chan<- int, stop *goes.Stop) {
+func (r *rtpEval) Serve(rch chan<- uint32, exit *goes.Stop) {
 	for {
 		select {
-		case <-stop.C:
+		case <-exit.C:
 			return
 
-		// 末尾分组的超时机制
 		case <-time.After(r.timeOut()):
 			r.lossRtp(rch)
 
 		case ri := <-r.Info:
-			d := roundSpacing(r.acked, seq)
 			if ri.End {
 				r.end = true
 			}
-			// 综合评估
-			if !r.lost(d) {
-				if r.end {
-					close(rch)
-				}
-				break
+			r.update(ri.Seq, ri.Ack)
+
+			if r.done() {
+				close(rch)
+				return
 			}
-			r.lossRtp(rch)
+			rch <- r.allRtp()
 		}
 	}
 }
 
 //
-// 计算超时时间。
-// 用与前一个包的时间间隔的倍数计算超时（通常2-3倍）。
-// 注记：
-// 每次循环（接收到一个发送信息）都会更新一次。
+// 统计状态更新。
+// 注：seq和ack属于同一个数据报。
+//
+func (r *rtpEval) update(seq, ack uint32) {
+	if r.ack == seq {
+		r.ack = xLimit32
+	}
+	if !r.stat.Has(int(ack)) && r.ack == xLimit32 {
+		r.ack = ack
+	}
+	r.stat.Insert(int(seq))
+	r.last = r.cur
+	r.cur = time.Now()
+}
+
+//
+// 超时时间。
+// 用最后两个包收到的时间间隔计算超时（2-3倍）。
 //
 func (r *rtpEval) timeOut() time.Duration {
-	tm := r.last
-	r.last = time.Now()
-
-	return time.Duration(float64(r.last.Sub(tm)) * recvTimeoutx)
+	return time.Duration(
+		float64(r.cur.Sub(r.last)) * recvTimeoutx,
+	)
 }
 
 //
-// 通知重发请求的序列号。
+// 发送全部中间缺失包。
+// 仅在收到END包之后才执行。
+// 注：
+// 上层发送总管依然会有自己的速率控制。
 //
-func (r *rtpEval) lossRtp(rch chan<- int) {
-	if lost := r.Rcpl.Lost(); lost < xLimit32 {
-		rch <- lost
-	}
+func (r *rtpEval) allRtp(rch chan<- uint32) {
+	//
 }
 
 //
-// 是否判断为丢包（请求重发）。
-// 规则：
-// 1. 与进度线的距离和丢包数的乘积不大于某个限度。
-//    配置变量为recvLossx，如：12允许2个丢包但距离不超过6。
-// 2. 如果已经接收到END包，则优先请求重发。
+// 漏包重发。
+// 请求的中间缺失的包的顺序没有定义。
 //
-func (r *rtpEval) lost(seq int) bool {
-	d := r.Rcpl.Distance(seq)
-	cnt = r.Rcpl.LossCount(d)
+func (r *rtpEval) lossRtp(rch chan<- uint32) {
+	if r.done() {
+		return
+	}
+}
 
-	if cnt == 0 {
-		return false
-	}
-	if r.end {
-		return true
-	}
-	return d > 1 && d*cnt > recvLossx
+func (r *rtpEval) done() bool {
+
 }
