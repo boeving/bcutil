@@ -702,10 +702,10 @@ func (q *seqQueue) Push(seq uint32) bool {
 // 原序列即已有序，从头开始检查。
 //
 func (q *seqQueue) Clean(seq uint32) int {
-	if !q.set.Has(int(seq)) {
+	if !q.set.Has(int(seq)) || q.buf[0] == seq {
 		return 0
 	}
-	i := 0
+	i := 1
 	for ; i < len(q.buf); i++ {
 		if q.buf[i] == seq {
 			break

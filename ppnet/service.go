@@ -16,8 +16,8 @@ package ppnet
 ///   > 如果消化处于饥饿状态，则ACK为全发模式，每收到一个数据报回馈一个确认。
 ///
 /// - 根据发送距离因子，评估本端发送的ACK丢失情况，可能重新确认丢失的ACK。
-/// - 根据传输路径超时（参考两个连续包的间隔时间），请求最先检查到的缺失包。
-/// - 如果收到END包，连续请求中间缺失的包（顺序未定义）。
+/// - 根据传输路径超时（参考两个连续包的间隔时间），请求中间缺失的某个包。
+/// - 如果已经收到END包，则之后每收到一个包就请求一次中间缺失的包。
 ///
 ///
 /// 并行接收
@@ -50,7 +50,8 @@ const (
 	AliveTime   = 120 * time.Second // 保活时间界限，考虑NAT会话存活时间
 	AliveIntvl  = 10 * time.Second  // 保活报文间隔时间
 	CalmExpire  = 90 * time.Second  // 服务静置期限（SND/RCV子服务无活动）
-	ReadyTime   = 6 * time.Second   // 请求发送就绪，接收超时
+	ReadyTime   = 10 * time.Second  // 请求发送就绪，接收超时
+	RtpTimeout  = 60 * time.Second  // 重发请求积累超时
 )
 
 // 基本参数常量
@@ -58,7 +59,7 @@ const (
 	xLimit32     = 1<<32 - 1 // 序列号上限（不含）
 	xLimit16     = 1<<16 - 1 // 数据体ID上限
 	recvTimeoutx = 2.5       // 接收超时的包间隔倍数
-	recvLossx    = 12        // 接收丢包评估（数量距离积）
+	reAckLimit   = 5         // 重新确认的距离下限
 )
 
 // END关联全局变量。
@@ -226,13 +227,16 @@ func newForAcks() *forAcks {
 // - BYE 	BYE信息（结束）
 //
 type recvServ struct {
-	ID       uint16           // 数据ID#RCV（<=ID#SND）
-	AReq     chan<- *ackReq   // 确认申请（-> xSender）
-	Rtp      <-chan int       // 请求重发通知
-	Rack     <-chan int       // 再次确认通知
-	Ack      <-chan int       // 应用确认通知（数据消耗）
-	alive    time.Time        // 活着时间戳
-	readyOut <-chan time.Time // 资源请求发送就绪后超时
+	ID    uint16         // 数据ID#RCV（<=ID#SND）
+	AReq  chan<- *ackReq // 确认申请（-> xSender）
+	Rtp   <-chan int     // 请求重发通知
+	Rack  <-chan int     // 再次确认通知
+	Ack   <-chan int     // 应用确认通知（数据消耗）
+	alive time.Time      // 活着时间戳
+
+	// 资源请求发送就绪后超时
+	// 用于发送服务通知衔接（接收准备）。
+	readyOut <-chan time.Time
 }
 
 func newRecvServ(id uint16, x *forAcks) *recvServ {
@@ -307,20 +311,19 @@ func (r *recvServ) Receive(seq, rpz int, data []byte) {
 }
 
 //
-// 确认关联信息。
-// 发送方对本端确认的回馈（确认的确认）。
+// 重复确认信息。
+// 根据发送距离评估是否需要重新确认。
 //
 type ackInfo struct {
-	Seq  int  // 响应序列号
-	Dist int  // 发送距离
-	End  bool // 传输完成
+	Ack  uint32 // 确认号（进度线）
+	Dist int    // 发送距离
+	End  bool   // 接收完毕
 }
 
 //
 // 再确认评估。
 // 条件：
 // - 发送距离太大，且进度停滞；
-// - 发送方的确认号低于当前进度线较多；
 // - 等待接收新的数据报超时（END包之前）；
 // - 等待BYE包超时（已全部接收）。
 //   重复END包确认，最多EndAcks次之后结束服务。
@@ -329,7 +332,29 @@ type ackInfo struct {
 // 本重发通常仅在数据体的末尾分组部分才会用到（已无新的数据报抵达）。
 //
 type reAck struct {
-	Ack <-chan *ackInfo // 确认信息信道
+	Ack  <-chan *ackInfo // 确认信息信道
+	last uint32          // 上一个确认号
+}
+
+func (r *reAck) Serve(rach chan<- uint32, exit *goes.Stop) {
+	for {
+		select {
+		case <-exit.C:
+			return
+		case ra := <-r.Ack:
+			if r.again(ra.Dist, ra.Ack) {
+				rach <- ra.Ack
+			}
+			r.last = ra.Ack
+		}
+	}
+}
+
+//
+// 是否需要重新发送确认。
+//
+func (r *reAck) again(dist int, ack uint32) bool {
+	return ack == r.last && dist > reAckLimit
 }
 
 //
@@ -338,25 +363,19 @@ type reAck struct {
 // 用于应用接收器消耗数据并提供进度控制。
 //
 type sndInfo struct {
-	Seq  uint32 // 序列号
-	Data []byte // 响应数据
-	End  bool   // 传输完成
-	Bye  bool   // 发送结束/退出
-}
-
-//
-// 返回对应的确认号。
-//
-func (s *sndInfo) Ack() uint32 {
-	return roundPlus(s.Seq, len(s.Data))
+	Seq      uint32 // 序列号
+	Data     []byte // 响应数据
+	Dist     int    // 发送距离
+	Beg, End bool   // 首位数据报标记
+	Bye      bool   // 发送结束/退出
 }
 
 //
 // 确认评估器。
-// 应用接收器消化数据，制约当前的确认进度。
+// 应用接收器对数据的消耗制约确认进度。
 //
 type ackEval struct {
-	sch  <-chan *sndInfo // 响应数据递送
+	Snd  <-chan *sndInfo // 响应数据递送
 	Pool *recvPool       // 数据接收管理
 	App  *appReceive     // 应用接收器
 }
@@ -365,29 +384,40 @@ type ackEval struct {
 // 启动一个确认评估服务。
 // ach 为确认号递送信道。
 //
-func (a *ackEval) Serve(ach chan<- uint32, exit *goes.Stop) {
-	// 重置后，已消耗数量
-	var used int64
-
+func (a *ackEval) Serve(ach chan<- uint32, rach chan<- *ackInfo, exit *goes.Stop) {
 	for {
 		select {
 		case <-exit.C:
 			return
-		case sd := <-a.Snd:
-			switch {
-			case sd.Rpz > 0: // and RST
-				used = a.Pool.RpzReset(sd.Seq, sd.Rpz)
-			case sd.Rst:
-				usde = a.Pool.Reset(sd.Seq)
+		case si := <-a.Snd:
+			if !a.update(si) {
+				continue
 			}
-			if used >= len(sd.Data) {
-				used -= len(sd.Data)
-				break
+			seq, ack := a.Pool.Acked()
+			bs := a.Pool.ToAck(seq)
+
+			if bs != nil {
+				a.App.Puts(bs)
+				ach <- ack
+			} else {
+				// 进度停滞
+				rach <- &ackInfo{ack, si.Dist, si.End}
 			}
-			dch <- a.pack(sd.Data[used:], sd.Seq, sd.End)
-			used = 0
 		}
 	}
+}
+
+//
+// 更新接收池信息。
+// 如果已收到BEG包，则返回true，否则返回false。
+//
+func (a *ackEval) update(si *sndInfo) bool {
+	if si.Beg {
+		a.Pool.First(si.Seq, si.Data)
+	} else {
+		a.Pool.Add(si.Seq, si.Data)
+	}
+	return a.Pool.Ready()
 }
 
 //
@@ -537,8 +567,8 @@ type rtpInfo struct {
 //
 type rtpEval struct {
 	Info      <-chan *rtpInfo // 基本响应信息通道
-	stat      intsets.Sparse  // 已收到统计
-	ack       uint32          // 最近确认号（所需包序列号）
+	seqx      intsets.Sparse  // 已收到记录
+	ackx      intsets.Sparse  // 确认号剩余
 	end       bool            // 已收到END包
 	last, cur time.Time       // 上一个与当前包的接收时间
 }
@@ -550,7 +580,6 @@ type rtpEval struct {
 func newRtpEval(ri <-chan *rtpInfo) *rtpEval {
 	return &rtpEval{
 		Info: ri,
-		ack:  xLimit32,
 		cur:  time.Now(),
 	}
 }
@@ -560,43 +589,62 @@ func newRtpEval(ri <-chan *rtpInfo) *rtpEval {
 // rch 为请求重发数据报的序列号通知信道。
 //
 func (r *rtpEval) Serve(rch chan<- uint32, exit *goes.Stop) {
+	// 路径超时
+	out := time.NewTimer(r.timeOut())
+	defer out.Stop()
+
+	// 重发累计次数
+	var rcnt int
+
 	for {
 		select {
 		case <-exit.C:
 			return
 
-		case <-time.After(r.timeOut()):
+		case <-out.C:
+			rcnt++
+			if time.Since(r.last) > RtpTimeout {
+				log.Printf("retransmit %d tries, timeout at last.", rcnt)
+				return
+			}
 			r.lossRtp(rch)
+			// 积累延迟（2^n-1）
+			r.cur = time.Now()
 
 		case ri := <-r.Info:
-			if ri.End {
-				r.end = true
-			}
-			r.update(ri.Seq, ri.Ack)
+			r.update(ri)
 
 			if r.done() {
 				close(rch)
 				return
 			}
-			rch <- r.allRtp()
+			if r.end {
+				r.endRtp(rch)
+			}
 		}
+		out.Reset(r.timeOut())
 	}
 }
 
 //
 // 统计状态更新。
-// 注：seq和ack属于同一个数据报。
+// 确认号的统计需排除END包，已便于done检测。
+// 会重置路径超时为正常的包间隔。
 //
-func (r *rtpEval) update(seq, ack uint32) {
-	if r.ack == seq {
-		r.ack = xLimit32
-	}
-	if !r.stat.Has(int(ack)) && r.ack == xLimit32 {
-		r.ack = ack
-	}
-	r.stat.Insert(int(seq))
+func (r *rtpEval) update(ri *rtpInfo) {
 	r.last = r.cur
 	r.cur = time.Now()
+
+	if !r.seqx.Insert(int(ri.Seq)) {
+		return
+	}
+	if ri.End {
+		r.end = true
+		// not insert.
+	} else {
+		r.ackx.Insert(int(ri.Ack))
+	}
+	r.ackx.Remove(int(ri.Seq))
 }
 
 //
@@ -610,13 +658,15 @@ func (r *rtpEval) timeOut() time.Duration {
 }
 
 //
-// 发送全部中间缺失包。
-// 仅在收到END包之后才执行。
-// 注：
-// 上层发送总管依然会有自己的速率控制。
+// 收到END包后的重发申请。
+// 注：与超时重发不重复。
 //
-func (r *rtpEval) allRtp(rch chan<- uint32) {
-	//
+func (r *rtpEval) endRtp(rch chan<- uint32) {
+	// 留给超时机制
+	if r.ackx.Len() == 1 {
+		return
+	}
+	rch <- uint32(r.ackx.Max())
 }
 
 //
@@ -624,11 +674,15 @@ func (r *rtpEval) allRtp(rch chan<- uint32) {
 // 请求的中间缺失的包的顺序没有定义。
 //
 func (r *rtpEval) lossRtp(rch chan<- uint32) {
-	if r.done() {
+	if r.ackx.Len() == 0 {
 		return
 	}
+	rch <- uint32(r.ackx.Min())
 }
 
+//
+// 全部接收完成。
+//
 func (r *rtpEval) done() bool {
-
+	return r.end && r.ackx.Len() == 0
 }
