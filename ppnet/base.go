@@ -15,9 +15,9 @@ package ppnet
 /// +---------------------------------------------------------------+
 /// |                      Acknowledgment number                    |
 /// +-------------------------------+-------------------------------+
-/// |B|E|R|B|Q|R|S|.|      ...      |              |                |
-/// |Y|N|T|E|E|E|E|.|      ...      | ACK distance |  Send distance |
-/// |E|D|P|G|R|Q|S|.|      (8)      |      (6)     |      (10)      |
+/// |B|E|R|B|Q|R|S|.|      ...      |      ...      |               |
+/// |Y|N|T|E|E|E|E|.|               |               |  ACK distance |
+/// |E|D|P|G|R|Q|S|.|      (8)      |      (8)      |      (8)      |
 /// +-------------------------------+-------------------------------+
 /// |                      Session verify code                      |
 /// +---------------------------------------------------------------+
@@ -64,7 +64,6 @@ const (
 )
 
 var (
-	errRpzSize  = errors.New("value overflow, must be between 0-15")
 	errNetwork  = errors.New("bad network name between two DCPAddr")
 	errOverflow = errors.New("exceeded the number of resource queries")
 	errZero     = errors.New("no data for Query")
@@ -168,9 +167,9 @@ type header struct {
 	flag            // 标志区（8）
 	SID, RID uint16 // 发送/接收数据ID
 	Seq, Ack uint32 // 序列号，确认号
-	None     byte   // 保留未用
-	AckDst   uint   // ACK distance，确认距离
-	SndDst   uint   // Send distance，发送距离
+	Non1     byte   // 保留未用
+	Non2     byte   // 保留未用
+	Dist     uint8  // ACK distance，确认距离
 	Sess     uint32 // Session verify code
 }
 
@@ -188,9 +187,9 @@ func (h *header) Decode(buf []byte) error {
 	h.Ack = binary.BigEndian.Uint32(buf[8:12])
 
 	h.flag = flag(buf[12])
-	h.None = buf[13]
-	h.AckDst = uint(buf[14]) >> 2
-	h.SndDst = uint(buf[15]) | uint(buf[14]&3)<<8
+	h.Non1 = buf[13]
+	h.Non2 = buf[14]
+	h.Dist = buf[15]
 	h.Sess = binary.BigEndian.Uint32(buf[16:20])
 
 	return nil
@@ -198,25 +197,25 @@ func (h *header) Decode(buf []byte) error {
 
 //
 // 编码头部数据。
+// 实参buf用于填充字节序列，可为nil。否则长度不应当小于headDCP。
+// 如果长度足够，返回的切片即为传入的实参。
 //
-func (h *header) Encode() ([]byte, error) {
-	if h.AckDst > 0x3f || h.SndDst > 0x3ff {
-		return nil, errDistance
+func (h *header) Encode(buf []byte) []byte {
+	if len(buf) < headDCP {
+		buf = make([]byte, headDCP)
 	}
-	var buf [headDCP]byte
-
 	binary.BigEndian.PutUint16(buf[0:2], h.SID)
 	binary.BigEndian.PutUint16(buf[2:4], h.RID)
 	binary.BigEndian.PutUint32(buf[4:8], h.Seq)
 	binary.BigEndian.PutUint32(buf[8:12], h.Ack)
 
 	buf[12] = byte(h.flag)
-	buf[13] = h.None
-	buf[14] = byte(h.AckDst)<<2 | byte(h.SndDst>>8)
-	buf[15] = byte(h.SndDst & 0xff)
+	buf[13] = h.Non1
+	buf[14] = h.Non2
+	buf[15] = h.Dist
 	binary.BigEndian.PutUint32(buf[16:20], h.Sess)
 
-	return buf[:], nil
+	return buf
 }
 
 //
@@ -233,11 +232,7 @@ type packet struct {
 // 如果出错返回nil，同时记录日志。这通常很少发生。
 //
 func (p packet) Bytes() []byte {
-	b, err := p.Encode()
-	if err != nil {
-		panic(err)
-	}
-	return append(b, p.Data...)
+	return append(p.Encode(nil), p.Data...)
 }
 
 func (p packet) Size() int {
@@ -628,23 +623,58 @@ func pieces(data []byte, size int) [][]byte {
 }
 
 //
-// 序列号有序压入。
-// 用于有回绕逻辑的序列号和确认号的有序排列。
-// 注意，首个序列号必须已经存在，且在逻辑上为最前。
-// 注记：
-// 与首个序列号/确认号比较距离即可。
+// 回绕序列号有序集。
+// 先进先出且有序的逻辑，且重复值无效。
+// 主要用于处理不连续序列号/确认号的排列问题。
+// 注：
+// 这里的序列号也可认为是确认号，回绕逻辑相同。
 //
-func orderPush(buf []uint32, seq uint32) []uint32 {
+type roundOrder struct {
+	beg uint32         // 距离参考（起点）
+	buf []uint32       // 序列号集
+	set intsets.Sparse // 重复排除
+}
+
+//
+// 新建一个队列。
+// first应当为逻辑上的首个序列号。
+//
+func newRoundOrder(first uint32) *roundOrder {
+	ro := roundOrder{
+		beg: first,
+		buf: []uint32{first},
+	}
+	ro.set.Insert(int(first))
+	return &ro
+}
+
+//
+// 添加一个序列号。
+// 注意，新的序列号必然在首个序列号之后。
+// 成功添加后返回true，否则返回false（重复）。
+//
+func (r *roundOrder) Push(seq uint32) bool {
+	if !r.set.Insert(int(seq)) {
+		return false
+	}
+	r.buf = r.insert(r.buf, seq)
+	return true
+}
+
+//
+// 有序插入。
+// 注记：与起始值比较距离即可。
+//
+func (r *roundOrder) insert(buf []uint32, seq uint32) []uint32 {
 	i := len(buf) - 1
-	v := roundSpacing(buf[0], seq)
+	v := roundSpacing(r.beg, seq)
 
 	// 先扩展
-	if cap(buf) == len(buf) {
-		buf = append(buf, 0)
-	}
+	buf = append(buf, 0)
+
 	// 逆向：后到的确认号通常靠后。
 	for ; i >= 0; i-- {
-		if v > roundSpacing(buf[0], buf[i]) {
+		if v > roundSpacing(r.beg, buf[i]) {
 			break
 		}
 	}
@@ -658,78 +688,49 @@ func orderPush(buf []uint32, seq uint32) []uint32 {
 }
 
 //
-// 序列号队列。
-// 先进先出的逻辑，但后添加的重复值无效。
-// 处理不连续序列号/确认号的排列问题。
+// 旧记录清理。
+// 移除目标序列号及其之前的历史记录（含目标本身）。
+// 返回移除的条目数。
 // 注：
-// 也可用于确认号的处理，同为回绕逻辑。
+// 执行一次之后，内部的起点参考beg即与buf[0]不再相同。
+// 因为目标值本身已从buf中移除。
 //
-type seqQueue struct {
-	buf []uint32       // 序列号集
-	set intsets.Sparse // 重复排除
-}
-
-//
-// 新建一个队列。
-// first应当为逻辑上的首个序列号。
-//
-func newSeqQueue(first uint32) *seqQueue {
-	sq := seqQueue{
-		buf: []uint32{first},
-	}
-	sq.set.Insert(int(first))
-	return &sq
-}
-
-//
-// 添加一个序列号。
-// 注意，新的序列号必然在首个序列号之后。
-// 成功添加后返回true，否则返回false（重复）。
-//
-func (q *seqQueue) Push(seq uint32) bool {
-	if !q.set.Insert(int(seq)) {
-		return false
-	}
-	q.buf = orderPush(q.buf, seq)
-	return true
-}
-
-//
-// 进度清理。
-// 移除进度线之前的历史（不含进度本身）。
-// 返回移除的条目数量。
-// 注记：
-// 原序列即已有序，从头开始检查。
-//
-func (q *seqQueue) Clean(seq uint32) int {
-	if !q.set.Has(int(seq)) || q.buf[0] == seq {
+func (r *roundOrder) Clean(seq uint32) int {
+	if !r.set.Has(int(seq)) {
 		return 0
 	}
-	i := 1
-	for ; i < len(q.buf); i++ {
-		if q.buf[i] == seq {
+	i := 0
+	for ; i < len(r.buf); i++ {
+		r.beg = r.buf[i]
+		r.set.Remove(int(r.beg))
+
+		if r.beg == seq {
+			i++
 			break
 		}
-		q.set.Remove(int(q.buf[i]))
 	}
-	q.buf = q.buf[i:]
+	r.buf = r.buf[i:]
 	return i
 }
 
-//
-// 返回队列大小。
-//
-func (q *seqQueue) Size() int {
-	return len(q.buf)
+func (r *roundOrder) Beg() uint32 {
+	return r.beg
 }
 
 //
-// 返回内部有序队列。
-// 外部不应当修改返回的队列。
-// 返回的队列仅在新的Add调用之前有效。
-// 注：
-// 主要用于外部迭代读取。
+// 返回集合大小。
 //
-func (q *seqQueue) Queue() []uint32 {
-	return q.buf
+func (r *roundOrder) Size() int {
+	return len(r.buf)
+}
+
+//
+// 返回内部有序集。
+// 返回值为一个引用，外部不应当修改返回的队列。
+// 返回值仅在新的Add调用之前有效。
+//
+// 注：主要用于外部迭代读取逻辑。
+//
+func (r *roundOrder) Queue() []uint32 {
+	return r.buf
 }

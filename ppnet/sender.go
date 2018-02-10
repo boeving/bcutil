@@ -80,6 +80,7 @@ const (
 	baseTick            = 10 * time.Second       // 基准速率评估间隔（一个滴答）
 	baseRatio           = 0.1                    // 基准速率调整步进比率
 	dataFull      int64 = 1024 * 576             // 满载数据量（概略值）
+	sendDistance        = 1024                   // 发送距离上限值
 	sendBadTries        = 4                      // 发送出错再尝试次数
 	sendBadSleep        = 100 * time.Millisecond // 发送出错再尝试暂停时间
 	sendPackets         = 40                     // 发送通道缓存（有序性）
@@ -256,7 +257,7 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 		p.Set(RTP)
 	}
 	if req.Dist > 0 {
-		p.AckDst = uint(req.Dist)
+		p.Dist = req.Dist
 	}
 	if req.Qer {
 		p.Set(QER)
@@ -440,7 +441,7 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 			s.update(p.Size(), p.BEG())
 
 			// 速率控制
-			time.Sleep(s.eval.Rate(int(p.SndDst), re.Base()))
+			time.Sleep(s.eval.Rate(s.dcnt.Dist(), re.Base()))
 		}
 		out.Reset(SendEndtime)
 	}
@@ -461,7 +462,7 @@ func (s *servSend) toBye() {
 		}
 	}()
 	if s.rcvSrv != nil {
-		s.rcvSrv.Ready()
+		s.rcvSrv.Ready(s.end)
 	}
 }
 
@@ -499,9 +500,10 @@ func (s *servSend) Send(size int) <-chan *packet {
 //
 func (s *servSend) Header(seq uint32) *header {
 	return &header{
-		SID:    s.ID,
-		Seq:    seq,
-		SndDst: s.dcnt.Dist(),
+		SID:  s.ID,
+		Seq:  seq,
+		Non1: byte(rand.Intn(0xff)),
+		Non2: byte(rand.Intn(0xff)),
 	}
 }
 
@@ -808,19 +810,19 @@ func (r *response) read(size int) ([]byte, error) {
 
 //
 // 发送距离计数。
-// 注：
+// 注记：
 // 发送时的记录和收到确认时的清理在不同的Go程中。
 //
 type sendDister struct {
-	ackQue *seqQueue  // 确认队列
-	mu     sync.Mutex // 清理保护
+	buf *roundOrder // 确认队列
+	mu  sync.Mutex  // 清理保护
 }
 
 //
 // 初始确认号（进度）。
 //
 func (d *sendDister) Init(ack uint32) {
-	d.ackQue = newSeqQueue(ack)
+	d.buf = newRoundOrder(ack)
 }
 
 //
@@ -829,7 +831,7 @@ func (d *sendDister) Init(ack uint32) {
 //
 func (d *sendDister) Add(ack uint32) {
 	d.mu.Lock()
-	d.ackQue.Push(ack)
+	d.buf.Push(ack)
 	d.mu.Unlock()
 }
 
@@ -838,17 +840,17 @@ func (d *sendDister) Add(ack uint32) {
 //
 func (d *sendDister) Clean(ack uint32) {
 	d.mu.Lock()
-	d.ackQue.Clean(ack)
+	d.buf.Clean(ack)
 	d.mu.Unlock()
 }
 
 //
 // 返回发送距离。
 //
-func (d *sendDister) Dist() uint {
+func (d *sendDister) Dist() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return uint(d.ackQue.Size() - 1)
+	return d.buf.Size()
 }
 
 //

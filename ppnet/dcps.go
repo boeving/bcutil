@@ -144,13 +144,15 @@ func (d *dcps) NewRecvServ(id uint16) *recvServ {
 
 //
 // 创建一个响应发送服务。
-// 由service实例接收到一个资源请求时调用。
-// 注：id由对端的资源请求传递过来。
+// 由service实例接收完一个资源请求后调用。
 //
-func (d *dcps) NewServSend(id uint16, rsp *response) *servSend {
+// id 由对端的资源请求传递过来。
+// seq 为资源请求最后分组的确认号（约定）。
+//
+func (d *dcps) NewServSend(id uint16, seq uint32, rsp *response) *servSend {
 	ss := newServSend(
 		id,
-		rand.Uint32()%xLimit32,
+		seq,
 		rsp,
 		d.forSend,
 	)
