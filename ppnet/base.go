@@ -302,6 +302,11 @@ func (w *connWriter) Send(p packet) (int, error) {
 }
 
 //
+// 数据报递送操作。
+//
+type poster func(*packet)
+
+//
 // 简单读取服务。
 // 成功读取后将数据报发送到service。
 // 外部可通过Stop.Exit()结束服务。
@@ -311,14 +316,12 @@ func (w *connWriter) Send(p packet) (int, error) {
 //
 type servReader struct {
 	read *connReader
-	post func(*packet)
 	stop *goes.Stop
 }
 
-func newServReader(conn *net.UDPConn, post func(*packet)) *servReader {
+func newServReader(conn *net.UDPConn) *servReader {
 	return &servReader{
 		read: &connReader{conn},
-		post: post,
 		stop: goes.NewStop(),
 	}
 }
@@ -326,7 +329,7 @@ func newServReader(conn *net.UDPConn, post func(*packet)) *servReader {
 //
 // 服务启动（阻塞）。
 //
-func (s *servReader) Serve() {
+func (s *servReader) Serve(post poster) {
 	for {
 		select {
 		case <-s.stop.C:
@@ -336,7 +339,7 @@ func (s *servReader) Serve() {
 			if err != nil {
 				break
 			}
-			go s.post(pack)
+			go post(pack)
 		}
 	}
 }
@@ -452,11 +455,10 @@ func Dial(laddr, raddr *DCPAddr) (*Contact, error) {
 		raddr: raddr.addr,
 		servs: srv,
 		sends: newXSender(),
-		rdsrv: newServReader(udpc, srv.Post),
+		rdsrv: newServReader(udpc),
 	}
-
-	go c.servs.Start() // 接收服务启动
-	go c.rdsrv.Serve() // 网络读取服务启动
+	// 网络读取服务启动
+	go c.rdsrv.Serve(srv.Post)
 
 	return &c, nil
 }
@@ -582,6 +584,23 @@ func roundBegin(end uint32, dist int) uint32 {
 }
 
 //
+// 判断两个回绕值的前后。
+// 返回值：
+//   0 	相等
+//  -1	v1 在 v2 之前
+//   1 	v1 在 v2 之后
+//
+func roundOrder(beg, v1, v2 uint32) int {
+	if v1 == v2 {
+		return 0
+	}
+	if roundSpacing(beg, v1) < roundSpacing(beg, v2) {
+		return -1
+	}
+	return 1
+}
+
+//
 // 限定计数器。
 // 对特定键计数，到达和超过目标限度后返回真。
 // 不含限度值本身（如：3，返回2个true）。
@@ -623,13 +642,13 @@ func pieces(data []byte, size int) [][]byte {
 }
 
 //
-// 回绕序列号有序集。
+// 序列号队列（回绕有序）。
 // 先进先出且有序的逻辑，且重复值无效。
 // 主要用于处理不连续序列号/确认号的排列问题。
 // 注：
 // 这里的序列号也可认为是确认号，回绕逻辑相同。
 //
-type roundOrder struct {
+type roundQueue struct {
 	beg uint32         // 距离参考（起点）
 	buf []uint32       // 序列号集
 	set intsets.Sparse // 重复排除
@@ -639,8 +658,8 @@ type roundOrder struct {
 // 新建一个队列。
 // first应当为逻辑上的首个序列号。
 //
-func newRoundOrder(first uint32) *roundOrder {
-	ro := roundOrder{
+func newRoundOrder(first uint32) *roundQueue {
+	ro := roundQueue{
 		beg: first,
 		buf: []uint32{first},
 	}
@@ -653,7 +672,7 @@ func newRoundOrder(first uint32) *roundOrder {
 // 注意，新的序列号必然在首个序列号之后。
 // 成功添加后返回true，否则返回false（重复）。
 //
-func (r *roundOrder) Push(seq uint32) bool {
+func (r *roundQueue) Push(seq uint32) bool {
 	if !r.set.Insert(int(seq)) {
 		return false
 	}
@@ -665,7 +684,7 @@ func (r *roundOrder) Push(seq uint32) bool {
 // 有序插入。
 // 注记：与起始值比较距离即可。
 //
-func (r *roundOrder) insert(buf []uint32, seq uint32) []uint32 {
+func (r *roundQueue) insert(buf []uint32, seq uint32) []uint32 {
 	i := len(buf) - 1
 	v := roundSpacing(r.beg, seq)
 
@@ -695,7 +714,7 @@ func (r *roundOrder) insert(buf []uint32, seq uint32) []uint32 {
 // 执行一次之后，内部的起点参考beg即与buf[0]不再相同。
 // 因为目标值本身已从buf中移除。
 //
-func (r *roundOrder) Clean(seq uint32) int {
+func (r *roundQueue) Clean(seq uint32) int {
 	if !r.set.Has(int(seq)) {
 		return 0
 	}
@@ -713,14 +732,14 @@ func (r *roundOrder) Clean(seq uint32) int {
 	return i
 }
 
-func (r *roundOrder) Beg() uint32 {
+func (r *roundQueue) Beg() uint32 {
 	return r.beg
 }
 
 //
 // 返回集合大小。
 //
-func (r *roundOrder) Size() int {
+func (r *roundQueue) Size() int {
 	return len(r.buf)
 }
 
@@ -731,6 +750,6 @@ func (r *roundOrder) Size() int {
 //
 // 注：主要用于外部迭代读取逻辑。
 //
-func (r *roundOrder) Queue() []uint32 {
+func (r *roundQueue) Queue() []uint32 {
 	return r.buf
 }

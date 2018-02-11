@@ -23,13 +23,13 @@ var (
 
 //
 // Listener 外部连系监听器。
-// 负责不同客户的服务器构造分配和数据传递。
+// 负责不同对端连系的服务器构造启动和数据传递。
 //
 type Listener struct {
-	conn    *connReader         // 网络读取
-	laddr   net.Addr            // 本地地址存储
-	pool    map[string]*service // Key: 远端地址
-	stopped bool                // 停止监听标记
+	conn    *connReader       // 网络读取
+	laddr   net.Addr          // 本地地址存储
+	pool    map[string]poster // Key: 远端地址
+	stopped bool              // 停止监听标记
 }
 
 //
@@ -44,7 +44,7 @@ func Listen(laddr *DCPAddr) (*Listener, error) {
 	l := Listener{
 		conn:  &connReader{udpc},
 		laddr: laddr.addr,
-		pool:  make(map[string]*service),
+		pool:  make(map[string]poster),
 	}
 	return &l, nil
 }
@@ -61,8 +61,8 @@ func (l *Listener) Accept() (*Contact, error) {
 		}
 		kr := raddr.String()
 
-		if srv, ok := l.pool[kr]; ok {
-			go srv.Post(pack)
+		if post, ok := l.pool[kr]; ok {
+			go post(pack)
 			continue
 		}
 		if l.stopped {
@@ -88,7 +88,7 @@ func (l *Listener) newContact(raddr net.Addr, pack *packet, k string) *Contact {
 		servs: newService(&connWriter{raddr, l.conn.Conn}, l.remove),
 		// rdsrv:  nil, // not needed.
 	}
-	l.pool[k] = c.servs
+	l.pool[k] = c.servs.Post
 	go c.servs.Start().Post(pack)
 
 	return &c
@@ -96,7 +96,7 @@ func (l *Listener) newContact(raddr net.Addr, pack *packet, k string) *Contact {
 
 //
 // Close 停止本地监听。
-// 已创建连系的两个端点间仍然可正常通信。
+// 不再接受连入请求，不影响已连系的两个端点间的通信。
 //
 func (l *Listener) Close() error {
 	l.stopped = true
