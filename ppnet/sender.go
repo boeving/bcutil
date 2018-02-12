@@ -12,7 +12,6 @@ package ppnet
 /// 2. 根据对方的资源请求，从注册的响应服务应用获取响应数据发送。
 ///
 /// - 初始阶段按基准速率匀速发送。收到第一个确认后，动态评估速率发送。
-/// - 发送附带发送距离，即确认号（进度）之后已发送的数据报数量。
 /// - 从接收端反馈的确认距离，评估是否丢包和重发。
 ///
 ///
@@ -66,10 +65,11 @@ const (
 	SendAckTime = 600 * time.Millisecond // 首个确认等待超时
 )
 
-// 通道缓存（有序性）
+// 通道缓存（弱有序）
 const (
 	postChSize = 20 // 数据报递送通道缓存
-	evalChSize = 5  // 速率评估距离增减量传递通道缓存
+	evalChSize = 6  // 速率评估距离增减量传递通道缓存
+	byeChSize  = 4  // BYE消息通知信道大小
 )
 
 // 基本参数常量
@@ -124,7 +124,7 @@ func newXSender(w *connWriter, dx *dcps, re *rateEval, exit *goes.Stop) *xSender
 	return &xSender{
 		Conn:  w,
 		Post:  dx.Post,
-		Acks:  dx.Req,
+		Acks:  dx.AckReq,
 		Bye:   dx.Bye,
 		Eval:  re,
 		Dcps:  dx,
@@ -163,7 +163,7 @@ func (x *xSender) Serve() {
 			p = x.Packet()
 			x.SetBye(p, bye)
 			// clean..
-			x.Dcps.Done(bye.ID, bye.Qer)
+			x.Dcps.Done(bye.ID, bye.Req)
 		}
 
 		if ack != nil {
@@ -184,14 +184,32 @@ func (x *xSender) Serve() {
 // 注记：
 // 即便仅有一个分组，也需要发送子服务的逻辑（ACK确认与丢包重发）。
 //
-func (x *xSender) Request(res []byte) error {
-	ss, rs, err := x.Dcps.NewRequest(res)
+func (x *xSender) Request(res []byte, rc Receiver) error {
+	ss, err := x.Dcps.NewRequest(res)
 	if err != nil {
 		return err
 	}
-	ss.SetRecvServ(rs)
-	go ss.Serve(x.Eval, x.Exit)
+	go ss.Serve(
+		x.Eval,
+		x.Exit,
+		func(id uint16, ack uint32) { x.reqDone(id, ack, rc) },
+	)
 	return nil
+}
+
+//
+// 目标id数据体的请求发送完毕。
+//
+func (x *xSender) reqDone(id uint16, seq uint32, rc Receiver) {
+	x.Dcps.Done(id, true)
+
+	// 开启响应接收。
+	rs := x.Dcps.RspRecvServ(id, seq, rc)
+
+	go rs.Serve(
+		x.Exit,
+		func(id uint16) { x.Dcps.Clean(id, false) },
+	)
 }
 
 //
@@ -262,7 +280,7 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 	if req.Dist > 0 {
 		p.Dist = req.Dist
 	}
-	if req.Qer {
+	if req.Req {
 		p.Set(QER)
 	}
 	p.RID = req.ID
@@ -270,10 +288,10 @@ func (x *xSender) SetAcks(p *packet, req *ackReq) {
 }
 
 //
-// 设置BYE通知（ACK）。
+// 设置BYE通知（作为ACK）。
 //
 func (x *xSender) SetBye(p *packet, bye ackBye) {
-	if bye.Qer {
+	if bye.Req {
 		p.Set(QER)
 	}
 	p.Set(BYE)
@@ -287,25 +305,27 @@ func (x *xSender) SetBye(p *packet, bye ackBye) {
 // 用于创建 servSend 实例时的成员赋值。
 //
 type forSend struct {
-	Post chan *packet // 数据报递送信道
-	Bye  chan ackBye  // 结束通知（BYE）
-	Dist chan int     // 发送距离增减量通知（-> rateEval）
+	Post   chan *packet // 数据报递送信道
+	Bye    chan ackBye  // 结束通知（BYE）
+	Dist   chan int     // 发送距离增减量通知（-> rateEval）
+	AckReq chan *ackReq // 确认申请（recvServ -> xSender）
 }
 
 func newForSend() *forSend {
 	return &forSend{
-		Post: make(chan *packet, postChSize),
-		Bye:  make(chan ackBye, 1),
-		Dist: make(chan int, evalChSize),
+		Post:   make(chan *packet, postChSize),
+		Bye:    make(chan ackBye, byeChSize),
+		Dist:   make(chan int, evalChSize),
+		AckReq: make(chan *ackReq, postChSize),
 	}
 }
 
 //
-// BYE确认通知。
+// BYE通知（发送方）。
 //
 type ackBye struct {
 	ID  uint16 // 数据ID#SND（=>#RCV）
-	Qer bool   // 是否为资源请求
+	Req bool   // 是否为资源请求
 }
 
 //
@@ -315,6 +335,11 @@ type ackLoss struct {
 	Ack uint32 // 当前进度线确认号
 	Off int    // 发送数据相对于进度线的偏移
 }
+
+//
+// 发送服务清理器器。
+//
+type sndCleaner func(uint16, uint32)
 
 //
 // 数据报发送器。
@@ -336,8 +361,8 @@ type ackLoss struct {
 // 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离也会让发送停止。
 //
 type servSend struct {
-	ID    uint16        // 数据ID#SND
-	RcvIn chan *rcvInfo // 接收确认信息（<- net）
+	ID    uint16          // 数据ID#SND
+	RcvIn chan<- *rcvInfo // 接收确认信息（<- net）
 
 	iPost chan<- *packet // 数据报递送（-> xServer）
 	iBye  chan<- ackBye  // 结束通知（BYE -> xServer）
@@ -347,19 +372,19 @@ type servSend struct {
 	recv  *ackRecv       // 接收确认
 	dcnt  *sendDister    // 距离计数器
 
-	stop   *goes.Stop    // 分支服务停止
-	read   chan *packet  // 读取回环传递（buf>0）
-	end    uint32        // END包的确认号
-	seq    uint32        // 当前序列号
-	rcvSrv *recvServ     // 资源请求关联接收器
-	endCh  chan<- seqAck // END包信息传递
+	read  chan *packet  // 读取回环传递（buf>0）
+	isBeg bool          // 是否为首个包
+	seq   uint32        // 当前序列号
+	end   uint32        // END包的确认号
+	isReq bool          // 为资源请求发送
+	endCh chan<- seqAck // END包信息传递（-> ackRecv）
 }
 
 //
 // 新建一个子发送服务器。
 // seq 实参为一个初始的随机值。
 //
-func newServSend(id uint16, seq uint32, rsp *response, x *forSend) *servSend {
+func newServSend(id uint16, seq uint32, rsp *response, req bool, pch chan<- *packet, bch chan<- ackBye, dch chan<- int) *servSend {
 	dcnt := &sendDister{}
 	lsev := newLossEval(subEaseRate, sendRateZoom)
 	endc := make(chan seqAck, 1)
@@ -368,34 +393,20 @@ func newServSend(id uint16, seq uint32, rsp *response, x *forSend) *servSend {
 	return &servSend{
 		ID:    id,
 		RcvIn: rcvi,
-		iPost: x.Post,
-		iBye:  x.Bye,
+		iPost: pch,
+		iBye:  bch,
 		cLoss: make(chan *ackLoss),
 		resp:  rsp,
 		read:  make(chan *packet, 1), // 缓存>0
-		stop:  goes.NewStop(),
-		eval:  newEvalRate(lsev, sendRateZoom, subEaseRate, x.Dist),
+		eval:  newEvalRate(lsev, sendRateZoom, subEaseRate, dch),
 		recv:  newAckRecv(rcvi, endc, lsev, rsp, dcnt),
+		isBeg: true,
 		seq:   seq,
 		dcnt:  dcnt,
+		end:   xLimit32,
+		isReq: req,
 		endCh: endc,
 	}
-}
-
-//
-// 终止服务。
-// 可能由资源请求的后续接收服务（recvServ）调用。
-//
-func (s *servSend) Exit() {
-	s.stop.Exit()
-}
-
-//
-// 设置资源请求关联的接收服务器实例。
-// 用于END发送结束后通知接收开始（单包丢失评估必要）。
-//
-func (s *servSend) SetRecvServ(rs *recvServ) {
-	s.rcvSrv = rs
 }
 
 //
@@ -405,11 +416,13 @@ func (s *servSend) SetRecvServ(rs *recvServ) {
 // 注记：
 // 丢包与正常的发送在一个Go程里处理，无并发问题。
 //
-func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
-	// 确认接收处理。
-	go s.recv.Serve(s.cLoss, re, s.stop)
+func (s *servSend) Serve(re *rateEval, exit *goes.Stop, done sndCleaner) {
+	// 确认接收分支服务。
+	stop := goes.NewStop()
+	go s.recv.Serve(s.cLoss, re, stop)
+	defer stop.Exit()
 
-	// END确认超时
+	// 等待END确认超时
 	out := time.NewTimer(SendEndtime)
 	defer out.Stop()
 
@@ -419,19 +432,15 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 
 		select {
 		case <-exit.C:
-			s.Exit()
 			return // 总结束
-		case <-s.stop.C:
-			return // 受控结束（recvServ）
 		case <-out.C:
 			// 通常不至于此。
-			s.toBye()
-			s.Exit()
+			s.toBye(done)
 			return
 
 		case as, ok := <-s.cLoss:
 			if !ok {
-				s.toBye()
+				s.toBye(done)
 				return // END确认，正常结束
 			}
 			if as.Off < 0 {
@@ -444,7 +453,7 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 		// 不影响丢包重发。
 		case p := <-s.Send(size):
 			s.iPost <- p
-			s.update(p.Size(), p.BEG())
+			s.update(p)
 
 			// 速率控制
 			time.Sleep(s.eval.Rate(s.dcnt.Dist(), re.Base()))
@@ -457,35 +466,38 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop) {
 // 发送结束通知（BYE）
 // 因为无数据负载，BYE作为一个确认信息发出。
 //
-// 对于响应接收，对端应当终止接收子服务（recvServ）。
-// 对于发送接收，对端应该已经开始响应了（不再END确认）。
-//
-func (s *servSend) toBye() {
+func (s *servSend) toBye(done sndCleaner) {
 	go func() {
 		s.iBye <- ackBye{
 			ID:  s.ID, // => #RCV
-			Qer: s.rcvSrv != nil,
+			Req: s.isReq,
 		}
 	}()
-	if s.rcvSrv != nil {
-		s.rcvSrv.Ready(s.end)
+	if done != nil {
+		done(s.ID, s.end)
 	}
 }
 
 //
 // 状态更新。
 // 设置下一个序列号，同时会更新距离计数器。
-// size 为数据报有效负载大小，保证为正。
-// beg 标记是否为首个分组。
+// 注记：
+// 在数据报已经进入发送队列后才更新，减小END确认时间误差。
 //
-func (s *servSend) update(size int, beg bool) {
-	v := roundPlus(s.seq, size)
-	if beg {
-		s.dcnt.Init(v)
+func (s *servSend) update(p *packet) {
+	ack := roundPlus(s.seq, p.Size())
+
+	if p.BEG() {
+		s.dcnt.Init(ack)
 	} else {
-		s.dcnt.Add(v)
+		s.dcnt.Add(ack)
 	}
-	s.seq = v
+	if p.END() {
+		// 向ackRecv传递END包信息
+		s.endCh <- seqAck{s.seq, s.end}
+		// no close
+	}
+	s.seq = ack // next..
 }
 
 //
@@ -531,17 +543,19 @@ func (s *servSend) Build(seq uint32, size int) *packet {
 	}
 	if err == io.EOF {
 		s.end = roundPlus(seq, len(b))
-		s.endCh <- seqAck{seq, s.end}
-		close(s.endCh)
 	}
 	return s.build(b, seq, err == io.EOF)
 }
 
 //
 // 丢包后的数据报构建。
+// off 为-1时表示END包，会即时计算seq值（可能PMTU变化）。
 //
 func (s *servSend) lossBuild(seq uint32, size, off int) *packet {
 	b, err := s.resp.LossGet(size, off)
+	if off < 0 {
+		seq = roundBegin(s.end, len(b))
+	}
 	if err != nil {
 		log.Println(err)
 		return nil
@@ -561,7 +575,11 @@ func (s *servSend) build(b []byte, seq uint32, end bool) *packet {
 	if end {
 		h.Set(END)
 	}
-	if s.rcvSrv != nil {
+	if s.isBeg {
+		h.Set(BEG)
+		s.isBeg = false
+	}
+	if s.isReq {
 		h.Set(REQ)
 	}
 	return &packet{header: h, Data: b}
@@ -625,7 +643,7 @@ func (a *ackRecv) Serve(ach chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
 	var seq, end uint32
 	var out <-chan time.Time
 
-	// END包后确认等待
+	// END包确认等待
 	// 注：实际上为针对包全部丢失情况。
 	var wait time.Duration
 
@@ -648,7 +666,7 @@ func (a *ackRecv) Serve(ach chan<- *ackLoss, re *rateEval, exit *goes.Stop) {
 				log.Println("wait Acknowledgment was timeout.")
 				return
 			}
-			ach <- &ackLoss{seq, 0}
+			ach <- &ackLoss{seq, -1}
 			out = time.After(wait)
 
 		case ai := <-a.Rcvs:
@@ -690,10 +708,17 @@ func (a *ackRecv) update(ack uint32) {
 
 //
 // 评估丢包。
+// 子服务丢包判断会间接影响总速率评估器。
+//
 // dist 为确认距离，re 为总速率评估器。
 //
 func (a *ackRecv) lost(dist int, re *rateEval) bool {
-	return a.Loss.Eval(float64(dist), re.Base())
+	lost := a.Loss.Eval(float64(dist), re.Base())
+	if lost {
+		// 丢包影响
+		re.Loss <- struct{}{}
+	}
+	return lost
 }
 
 //
@@ -750,7 +775,7 @@ func (r *response) Acked(amount int) {
 // 最后一片数据大小可能小于size。
 //
 // size 为所需数据片大小（最大值，字节数）。
-// off 为丢包所需数据起点相对于确认点的字节偏移。
+// off 为丢包所需数据起点相对于确认点的字节偏移，负值表示末尾。
 //
 // 注记：
 // 返回的数据量在size范围内，但尽量多。
@@ -762,10 +787,23 @@ func (r *response) LossGet(size, off int) ([]byte, error) {
 	if off >= len(b) {
 		return nil, errLossOffset
 	}
+	if off == -1 {
+		return r.last(b, size), nil
+	}
 	if size+off >= len(b) {
 		return b[off:], nil
 	}
 	return b[off : off+size], nil
+}
+
+//
+// 获取末尾size大小的分片。
+//
+func (r *response) last(buf []byte, size int) []byte {
+	if size >= len(buf) {
+		return buf
+	}
+	return buf[len(buf)-size:]
 }
 
 //
@@ -885,13 +923,13 @@ func (d *sendDister) Dist() int {
 // 根据长时间的当前速率评估计算基准速率，调优自适应。
 //
 type rateEval struct {
-	base     float64         // 基准速率
-	rate     float64         // 当前速率
-	mu       sync.Mutex      // base并发安全
-	dataSize int64           // 数据量
-	ease     easeRate        // 速率生成器
-	dist     <-chan int      // 发送距离增减量（负为减）
-	loss     <-chan struct{} // 丢包通知
+	Loss     chan struct{} // 丢包通知
+	base     float64       // 基准速率
+	rate     float64       // 当前速率
+	mu       sync.Mutex    // base并发安全
+	dataSize int64         // 数据量
+	ease     easeRate      // 速率生成器
+	dist     <-chan int    // 发送距离增减量（负为减）
 }
 
 //
@@ -904,13 +942,13 @@ type rateEval struct {
 // dch 与所有数据体发送实例共享（一对连系），收集相关信息。
 // 通常为一个有缓存大小的信道。
 //
-func newRateEval(total float64, dch <-chan int, lch <-chan struct{}) *rateEval {
+func newRateEval(total float64, dch <-chan int) *rateEval {
 	return &rateEval{
+		Loss: make(chan struct{}),
 		base: float64(BaseRate),
 		rate: float64(BaseRate),
 		ease: newEaseRate(total),
 		dist: dch,
-		loss: lch,
 	}
 }
 
@@ -1007,7 +1045,7 @@ Loop:
 		select {
 		case <-stop.C:
 			break Loop // 退出
-		case <-r.loss:
+		case <-r.Loss:
 			if x > 0 {
 				x-- // 恢复累积
 			}

@@ -55,7 +55,7 @@ const (
 	ReadyRspMax  = 5                      // 请求响应最多次数
 	RtpTimeout   = 60 * time.Second       // 相同重发请求积累超时
 	RtpEndTime   = 1 * time.Second        // BYE等待超时重发间隔
-	ByeTimeout   = 10 * time.Second       // BYE等待超时重发间隔
+	ByeTimeout   = 6 * time.Second        // BYE等待超时重发间隔（应当小于ReadyTimeout）
 )
 
 // 基本参数常量
@@ -63,7 +63,7 @@ const (
 	xLimit32     = 1<<32 - 1 // 序列号上限（不含）
 	xLimit16     = 1<<16 - 1 // 数据体ID上限
 	recvTimeoutx = 2.5       // 接收超时的包间隔倍数
-	getsChSize   = 5         // 网络数据向下传递信道缓存
+	getsChSize   = 2         // 网络数据向下传递信道缓存
 )
 
 var (
@@ -159,25 +159,7 @@ type ackReq struct {
 	Ack  uint32 // 确认号
 	Dist uint8  // 确认距离（0值无漏包）
 	Rtp  bool   // 重发请求
-	Qer  bool   // 资源请求的确认
-}
-
-//
-// 接收子服务上传信息通道。
-// 用于创建 recvServ 实例时的成员赋值。
-//
-type forAcks struct {
-	Ack chan ackDst  // 应用确认通知（数据消耗）
-	Rtp chan uint32  // 请求重发通知
-	Req chan *ackReq // 确认申请（-> xSender）
-}
-
-func newForAcks() *forAcks {
-	return &forAcks{
-		Ack: make(chan ackDst, postChSize),
-		Rtp: make(chan uint32, 1),
-		Req: make(chan *ackReq, postChSize),
-	}
+	Req  bool   // 资源请求的确认
 }
 
 type ackDst struct {
@@ -186,15 +168,22 @@ type ackDst struct {
 }
 
 //
-// 响应数据关联信息。
-// 从对端发送过来的响应信息中提取的信息。
-// 用于应用接收器消耗数据并提供进度控制。
+// 发送数据关联信息。
+// 从对端发送过来的请求或响应中提取的信息。
+// - 为资源请求时，用于缓存请求数据标识（之后向响应器提交）。
+// 用于请求缓存或应用接收器消耗数据并提供进度控制。
 //
 type sndInfo struct {
 	Seq      uint32 // 序列号
 	Data     []byte // 响应数据
 	Beg, End bool   // 首位数据报标记
+	Req      bool   // 为资源请求
 }
+
+//
+// 接收服务清理器器。
+//
+type rcvCleaner func(uint16)
 
 //
 // 接收服务器。
@@ -215,41 +204,92 @@ type sndInfo struct {
 // - BYE 	BYE信息（结束）
 //
 type recvServ struct {
-	ID    uint16        // 数据ID#RCV（<=ID#SND）
-	SndIn chan *sndInfo // 接受到的发送数据信息
-	RtpIn chan *rtpInfo // 请求重发所需评估信息
+	ID    uint16          // 数据ID#RCV（<=ID#SND）
+	SndIn chan<- *sndInfo // 接受到的发送数据信息
+	RtpIn chan<- *rtpInfo // 请求重发所需评估信息
 
-	iReq chan<- *ackReq // 确认申请（-> xSender）
-	oRtp <-chan uint32  // 请求重发通知
-	oAck <-chan ackDst  // 确认通知（数据消耗|再次确认）
-
-	seq   uint32    // 当前序列号
-	alive time.Time // 活着时间戳
-
-	// 资源请求发送就绪后超时
-	// 用于发送服务通知衔接（准备接收）。
-	readyOut <-chan time.Time
+	ackReq chan<- *ackReq // 确认申请（-> xSender）
+	ackEv  *ackEval       // 确认评估器
+	rtpEv  *rtpEval       // 重发评估器
+	isReq  bool           // 为资源请求接收
+	alive  time.Time      // 活着时间戳
 }
 
-func newRecvServ(id uint16, x *forAcks) *recvServ {
+//
+// 新建一个接收子服务。
+// - 应当仅在请求发送完毕后创建一个响应接收。
+// - 或收到一个不同的请求时创建一个请求接收。
+//
+// ack 为所期待的对端响应的首个分组的序列号。
+// 注：也即资源请求的最后一个分组的确认号（预设约定）。
+// done 为接收完毕或中途退出时的调用。
+//
+func newRecvServ(id uint16, ack uint32, ar chan<- *ackReq, rc Receiver, isReq bool) *recvServ {
+	sndCh := make(chan *sndInfo, getsChSize)
+	rtpCh := make(chan *rtpInfo, getsChSize)
+
 	return &recvServ{
-		ID:  id,
-		req: x.Req,
-		rtp: x.Rtp,
-		ack: x.Ack,
-		seq: xLimit32,
-		// zero
-		alive: time.Time{},
+		ID:     id,
+		SndIn:  sndCh,
+		RtpIn:  rtpCh,
+		ackReq: ar,
+		ackEv:  newAckEval(sndCh, newAppReceive(rc)),
+		rtpEv:  newRtpEval(ack, rtpCh),
+		isReq:  isReq,
+		alive:  time.Now(),
 	}
 }
 
 //
 // 启动接收服务。
-// 接收对端传送来的响应数据及相关信息。
-// 分解信息派发给各个评估模块。
+// 启动重发和确认评估模块，接收评估汇总。
+// 构造确认申请向 xSender 递送。
 //
-func (r *recvServ) Serve(ri chan<- *rtpInfo, exit *goes.Stop) {
-	//
+func (r *recvServ) Serve(exit *goes.Stop, done rcvCleaner) {
+	defer done(r.ID)
+
+	// 评估模块控制
+	stop := goes.NewStop()
+	defer stop.Exit()
+
+	ackCh := make(chan ackDst, 1)
+	rtpCh := make(chan uint32, 1)
+
+	go r.ackEv.Serve(ackCh, stop)
+	go r.rtpEv.Serve(rtpCh, stop)
+
+	for {
+		req := r.newAckReq()
+
+		select {
+		// 上级收到BYE消息后主动结束
+		case <-exit.C:
+			return
+
+		case ack := <-rtpCh:
+			req.Ack = ack
+			req.Rtp = true
+
+		case ad, ok := <-ackCh:
+			if !ok {
+				return // 等待BYE超时
+			}
+			req.Ack = ad.Ack
+			req.Dist = ad.Dist
+		}
+		r.ackReq <- req
+		r.alive = time.Now()
+	}
+}
+
+//
+// 新建一个空确认请求。
+//
+func (r *recvServ) newAckReq() *ackReq {
+	return &ackReq{
+		ID:  r.ID,
+		Req: r.isReq,
+	}
 }
 
 //
@@ -261,22 +301,6 @@ func (r *recvServ) Serve(ri chan<- *rtpInfo, exit *goes.Stop) {
 //
 func (r *recvServ) Alive() bool {
 	return time.Since(r.alive) < CalmExpire
-}
-
-//
-// 资源请求发送就绪调用（servSend）。
-// 用于接收器准备接收首个响应数据片的超时重发请求。
-// 如果已经接收到响应数据，则无行为。
-//
-// seq 为对端响应的首个分组的序列号。
-// 注：也即资源请求的最后一个分组的确认号（预设约定）。
-//
-func (r *recvServ) Ready(seq uint32) {
-	if !r.alive.IsZero() {
-		return
-	}
-	r.seq = seq
-	r.readyOut = time.After(ReadyTime)
 }
 
 //
@@ -340,7 +364,7 @@ func (a *ackEval) Serve(ach chan<- ackDst, exit *goes.Stop) {
 
 			// 等待消耗或立即
 			if bs != nil {
-				a.App.Puts(bs)
+				a.App.Puts(bs, done)
 			}
 			ach <- ackDst{ack, a.pool.Dist()}
 
@@ -551,13 +575,19 @@ type rtpEval struct {
 
 //
 // 创建一个重发申请评估器。
-// ack 为初始包（BEG）的序列号。
+// ack0 为初始确认号（所需BEG包序列号）。
 //
-func newRtpEval(ri <-chan *rtpInfo) *rtpEval {
-	return &rtpEval{
+func newRtpEval(ack0 uint32, ri <-chan *rtpInfo) *rtpEval {
+	tm := time.Now()
+
+	re := rtpEval{
 		Info: ri,
-		cur:  time.Now(),
+		last: tm.Add(-ReadyTimeout),
+		cur:  tm,
 	}
+	re.ackx.Insert(int(ack0))
+
+	return &re
 }
 
 //

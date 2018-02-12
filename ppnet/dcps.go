@@ -32,17 +32,34 @@ import (
 ///
 ///////////////////////////////////////////////////////////////////////////////
 
-var (
-	errRecvServ = errors.New("not enough id resources")
-)
+var errRequest = errors.New("not enough id resources")
+
+//
+// 资源请求写入缓存。
+//
+type resBuffer struct {
+	*bytes.Buffer
+	done func()
+}
+
+//
+// Receiver 接口实现。
+//
+func (rb *resBuffer) Close() error {
+	rb.done()
+	return nil
+}
+
+func newResBuffer(done func()) *resBuffer {
+	return &resBuffer{new(bytes.Buffer), done}
+}
 
 //
 // 发送/接收子服务管理。
 // 一个4元组两端连系对应一个本类实例。
 //
 type dcps struct {
-	*forSend                      // servSend 创建参考
-	*forAcks                      // recvServ 创建参考
+	*forSend                      // 发送相关信道存储
 	idx      uint16               // 最新请求ID（数据体ID）存储
 	reqSend  map[uint16]*servSend // 资源请求发送子服务（key:next）
 	rspRecv  map[uint16]*recvServ // 响应接收子服务（key:next）
@@ -58,7 +75,6 @@ type dcps struct {
 func newDcps() *dcps {
 	return &dcps{
 		forSend: newForSend(),
-		forAcks: newForAcks(),
 		idx:     uint16(rand.Intn(xLimit16)),
 		rspRecv: make(map[uint16]*recvServ),
 		reqRecv: make(map[uint16]*recvServ),
@@ -77,38 +93,50 @@ func (d *dcps) ReqSize() int {
 }
 
 //
-// 新建一个请求关联服务。
-// 包含请求发送子服务和对应的响应接收子服务。
-// 返回新建的两个子服务。
+// 创建一个请求发送子服务。
+// 如果内部ID资源不足，则返回一个errRequest错误。
 //
-func (d *dcps) NewRequest(res []byte) (*servSend, *recvServ, error) {
+func (d *dcps) NewRequest(res []byte) (*servSend, error) {
 	i := d.reqID(d.idx)
 	if i == xLimit16 {
-		return nil, nil, errRecvServ
+		return nil, errRequest
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
-	rs := newRecvServ(i, d.forAcks)
-	d.rspRecv[i] = rs
 
 	ss := newServSend(
 		i,
 		rand.Uint32()%xLimit32,
 		newResponse(bytes.NewReader(res)),
-		d.forSend,
+		true,
+		d.Post,
+		d.Bye,
+		d.Dist,
 	)
 	d.reqSend[i] = ss
-
 	d.idx = i
-	return ss, rs, nil
+
+	return ss, nil
 }
 
 //
-// 清除数据ID。
-// 通常在收到BYE消息时，或END确认发送后超时时被调用。
-// 注记：
-// 仅需清除recvServ存储即可（servSend的ID为依赖关系）。
+// 创建一个响应接收子服务。
+// 它通常在一个请求发送结束后被调用。
+// ack 为响应端将要发送的首个分组的序列号（约定）。
+//
+func (d *dcps) RspRecvServ(id uint16, ack uint32, rc Receiver) *recvServ {
+	rs := newRecvServ(id, ack, d.AckReq, rc, false)
+
+	d.mu.Lock()
+	d.rspRecv[id] = rs
+	d.mu.Unlock()
+
+	return rs
+}
+
+//
+// 清理响应接收池。
+// 通常在收到BYE或重复END确认超时被调用。
 //
 func (d *dcps) Clean(id uint16, req bool) {
 	d.mu.Lock()
@@ -131,30 +159,30 @@ func (d *dcps) RecvServ(id uint16) *recvServ {
 
 //
 // 创建一个请求接收子服务。
+// id 由资源请求数据报传递过来。
+// done 为请求接收完毕后的调用（用于创建响应发送）。
 //
-func (d *dcps) NewRecvServ(id uint16) *recvServ {
-	rs := newRecvServ(id, d.forAcks)
-
+func (d *dcps) NewReceive(id uint16, ack uint32, done func()) *recvServ {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	rs := newRecvServ(id, ack, d.AckReq, newResBuffer(done), true)
 	d.reqRecv[id] = rs
-	d.mu.Unlock()
 
 	return rs
 }
 
 //
-// 创建一个响应发送服务。
-// 由service实例接收完一个资源请求后调用。
+// 创建一个响应发送子服务。
+// 它在一个资源请求接收完毕后被调用（NewReceive的回调里）。
 //
-// id 由对端的资源请求传递过来。
+// id 由资源请求数据报传递过来。
 // seq 为资源请求最后分组的确认号（约定）。
 //
-func (d *dcps) NewServSend(id uint16, seq uint32, rsp *response) *servSend {
+func (d *dcps) RspServSend(id uint16, seq uint32, rsp *response) *servSend {
 	ss := newServSend(
-		id,
-		seq,
-		rsp,
-		d.forSend,
+		id, seq, rsp, false,
+		d.Post, d.Bye, d.Dist,
 	)
 	d.mu.Lock()
 	d.rspSend[uint16(id)] = ss
@@ -164,8 +192,8 @@ func (d *dcps) NewServSend(id uint16, seq uint32, rsp *response) *servSend {
 }
 
 //
-// 响应/请求发送完成。
-// 在响应发送完成之后（BYE发出）调用。
+// 请求/响应发送完成。
+// 在BYE发送之后被调用。
 //
 func (d *dcps) Done(id uint16, req bool) {
 	d.mu.Lock()
