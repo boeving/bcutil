@@ -3,8 +3,9 @@ package ppnet
 /////////////////////
 /// DCP 接收服务实现。
 /// 流程
-/// 	客户端：应用请求 >> [发送]； [接收] >> 写入应用。
-/// 	服务端：[接收] >> 询问应用，获取io.Reader，读取 >> [发送]。
+/// 	客户端：应用请求 -> 发送请求 >>>>>>
+/// 	服务端：[接收请求] -> 询问应用，从io.Reader读取 -> 发送响应 >>>>>>
+/// 	客户端：[接收响应] -> 写入应用
 ///
 /// 接收端
 /// ------
@@ -12,24 +13,23 @@ package ppnet
 /// 2. 接收对端发送来的响应数据（之前向对端请求过），写入应用接收接口（Receiver）。
 ///
 /// - 根据应用接收接口的数据消化情况，决定ACK的发送：
-///   > 如果消化处于忙状态，则停止发送ACK确认，缓存积累已收到的数据报。
-///   > 如果消化处于饥饿状态，则ACK为全发模式，每收到一个数据报回馈一个确认。
+///   > 如果消化处于忙状态，阻塞ACK确认发送。缓存积累已收到的数据报。
+///   > 如果没有连续数据片可用（消化），则每收到一个数据报都会发送一个确认。
 ///
-/// - 根据发送距离因子，评估本端发送的ACK丢失情况，可能重新确认丢失的ACK。
 /// - 根据传输路径超时（参考两个连续包的间隔时间），请求缺失的某个包。
 /// - 如果已经收到END包，则之后每收到一个包就请求一次中间缺失的包。
+///   上面两种丢包检查同时执行，共同维护丢包重发请求机制。
 ///
 ///
 /// 并行接收
-/// - 每个数据体内的分组由序列号表达顺序，并按此重组数据。
 /// - 发送方数据体的发送是一种并发，因此接收到的数据体类似于一种并行。
 ///   这种情况下，小数据体不会受到大数据体的阻塞，会先完成。
+/// - 每个数据体内的分组由序列号表达顺序，并按此重组数据。
 ///
 /// 发送控制
-/// - 接收端也有发送的控制权，实际上接收端才是数据发送的主导者。
-/// - 每个数据体的应用消化各不相同。通过对数据确认的控制，抑制发送方的速率。
-/// - 如果已经收到END包但缺失中间的包，主动请求重发可以尽快完成数据体（交付到应用）。
-/// - 从「发送距离」评估确认是否送达（ACK丢失），必要时重新确认。
+/// - 接收端依靠重发请求和确认距离影响对端的发送，实际上是数据发送的主导方。
+/// - 接收端应用消费着数据，而消化进度各不相同，逻辑上它们也应当是数据流动的主控者。
+///   注：是「要多少给多少」，而不是给多少用多少。
 ///
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -51,11 +51,10 @@ const (
 	AliveIntvl   = 10 * time.Second       // 保活报文间隔时间
 	CalmExpire   = 90 * time.Second       // 服务静置期限（SND/RCV子服务无活动）
 	ReadyTimeout = 10 * time.Second       // 资源请求发送完毕，等待接收超时
-	ReadyRspTime = 500 * time.Millisecond // 请求响应起始间隔时间
-	ReadyRspMax  = 5                      // 请求响应最多次数
-	RtpTimeout   = 60 * time.Second       // 相同重发请求积累超时
+	ReadyRspTime = 100 * time.Millisecond // 主动请求对端响应起始间隔时间
+	RtpTimeout   = 30 * time.Second       // 相同重发请求积累超时
 	RtpEndTime   = 1 * time.Second        // BYE等待超时重发间隔
-	ByeTimeout   = 6 * time.Second        // BYE等待超时重发间隔（应当小于ReadyTimeout）
+	ByeTimeout   = 6 * time.Second        // BYE等待超时重发间隔
 )
 
 // 基本参数常量
@@ -71,9 +70,10 @@ var (
 )
 
 //
-// service 基础服务。
-// 接收网络数据，转发到数据体的接收服务器。
-// 如果为一个资源请求，创建一个发送服务器（servSend）交付。
+// 总接收服务。
+// 接收网络数据报，分解转发到各数据体的接收子服务。
+// 如果为一个资源请求，创建一个请求接收子服务，完毕后（Close）转接响应器。
+// 如果为一个响应，创建一个应用接收子服务，完毕后Close关闭应用接口。
 //
 // 一个对端4元组连系对应一个本类实例。
 //
@@ -138,15 +138,6 @@ func (s *service) resReader(res []byte) (io.Reader, error) {
 		return nil, errResponser
 	}
 	return s.Resp.GetReader(res)
-}
-
-//
-// 新建一个接收服务。
-// 它由一个新的请求激发，发送请求。
-// 初始化一个随机序列号，创建一个接收服务。
-//
-func (s *service) newReceive(res []byte, rec Receiver) {
-	//
 }
 
 //
@@ -578,15 +569,11 @@ type rtpEval struct {
 // ack0 为初始确认号（所需BEG包序列号）。
 //
 func newRtpEval(ack0 uint32, ri <-chan *rtpInfo) *rtpEval {
-	tm := time.Now()
-
 	re := rtpEval{
 		Info: ri,
-		last: tm.Add(-ReadyTimeout),
-		cur:  tm,
+		cur:  time.Now(),
 	}
 	re.ackx.Insert(int(ack0))
-
 	return &re
 }
 
@@ -596,8 +583,13 @@ func newRtpEval(ack0 uint32, ri <-chan *rtpInfo) *rtpEval {
 //
 func (r *rtpEval) Serve(rch chan<- uint32, exit *goes.Stop) {
 	// 路径超时
-	out := time.NewTimer(r.timeOut())
+	// 初始明显不会在readyOut之前触发。
+	out := time.NewTimer(ReadyTimeout * 2)
 	defer out.Stop()
+
+	// 就绪等待超时
+	readyOut := time.After(ReadyTimeout)
+	var work bool
 
 	// 重发累计次数
 	var rcnt int
@@ -606,6 +598,13 @@ func (r *rtpEval) Serve(rch chan<- uint32, exit *goes.Stop) {
 		select {
 		case <-exit.C:
 			return
+
+		case <-readyOut:
+			if !work {
+				out.Reset(ReadyRspTime)
+				r.last = time.Now()
+			}
+			continue
 
 		case <-out.C:
 			rcnt++
@@ -626,6 +625,10 @@ func (r *rtpEval) Serve(rch chan<- uint32, exit *goes.Stop) {
 			if r.end {
 				r.endRtp(rch)
 			}
+			if !out.Stop() {
+				<-out.C
+			}
+			work = true
 		}
 		out.Reset(r.timeOut())
 	}
