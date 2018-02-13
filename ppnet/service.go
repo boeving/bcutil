@@ -172,11 +172,6 @@ type sndInfo struct {
 }
 
 //
-// 接收服务清理器器。
-//
-type rcvCleaner func(uint16)
-
-//
 // 接收服务器。
 // A: 接收对端的资源请求，完毕之后交付到响应器处理。
 // B: 接收对端的响应数据，写入请求时附带的接收接口。
@@ -236,7 +231,7 @@ func newRecvServ(id uint16, ack uint32, ar chan<- *ackReq, rc Receiver, isReq bo
 // 启动重发和确认评估模块，接收评估汇总。
 // 构造确认申请向 xSender 递送。
 //
-func (r *recvServ) Serve(exit *goes.Stop, done rcvCleaner) {
+func (r *recvServ) Serve(exit *goes.Stop, done rspCleaner) {
 	defer done(r.ID)
 
 	// 评估模块控制

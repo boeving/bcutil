@@ -47,6 +47,7 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"sync"
 
@@ -219,6 +220,18 @@ func (h *header) Encode(buf []byte) []byte {
 }
 
 //
+// 创建一个基本报头。
+//
+func newHeader(id uint16, seq uint32) *header {
+	return &header{
+		SID:  id,
+		Seq:  seq,
+		Non1: byte(rand.Intn(0xff)),
+		Non2: byte(rand.Intn(0xff)),
+	}
+}
+
+//
 // 数据报。
 // 合并报头的方法便于使用。
 //
@@ -360,12 +373,13 @@ type Receiver interface {
 //
 // Responser 响应器接口。
 // 响应对端的资源请求，由提供数据服务的应用实现。
-// 返回的读取器读取完毕表示数据体结束。
+//
+// 返回的int值表示具体数据量（字节数）。
+// 如果无法提供数据量，可返回-1，表示未知或无限制。
+// 主要用于优化数据发送。
 //
 type Responser interface {
-	// res 为客户端请求资源的标识。
-	// addr 为远端地址。
-	GetReader(res []byte, addr net.Addr) (io.Reader, error)
+	GetReader(res []byte, raddr net.Addr) (io.Reader, int, error)
 }
 
 //

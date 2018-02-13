@@ -5,6 +5,8 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
+
+	"github.com/qchen-zh/pputil/goes"
 )
 
 //////////////
@@ -55,17 +57,67 @@ func newResBuffer(done func()) *resBuffer {
 }
 
 //
+// 请求发送完成回调。
+// 需要创建一个响应接收子服务。
+//
+type reqDoner func(id uint16, ack uint32, rc Receiver)
+
+//
+// 请求接收结束清理回调。
+// 需要创建一个响应发送子服务。
+//
+type reqCleaner func(id uint16, seq uint32, rp responser)
+
+//
+// 响应发送完成回调。
+//
+type rspDoner func(id uint16)
+
+//
+// 响应接收结束清理回调。
+//
+type rspCleaner func(id uint16)
+
+//
+// 请求发送接口。
+//
+type reqSender interface {
+	Serve(*rateEval, *goes.Stop, reqDoner)
+}
+
+//
+// 请求接收接口。
+//
+type reqReceiver interface {
+	Serve(*goes.Stop, reqCleaner)
+}
+
+//
+// 响应发送接口。
+//
+type rspSender interface {
+	Serve(*rateEval, *goes.Stop, rspDoner)
+}
+
+//
+// 响应接收接口。
+//
+type rspReceiver interface {
+	Serve(*goes.Stop, rspCleaner)
+}
+
+//
 // 发送/接收子服务管理。
 // 一个4元组两端连系对应一个本类实例。
 //
 type dcps struct {
-	*forSend                      // 发送相关信道存储
-	idx      uint16               // 最新请求ID（数据体ID）存储
-	reqSend  map[uint16]*servSend // 资源请求发送子服务（key:next）
-	rspRecv  map[uint16]*recvServ // 响应接收子服务（key:next）
-	reqRecv  map[uint16]*recvServ // 请求接收子服务（key:net #SND->#RCV）
-	rspSend  map[uint16]*servSend // 响应发送子服务（key:net #SND->#SND）
-	mu       sync.Mutex           // 集合保护（4 map）
+	*forSend                        // 发送相关信道存储
+	idx      uint16                 // 最新请求ID（数据体ID）存储
+	reqSend  map[uint16]reqSender   // 资源请求发送子服务（key:next）
+	reqRecv  map[uint16]reqReceiver // 请求接收子服务（key:net #SND->#RCV）
+	rspSend  map[uint16]rspSender   // 响应发送子服务（key:net #SND->#SND）
+	rspRecv  map[uint16]rspReceiver // 响应接收子服务（key:next）
+	mu       sync.Mutex             // 集合保护（4 map）
 }
 
 //
@@ -76,10 +128,10 @@ func newDcps() *dcps {
 	return &dcps{
 		forSend: newForSend(),
 		idx:     uint16(rand.Intn(xLimit16)),
-		rspRecv: make(map[uint16]*recvServ),
-		reqRecv: make(map[uint16]*recvServ),
-		rspSend: make(map[uint16]*servSend),
-		reqSend: make(map[uint16]*servSend),
+		reqSend: make(map[uint16]reqSender),
+		reqRecv: make(map[uint16]reqReceiver),
+		rspSend: make(map[uint16]rspSender),
+		rspRecv: make(map[uint16]rspReceiver),
 	}
 }
 
@@ -96,7 +148,7 @@ func (d *dcps) ReqSize() int {
 // 创建一个请求发送子服务。
 // 如果内部ID资源不足，则返回一个errRequest错误。
 //
-func (d *dcps) NewRequest(res []byte) (*servSend, error) {
+func (d *dcps) NewRequest(res []byte) (reqSender, error) {
 	i := d.reqID(d.idx)
 	if i == xLimit16 {
 		return nil, errRequest
@@ -124,7 +176,7 @@ func (d *dcps) NewRequest(res []byte) (*servSend, error) {
 // 它通常在一个请求发送结束后被调用。
 // ack 为响应端将要发送的首个分组的序列号（约定）。
 //
-func (d *dcps) RspRecvServ(id uint16, ack uint32, rc Receiver) *recvServ {
+func (d *dcps) NewReceive(id uint16, ack uint32, rc Receiver) rspReceiver {
 	rs := newRecvServ(id, ack, d.AckReq, rc, false)
 
 	d.mu.Lock()
@@ -135,34 +187,11 @@ func (d *dcps) RspRecvServ(id uint16, ack uint32, rc Receiver) *recvServ {
 }
 
 //
-// 清理响应接收池。
-// 通常在收到BYE或重复END确认超时被调用。
-//
-func (d *dcps) Clean(id uint16, req bool) {
-	d.mu.Lock()
-	if req {
-		delete(d.reqRecv, id)
-	} else {
-		delete(d.rspRecv, id)
-	}
-	d.mu.Unlock()
-}
-
-//
-// 返回数据ID的接收子服务器。
-//
-func (d *dcps) RecvServ(id uint16) *recvServ {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.rspRecv[id]
-}
-
-//
-// 创建一个请求接收子服务。
+// 创建一个请求接收子服务器。
 // id 由资源请求数据报传递过来。
 // done 为请求接收完毕后的调用（用于创建响应发送）。
 //
-func (d *dcps) NewReceive(id uint16, ack uint32, done func()) *recvServ {
+func (d *dcps) NewReqReceiver(id uint16, ack uint32, done func()) reqReceiver {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -179,7 +208,7 @@ func (d *dcps) NewReceive(id uint16, ack uint32, done func()) *recvServ {
 // id 由资源请求数据报传递过来。
 // seq 为资源请求最后分组的确认号（约定）。
 //
-func (d *dcps) RspServSend(id uint16, seq uint32, rsp *response) *servSend {
+func (d *dcps) NewRspSender(id uint16, seq uint32, rsp *response) rspSender {
 	ss := newServSend(
 		id, seq, rsp, false,
 		d.Post, d.Bye, d.Dist,
@@ -192,30 +221,70 @@ func (d *dcps) RspServSend(id uint16, seq uint32, rsp *response) *servSend {
 }
 
 //
-// 请求/响应发送完成。
-// 在BYE发送之后被调用。
+// 请求发送完成。
+// 注：会在BYE发送之后被调用。
 //
-func (d *dcps) Done(id uint16, req bool) {
+func (d *dcps) ReqDone(id uint16) {
 	d.mu.Lock()
-	if req {
-		delete(d.reqSend, id)
-	} else {
-		delete(d.rspSend, id)
-	}
+	delete(d.reqSend, id)
 	d.mu.Unlock()
 }
 
 //
-// 返回数据ID的发送子服务器。
-// req 标识是否为资源请求的发送子服务。
+// 发送完成（请求/响应）。
+// 在BYE发送之后被调用。
 //
-func (d *dcps) ServSend(id uint16, req bool) *servSend {
+func (d *dcps) RspDone(id uint16) {
+	d.mu.Lock()
+	delete(d.rspSend, id)
+	d.mu.Unlock()
+}
+
+//
+// 清理请求接收池。
+// 注：通常在收到BYE或重复END确认超时被调用。
+//
+func (d *dcps) ReqClean(id uint16) {
+	d.mu.Lock()
+	delete(d.reqRecv, id)
+	d.mu.Unlock()
+}
+
+//
+// 清理响应接收池。
+// 注：通常在收到BYE或重复END确认超时被调用。
+//
+func (d *dcps) RspClean(id uint16) {
+	d.mu.Lock()
+	delete(d.rspRecv, id)
+	d.mu.Unlock()
+}
+
+//
+// 获取请求发送子服务器。
+//
+func (d *dcps) ReqSender(id uint16) reqSender {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if req {
-		return d.reqSend[id]
-	}
+	return d.reqSend[id]
+}
+
+//
+// 获取响应发送子服务器。
+//
+func (d *dcps) RspSender(id uint16) rspSender {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	return d.rspSend[id]
+}
+
+//
+// 获取响应接收子服务器。
+//
+func (d *dcps) RspReceiver(id uint16) rspReceiver {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.rspRecv[id]
 }
 
 //
