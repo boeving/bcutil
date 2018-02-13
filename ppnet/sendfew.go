@@ -19,6 +19,9 @@ import (
 	"github.com/qchen-zh/pputil/goes"
 )
 
+// OneAckTime 单数据报确认等待时间。
+const OneAckTime = 300 * time.Millisecond
+
 //
 // 请求发送器封装。
 //
@@ -93,8 +96,8 @@ func newOneSend(id uint16, seq uint32, b []byte, pch chan<- *packet, bch chan<- 
 // 因为一个数据报就是一个数据体，冗余浪费可接受。
 //
 func (o *oneSend) Serve(re *rateEval, exit *goes.Stop, done func(id uint16, ack uint32)) {
-	// 取普通值的一半
-	wait := SendAckTime / 2
+	// 初次等待时间
+	wait := OneAckTime
 
 	end := time.NewTimer(wait)
 	defer end.Stop()

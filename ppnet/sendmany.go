@@ -21,7 +21,7 @@ import (
 // 基础常量设置。
 const (
 	SendEndtime = 10 * time.Second       // 发送END包后超时结束时限
-	SendAckTime = 600 * time.Millisecond // 首个确认等待超时
+	SendAckTime = 600 * time.Millisecond // 首个确认等待时间
 )
 
 var (
@@ -64,7 +64,7 @@ type servSend struct {
 	RcvIn chan<- *rcvInfo // 接收确认信息（<- net）
 
 	iPost chan<- *packet // 数据报递送（-> xServer）
-	iBye  chan<- ackBye  // 结束通知（BYE -> xServer）
+	iBye  chan<- *ackBye // 结束通知（BYE -> xServer）
 	cLoss chan *ackLoss  // 丢包重发通知（offset）
 	resp  *response      // 响应器
 	eval  *evalRate      // 速率评估器
