@@ -62,7 +62,7 @@ const (
 	xLimit32     = 1<<32 - 1 // 序列号上限（不含）
 	xLimit16     = 1<<16 - 1 // 数据体ID上限
 	recvTimeoutx = 2.5       // 接收超时的包间隔倍数
-	getsChSize   = 2         // 网络数据向下传递信道缓存
+	getsChSize   = 3         // 网络数据向下传递信道缓存
 )
 
 var (
@@ -583,6 +583,7 @@ func (r *rtpEval) Serve(rch chan<- uint32, exit *goes.Stop) {
 	defer out.Stop()
 
 	// 就绪等待超时
+	// 请求发送完成后，等待对端的响应。
 	readyOut := time.After(ReadyTimeout)
 	var work bool
 
@@ -661,25 +662,26 @@ func (r *rtpEval) timeOut() time.Duration {
 
 //
 // 收到END包后的重发申请。
-// 注：与超时重发不重复。
 //
 func (r *rtpEval) endRtp(rch chan<- uint32) {
 	// 留给超时机制
 	if r.ackx.Len() == 1 {
 		return
 	}
-	rch <- uint32(r.ackx.Max())
+	rch <- uint32(r.ackx.Min())
 }
 
 //
-// 漏包重发。
-// 请求的中间缺失的包的顺序没有定义。
+// 漏包重发（路径超时）。
+// 注：
+// 因为序列号回绕的原因，Max值并不准确表达为当前所需包。
+// 这是一个近似以简化处理，可以接受。
 //
 func (r *rtpEval) lossRtp(rch chan<- uint32) {
 	if r.ackx.Len() == 0 {
 		return
 	}
-	rch <- uint32(r.ackx.Min())
+	rch <- uint32(r.ackx.Max())
 }
 
 //

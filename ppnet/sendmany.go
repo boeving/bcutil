@@ -41,23 +41,34 @@ type ackLoss struct {
 }
 
 //
+// 序列号/确认号对。
+//
+type seqAck struct {
+	Seq, Ack uint32
+}
+
+//
+// 确认信息。
+// 对端对本端响应的确认信息。
+//
+type rcvInfo struct {
+	Ack  uint32 // 确认号
+	Dist int    // 确认距离
+	Rtp  bool   // 重传请求
+}
+
+//
 // 数据报发送器。
 // 一个响应服务对应一个本类实例。
-// - 从响应器接收数据负载，构造数据报递送到总发送器。
-// - 根据对端确认距离评估丢包重发，重构丢失包之后已发送的数据报。
-// - 管理递增的序列号。
+// - 从应用响应器读取数据，构造数据报递送到总发送器。
+// - 根据对端确认距离评估丢包和重发。
 //
-// 退出发送：
+// 退出：
 // - 接收到END确认后（ackRecv），发送一个BYE通知即退出。
-// - 接收端最多重复endAcks次END确认，如果都丢失，则由超时机制退出。
-//
-// 接收确认信息（ackRecv:rcvInfo）：
-// - Ack 	确认号
-// - Dist 	确认距离
-// - RTP 	请求重发标记
+// - 接收端收到BYE之前会重复多次END确认，如果全部丢失，则由超时机制退出。
 //
 // 注记：
-// 丢失的包不可能跨越一个序列号回绕周期，巨大的发送距离也会让发送停止。
+// 丢失的包不可能跨越一个序列号回绕段，太大的发送距离会让发送停止。
 //
 type servSend struct {
 	ID    uint16          // 数据ID#SND
@@ -66,24 +77,24 @@ type servSend struct {
 	iPost chan<- *packet // 数据报递送（-> xServer）
 	iBye  chan<- *ackBye // 结束通知（BYE -> xServer）
 	cLoss chan *ackLoss  // 丢包重发通知（offset）
-	resp  *response      // 响应器
+	resp  responser      // 响应器
 	eval  *evalRate      // 速率评估器
 	recv  *ackRecv       // 接收确认
-	dcnt  *sendDister    // 距离计数器
+	dcnt  *sendDister    // 发送距离计数器
 
 	read  chan *packet  // 读取回环传递（buf>0）
 	isBeg bool          // 是否为首个包
+	isReq bool          // 为资源请求发送
 	seq   uint32        // 当前序列号
 	end   uint32        // END包的确认号
-	isReq bool          // 为资源请求发送
 	endCh chan<- seqAck // END包信息传递（-> ackRecv）
 }
 
 //
 // 新建一个子发送服务器。
-// seq 实参为一个初始的随机值。
+// seq 实参为一个初始首个包的序列号。
 //
-func newServSend(id uint16, seq uint32, rsp *response, req bool, pch chan<- *packet, bch chan<- ackBye, dch chan<- int) *servSend {
+func newServSend(id uint16, seq uint32, rsp responser, pch chan<- *packet, bch chan<- ackBye, dch chan<- int) *servSend {
 	dcnt := &sendDister{}
 	lsev := newLossEval(subEaseRate, sendRateZoom)
 	endc := make(chan seqAck, 1)
@@ -103,9 +114,15 @@ func newServSend(id uint16, seq uint32, rsp *response, req bool, pch chan<- *pac
 		seq:   seq,
 		dcnt:  dcnt,
 		end:   xLimit32,
-		isReq: req,
 		endCh: endc,
 	}
+}
+
+//
+// 设置为资源请求类型。
+//
+func (s *servSend) SetReq() {
+	s.isReq = true
 }
 
 //
@@ -115,7 +132,7 @@ func newServSend(id uint16, seq uint32, rsp *response, req bool, pch chan<- *pac
 // 注记：
 // 丢包与正常的发送在一个Go程里处理，无并发问题。
 //
-func (s *servSend) Serve(re *rateEval, exit *goes.Stop, done sndCleaner) {
+func (s *servSend) Serve(re *rateEval, exit *goes.Stop, done func(uint16, uint32)) {
 	// 确认接收分支服务。
 	stop := goes.NewStop()
 	go s.recv.Serve(s.cLoss, re, stop)
@@ -166,23 +183,21 @@ func (s *servSend) Serve(re *rateEval, exit *goes.Stop, done sndCleaner) {
 // 发送结束通知（BYE）
 // 因为无数据负载，BYE作为一个确认信息发出。
 //
-func (s *servSend) toBye(done sndCleaner) {
+func (s *servSend) toBye(done func(uint16, uint32)) {
 	go func() {
 		s.iBye <- ackBye{
 			ID:  s.ID, // => #RCV
 			Ack: rand.Uint32(),
 		}
 	}()
-	if done != nil {
-		done(s.ID, s.end)
-	}
+	done(s.ID, s.end)
 }
 
 //
 // 状态更新。
 // 设置下一个序列号，同时会更新距离计数器。
 // 注记：
-// 在数据报已经进入发送队列后才更新，减小END确认时间误差。
+// 在数据报进入发送队列之后更新，减小END确认超时延误。
 //
 func (s *servSend) update(p *packet) {
 	ack := roundPlus(s.seq, p.Size())
@@ -194,8 +209,8 @@ func (s *servSend) update(p *packet) {
 	}
 	if p.END() {
 		// 向ackRecv传递END包信息
-		s.endCh <- seqAck{s.seq, s.end}
 		// no close
+		s.endCh <- seqAck{s.seq, s.end}
 	}
 	s.seq = ack // next..
 }
@@ -241,12 +256,12 @@ func (s *servSend) Build(seq uint32, size int) *packet {
 //
 func (s *servSend) lossBuild(seq uint32, size, off int) *packet {
 	b, err := s.resp.LossGet(size, off)
-	if off < 0 {
-		seq = roundBegin(s.end, len(b))
-	}
 	if err != nil {
 		log.Println(err)
 		return nil
+	}
+	if off == -1 {
+		seq = roundBegin(s.end, len(b))
 	}
 	return s.build(
 		b,
@@ -271,23 +286,6 @@ func (s *servSend) build(b []byte, seq uint32, end bool) *packet {
 		h.Set(REQ)
 	}
 	return &packet{header: h, Data: b}
-}
-
-//
-// 序列号/确认号对。
-//
-type seqAck struct {
-	Seq, Ack uint32
-}
-
-//
-// 确认信息。
-// 对端对本端响应的确认信息。
-//
-type rcvInfo struct {
-	Ack  uint32 // 确认号
-	Dist int    // 确认距离
-	Rtp  bool   // 重传请求
 }
 
 //

@@ -95,7 +95,7 @@ func newOneSend(id uint16, seq uint32, b []byte, pch chan<- *packet, bch chan<- 
 // 初始超时设置稍低，模拟双发保险。
 // 因为一个数据报就是一个数据体，冗余浪费可接受。
 //
-func (o *oneSend) Serve(re *rateEval, exit *goes.Stop, done func(id uint16, ack uint32)) {
+func (o *oneSend) Serve(re *rateEval, exit *goes.Stop, done func(uint16, uint32)) {
 	// 初次等待时间
 	wait := OneAckTime
 
@@ -141,7 +141,7 @@ func (o *oneSend) SetReq() {
 // 发送结束通知（BYE）
 // 因无数据负载，BYE作为一个确认信息发出。
 //
-func (o *oneSend) toBye(done sndCleaner) {
+func (o *oneSend) toBye(done func(uint16, uint32)) {
 	go func() {
 		o.iBye <- &ackBye{
 			ID:  o.ID,
@@ -149,6 +149,9 @@ func (o *oneSend) toBye(done sndCleaner) {
 			Req: o.isReq,
 		}
 	}()
+	// 向下一阶段传递ID和确认号。
+	// 确认号约定为响应接收器的初始确认号。
+	// （如果此为请求发送）
 	done(o.ID, roundPlus(o.ID, o.pack.Size()))
 }
 
