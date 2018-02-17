@@ -1,2 +1,2 @@
-# pputil
-p2p网络应用工具集。
+# bcutil
+区块链（blockchain）简单工具集。

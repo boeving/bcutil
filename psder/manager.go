@@ -1,4 +1,4 @@
-// Package download 分片下载模块。
+// Package psder 分片下载模块。
 // 支持并发、断点续传。
 // 外部实现特定的下载方式，如http直接下载或P2P传输。
 // 由用户定义下载响应集。
@@ -6,14 +6,14 @@
 // 对于http方式的资源，也应当构建一个分片索引集，包含验证哈希。
 // 这样便于P2P传输。http源被视为一个种子。
 //
-package download
+package psder
 
 import (
 	"crypto/sha256"
 	"io"
 	"sync"
 
-	"github.com/qchen-zh/pputil/download/piece"
+	"github.com/qchen-zh/bcutil/psder/piece"
 )
 
 // 写入缓存常量。

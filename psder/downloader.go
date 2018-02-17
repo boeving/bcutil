@@ -1,11 +1,11 @@
-package download
+package psder
 
 import (
 	"crypto/sha256"
 	"errors"
 
-	"github.com/qchen-zh/pputil/download/piece"
-	"github.com/qchen-zh/pputil/goes"
+	"github.com/qchen-zh/bcutil/psder/piece"
+	"github.com/qchen-zh/goes"
 )
 
 const (

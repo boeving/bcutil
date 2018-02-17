@@ -40,7 +40,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/qchen-zh/pputil/goes"
+	"github.com/qchen-zh/goes"
 )
 
 // 基本常量

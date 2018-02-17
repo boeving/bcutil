@@ -1,4 +1,4 @@
-package download
+package psder
 
 /////////////////////////////////////////
 // 缓存已下载数据并为其它端点提供下载支持。
@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/qchen-zh/pputil/download/piece"
+	"github.com/qchen-zh/bcutil/psder/piece"
 )
 
 // CacheSize 默认缓存大小（100MB）
