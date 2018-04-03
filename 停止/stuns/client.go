@@ -5,25 +5,36 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
+	"time"
+	"bytes"
 )
 
 func main() {
-	raddr, err := net.ResolveUDPAddr("udp", "192.168.31.24:7788")
-	log.Println("Server address: ", raddr, err)
+	raddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:17788")
+	log.Println("Remote address: ", raddr, err)
 
-	laddr, err := net.ResolveUDPAddr("udp", "192.168.31.24:17799")
+	laddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:7788")
 	log.Println("Local: ", laddr, err)
 
 	conn, err := net.DialUDP("udp", laddr, raddr)
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer conn.Close()
-	go mustCopy(os.Stdout, conn)
 
-	mustCopy(conn, os.Stdin)
-	fmt.Println("UDP Dial End")
+	time.Sleep(3*time.Second)
+
+	fmt.Println(conn.Write([]byte("The First line..")))
+	fmt.Println(conn.Write([]byte("The Second line..")))
+	fmt.Println(conn.Write([]byte("The Three line..")))
+
+	 dd := bytes.Repeat([]byte("Hello"), 100)
+	 fmt.Println(conn.Write(dd))
+
+	time.Sleep(3*time.Second)
+	conn.Close()
+
+	//go mustCopy(os.Stdout, conn)
+	fmt.Println("UDP Send Done")
 }
 
 func mustCopy(dst io.Writer, src io.Reader) {
